@@ -1,0 +1,20 @@
+{
+  "name": "algaetree-kiosk",
+  "version": "1.0.0",
+  "description": "AlgaeTree AI Fullscreen Kiosk for Raspberry Pi",
+  "main": "main.js",
+  "author": "MW FutureTech",
+  "homepage": "https://algaetree.vercel.app",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "start:dev": "ALGAETREE_URL=http://localhost:3000 electron .",
+    "build:deb": "electron-builder --linux deb --arm64",
+    "build:deb:armv7l": "electron-builder --linux deb --armv7l"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  }
+}

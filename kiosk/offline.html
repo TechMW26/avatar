@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlgaeTree – Connect to Internet</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      height: 100vh;
+      background: #060b14;
+      color: rgba(255,255,255,0.95);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Ambient background */
+    .ambient { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+    .orb {
+      position: absolute; border-radius: 50%; filter: blur(100px);
+      animation: drift 20s ease-in-out infinite;
+    }
+    .orb-1 { width: 500px; height: 500px; top: -10%; left: -5%; background: rgba(34,197,94,0.08); }
+    .orb-2 { width: 400px; height: 400px; bottom: -10%; right: -5%; background: rgba(56,189,248,0.06); animation-delay: -7s; }
+
+    @keyframes drift {
+      0%,100% { transform: translate(0,0) scale(1); }
+      33% { transform: translate(30px,-20px) scale(1.05); }
+      66% { transform: translate(-20px,15px) scale(0.95); }
+    }
+
+    .container {
+      position: relative; z-index: 1;
+      width: 90%; max-width: 680px;
+      display: flex; flex-direction: column; align-items: center;
+      gap: 32px;
+    }
+
+    /* Logo */
+    .logo {
+      display: flex; align-items: center; gap: 12px;
+      font-size: 22px; font-weight: 700;
+    }
+    .logo-icon {
+      width: 44px; height: 44px; border-radius: 50%;
+      background: rgba(34,197,94,0.15);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px;
+    }
+
+    /* Status card */
+    .status-card {
+      width: 100%; padding: 36px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 24px;
+      backdrop-filter: blur(20px);
+      text-align: center;
+    }
+    .status-icon {
+      width: 72px; height: 72px; margin: 0 auto 20px;
+      border-radius: 50%;
+      background: rgba(249,115,22,0.1);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 32px;
+      animation: pulse-icon 2s ease-in-out infinite;
+    }
+    @keyframes pulse-icon {
+      0%,100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(249,115,22,0.2); }
+      50% { transform: scale(1.05); box-shadow: 0 0 30px rgba(249,115,22,0.15); }
+    }
+    .status-title { font-size: 24px; font-weight: 800; margin-bottom: 8px; }
+    .status-sub { font-size: 14px; color: rgba(255,255,255,0.45); line-height: 1.6; }
+
+    /* Steps panel */
+    .panel {
+      width: 100%;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 24px;
+      backdrop-filter: blur(20px);
+      overflow: hidden;
+    }
+    .panel-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 20px 28px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .panel-title { font-size: 16px; font-weight: 700; }
+    .tab-row { display: flex; gap: 4px; }
+    .tab {
+      padding: 8px 18px; border-radius: 12px; border: none;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      transition: all 0.2s;
+      background: transparent; color: rgba(255,255,255,0.35);
+    }
+    .tab.active {
+      background: rgba(34,197,94,0.12); color: #4ade80;
+      border: 1px solid rgba(34,197,94,0.25);
+    }
+    .tab:not(.active):hover { color: rgba(255,255,255,0.6); }
+
+    .panel-body { padding: 24px 28px; max-height: 48vh; overflow-y: auto; }
+
+    /* Step items */
+    .step {
+      display: flex; gap: 16px; padding: 16px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .step:last-child { border-bottom: none; }
+    .step-num {
+      width: 32px; height: 32px; border-radius: 10px; flex-shrink: 0;
+      background: rgba(34,197,94,0.1); color: #4ade80;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; font-weight: 800;
+    }
+    .step-content { flex: 1; }
+    .step-title { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+    .step-desc { font-size: 13px; color: rgba(255,255,255,0.45); line-height: 1.5; }
+
+    /* WiFi network list */
+    .wifi-list { display: flex; flex-direction: column; gap: 8px; }
+    .wifi-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-radius: 14px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      cursor: pointer; transition: all 0.2s;
+    }
+    .wifi-item:hover {
+      background: rgba(34,197,94,0.06);
+      border-color: rgba(34,197,94,0.2);
+    }
+    .wifi-item.selected {
+      background: rgba(34,197,94,0.1);
+      border-color: rgba(34,197,94,0.3);
+    }
+    .wifi-name { font-size: 14px; font-weight: 600; }
+    .wifi-meta { display: flex; align-items: center; gap: 12px; }
+    .wifi-signal { font-size: 12px; color: rgba(255,255,255,0.35); }
+    .wifi-security {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      padding: 3px 8px; border-radius: 6px;
+      background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.4);
+    }
+    .signal-bars {
+      display: flex; align-items: flex-end; gap: 2px; height: 16px;
+    }
+    .signal-bar {
+      width: 4px; border-radius: 2px;
+      background: rgba(255,255,255,0.12);
+    }
+    .signal-bar.active { background: #4ade80; }
+
+    /* Password input */
+    .password-section {
+      margin-top: 16px; padding: 20px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      display: none;
+    }
+    .password-section.show { display: block; }
+    .password-label { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: rgba(255,255,255,0.6); }
+    .password-row { display: flex; gap: 10px; }
+    .password-input {
+      flex: 1; padding: 12px 16px; border-radius: 12px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      color: white; font-size: 14px;
+      outline: none; transition: border-color 0.2s;
+    }
+    .password-input:focus { border-color: rgba(34,197,94,0.4); }
+    .btn-connect {
+      padding: 12px 24px; border-radius: 12px; border: none;
+      background: #22c55e; color: #060b14;
+      font-size: 14px; font-weight: 700; cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-connect:hover { background: #16a34a; }
+    .btn-connect:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Scan button */
+    .btn-scan {
+      width: 100%; padding: 12px; border-radius: 12px; border: none;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.6); font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; margin-top: 12px;
+    }
+    .btn-scan:hover { background: rgba(255,255,255,0.08); color: white; }
+
+    /* Connection status */
+    .connect-status {
+      margin-top: 12px; padding: 12px 16px; border-radius: 12px;
+      font-size: 13px; font-weight: 600; display: none;
+    }
+    .connect-status.show { display: block; }
+    .connect-status.success { background: rgba(34,197,94,0.1); color: #4ade80; }
+    .connect-status.error { background: rgba(239,68,68,0.1); color: #f87171; }
+    .connect-status.loading { background: rgba(56,189,248,0.1); color: #38bdf8; }
+
+    /* Retry bar */
+    .retry-bar {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 12px;
+      font-size: 13px; color: rgba(255,255,255,0.35);
+    }
+    .spinner {
+      width: 16px; height: 16px; border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.1);
+      border-top-color: #4ade80;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Ethernet steps */
+    .ethernet-steps { display: none; }
+    .ethernet-steps.show { display: block; }
+    .wifi-section { display: block; }
+    .wifi-section.hide { display: none; }
+
+    /* Scrollbar */
+    .panel-body::-webkit-scrollbar { width: 4px; }
+    .panel-body::-webkit-scrollbar-track { background: transparent; }
+    .panel-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+  </style>
+</head>
+<body>
+  <div class="ambient">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+  </div>
+
+  <div class="container">
+    <!-- Logo -->
+    <div class="logo">
+      <div class="logo-icon">🌿</div>
+      <span>AlgaeTree</span>
+    </div>
+
+    <!-- Status -->
+    <div class="status-card">
+      <div class="status-icon">📡</div>
+      <div class="status-title">No Internet Connection</div>
+      <div class="status-sub">
+        AlgaeTree AI requires an internet connection to function.<br/>
+        Follow the steps below to connect your device to WiFi or Ethernet.
+      </div>
+    </div>
+
+    <!-- Connection Panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Connect to Network</div>
+        <div class="tab-row">
+          <button class="tab active" onclick="switchTab('wifi')">📶 WiFi</button>
+          <button class="tab" onclick="switchTab('ethernet')">🔌 Ethernet</button>
+        </div>
+      </div>
+
+      <div class="panel-body">
+        <!-- WiFi Section -->
+        <div class="wifi-section" id="wifiSection">
+          <div class="wifi-list" id="wifiList">
+            <div class="step">
+              <div class="step-num">
+                <div class="spinner"></div>
+              </div>
+              <div class="step-content">
+                <div class="step-title">Scanning for WiFi networks...</div>
+                <div class="step-desc">Please wait while we detect available networks nearby.</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Password entry -->
+          <div class="password-section" id="passwordSection">
+            <div class="password-label">Enter password for "<span id="selectedSSID"></span>"</div>
+            <div class="password-row">
+              <input
+                type="password"
+                class="password-input"
+                id="passwordInput"
+                placeholder="WiFi Password"
+                autocomplete="off"
+                onkeydown="if(event.key==='Enter')connectToNetwork()"
+              />
+              <button class="btn-connect" id="connectBtn" onclick="connectToNetwork()">Connect</button>
+            </div>
+            <div class="connect-status" id="connectStatus"></div>
+          </div>
+
+          <button class="btn-scan" onclick="scanNetworks()">🔄 Scan Again</button>
+        </div>
+
+        <!-- Ethernet Section -->
+        <div class="ethernet-steps" id="ethernetSection">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-content">
+              <div class="step-title">Get an Ethernet Cable</div>
+              <div class="step-desc">Find a standard RJ45 Ethernet cable. These are usually available near your WiFi router or network switch.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-content">
+              <div class="step-title">Connect to the Raspberry Pi</div>
+              <div class="step-desc">Plug one end of the Ethernet cable into the Ethernet port on the side of the Raspberry Pi. You'll feel a click when it's properly seated.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-content">
+              <div class="step-title">Connect to Router or Network Switch</div>
+              <div class="step-desc">Plug the other end into any available LAN port on your WiFi router or network switch. The port should light up.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">4</div>
+            <div class="step-content">
+              <div class="step-title">Wait for Auto-Connection</div>
+              <div class="step-desc">The Raspberry Pi will automatically detect and configure the Ethernet connection. This screen will close automatically once internet is detected.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">💡</div>
+            <div class="step-content">
+              <div class="step-title">Troubleshooting</div>
+              <div class="step-desc">If the connection doesn't work after 30 seconds, try unplugging and replugging the cable. Make sure the LEDs on both the Pi and router port are blinking.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="retry-bar">
+        <div class="spinner"></div>
+        <span>Checking for internet connection automatically...</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let networks = [];
+    let selectedNetwork = null;
+
+    // Called from main process after page load
+    window.__setNetworks = function(nets) {
+      networks = nets || [];
+      renderNetworks();
+    };
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      if (tab === 'wifi') {
+        document.querySelector('.tab:first-child').classList.add('active');
+        document.getElementById('wifiSection').classList.remove('hide');
+        document.getElementById('ethernetSection').classList.remove('show');
+      } else {
+        document.querySelector('.tab:last-child').classList.add('active');
+        document.getElementById('wifiSection').classList.add('hide');
+        document.getElementById('ethernetSection').classList.add('show');
+      }
+    }
+
+    function getSignalLevel(signal) {
+      if (signal >= 70) return 4;
+      if (signal >= 50) return 3;
+      if (signal >= 30) return 2;
+      return 1;
+    }
+
+    function renderNetworks() {
+      const list = document.getElementById('wifiList');
+      if (!networks.length) {
+        list.innerHTML = `
+          <div class="step">
+            <div class="step-num">⚠️</div>
+            <div class="step-content">
+              <div class="step-title">No WiFi Networks Found</div>
+              <div class="step-desc">Make sure your WiFi router is turned on and within range. Try scanning again.</div>
+            </div>
+          </div>`;
+        return;
+      }
+
+      list.innerHTML = networks.map(n => {
+        const level = getSignalLevel(n.signal);
+        const bars = [1,2,3,4].map(i =>
+          `<div class="signal-bar ${i <= level ? 'active' : ''}" style="height:${4 + i*3}px"></div>`
+        ).join('');
+        return `
+          <div class="wifi-item ${selectedNetwork === n.ssid ? 'selected' : ''}"
+               onclick="selectNetwork('${n.ssid.replace(/'/g, "\\'")}', '${n.security}')">
+            <div>
+              <div class="wifi-name">${escapeHtml(n.ssid)}</div>
+            </div>
+            <div class="wifi-meta">
+              <div class="signal-bars">${bars}</div>
+              <div class="wifi-signal">${n.signal}%</div>
+              ${n.security && n.security !== '--' && n.security !== 'Open'
+                ? `<div class="wifi-security">🔒 ${escapeHtml(n.security)}</div>`
+                : `<div class="wifi-security">Open</div>`}
+            </div>
+          </div>`;
+      }).join('');
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function selectNetwork(ssid, security) {
+      selectedNetwork = ssid;
+      renderNetworks();
+      const section = document.getElementById('passwordSection');
+      document.getElementById('selectedSSID').textContent = ssid;
+      if (security && security !== '--' && security !== 'Open') {
+        section.classList.add('show');
+        document.getElementById('passwordInput').value = '';
+        document.getElementById('passwordInput').focus();
+      } else {
+        section.classList.remove('show');
+        connectToNetwork();
+      }
+      hideStatus();
+    }
+
+    async function scanNetworks() {
+      const list = document.getElementById('wifiList');
+      list.innerHTML = `
+        <div class="step">
+          <div class="step-num"><div class="spinner"></div></div>
+          <div class="step-content">
+            <div class="step-title">Scanning for WiFi networks...</div>
+            <div class="step-desc">Please wait while we detect available networks nearby.</div>
+          </div>
+        </div>`;
+
+      if (window.kiosk) {
+        networks = await window.kiosk.scanWifi();
+      }
+      renderNetworks();
+    }
+
+    async function connectToNetwork() {
+      if (!selectedNetwork) return;
+
+      const password = document.getElementById('passwordInput')?.value || '';
+      const btn = document.getElementById('connectBtn');
+      btn.disabled = true;
+      btn.textContent = 'Connecting...';
+      showStatus('Connecting to ' + selectedNetwork + '...', 'loading');
+
+      if (window.kiosk) {
+        const result = await window.kiosk.connectWifi(selectedNetwork, password);
+        if (result.success) {
+          showStatus('Connected! Loading AlgaeTree AI...', 'success');
+          // The main process connectivity check will auto-redirect
+        } else {
+          showStatus('Connection failed: ' + result.message, 'error');
+        }
+      } else {
+        showStatus('WiFi control not available in this environment.', 'error');
+      }
+
+      btn.disabled = false;
+      btn.textContent = 'Connect';
+    }
+
+    function showStatus(message, type) {
+      const el = document.getElementById('connectStatus');
+      el.textContent = message;
+      el.className = 'connect-status show ' + type;
+    }
+
+    function hideStatus() {
+      document.getElementById('connectStatus').className = 'connect-status';
+    }
+  </script>
+</body>
+</html>

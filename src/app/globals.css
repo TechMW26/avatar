@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg: #0D0A07;
+    --surface: rgba(255, 255, 255, 0.06);
+    --surface-hover: rgba(255, 255, 255, 0.1);
+    --border: rgba(255, 255, 255, 0.1);
+    --border-hover: rgba(255, 255, 255, 0.2);
+    --highlight: rgba(255, 255, 255, 0.15);
+    --saffron: #FF9933;
+    --saffron-light: #FFB366;
+    --saffron-glow: rgba(255, 153, 51, 0.35);
+    --gold: #FFC107;
+    --maroon: #8B1A1A;
+    --text-1: rgba(255, 255, 255, 0.95);
+    --text-2: rgba(255, 255, 255, 0.6);
+    --text-3: rgba(255, 255, 255, 0.35);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text-1);
+    font-family: var(--font-inter), -apple-system, sans-serif;
+    overflow: hidden;
+  }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+}
+
+/* ===== KEYFRAMES ===== */
+@keyframes drift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(30px, -20px) scale(1.05); }
+  66% { transform: translate(-20px, 15px) scale(0.95); }
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-12px); }
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
+}
+@keyframes sound-wave {
+  0%, 100% { height: 8px; }
+  50% { height: 26px; }
+}
+@keyframes orb-breathe {
+  0%, 100% { box-shadow: 0 0 40px var(--saffron-glow), 0 0 80px rgba(255,153,51,0.15); }
+  50% { box-shadow: 0 0 60px var(--saffron-glow), 0 0 120px rgba(255,153,51,0.25); }
+}
+@keyframes orb-speak {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 40px var(--saffron-glow); }
+  25% { transform: scale(1.04); box-shadow: 0 0 70px var(--saffron-glow); }
+  50% { transform: scale(0.97); box-shadow: 0 0 50px var(--saffron-glow); }
+  75% { transform: scale(1.03); box-shadow: 0 0 65px var(--saffron-glow); }
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@layer components {
+  /* ===== AMBIENT BG ===== */
+  .ambient-bg {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+  }
+  .ambient-bg .orb {
+    position: absolute; border-radius: 50%; filter: blur(120px); opacity: 0.35;
+    animation: drift 25s ease-in-out infinite;
+  }
+  .ambient-bg .orb-1 { width: 600px; height: 600px; top: -10%; left: -5%; background: rgba(255,153,51,0.25); }
+  .ambient-bg .orb-2 { width: 500px; height: 500px; bottom: -15%; right: -5%; background: rgba(139,26,26,0.2); animation-delay: -8s; }
+  .ambient-bg .orb-3 { width: 400px; height: 400px; top: 50%; left: 60%; background: rgba(255,193,7,0.12); animation-delay: -16s; }
+
+  /* ===== ANIMATION CLASSES ===== */
+  .float-anim { animation: float 5s ease-in-out infinite; }
+  .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+  .orb-idle { animation: orb-breathe 3s ease-in-out infinite; }
+  .orb-speaking { animation: orb-speak 0.7s ease-in-out infinite; }
+  .sound-bar { animation: sound-wave 0.6s ease-in-out infinite; }
+  .sound-bar:nth-child(2) { animation-delay: 0.1s; }
+  .sound-bar:nth-child(3) { animation-delay: 0.2s; }
+  .sound-bar:nth-child(4) { animation-delay: 0.3s; }
+  .sound-bar:nth-child(5) { animation-delay: 0.15s; }
+
+  /* ===== GLASS CARD ===== */
+  .card {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
+    box-shadow: 0 4px 30px rgba(0,0,0,0.3), inset 0 1px 0 var(--highlight);
+    overflow: hidden;
+    transition: transform 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  /* Saffron sound bar color */
+  .bg-saffron-400 { background: #FFB366; }
+}
+
+/* ===== MOBILE: Talk page fullscreen ===== */
+@media (max-width: 768px) {
+  .talk-avatar-container {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    z-index: 1 !important;
+  }
+
+  .vision-status-container {
+    top: 12px !important;
+    left: 50% !important;
+    right: auto !important;
+    transform: translateX(-50%) !important;
+    align-items: center !important;
+  }
+
+  .talk-gradient-overlay {
+    position: fixed !important;
+    z-index: 2 !important;
+  }
+
+  .talk-controls-overlay {
+    position: fixed !important;
+    z-index: 10 !important;
+  }
+
+  html, body { overflow: auto; }
+}

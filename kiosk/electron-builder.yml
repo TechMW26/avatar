@@ -1,0 +1,46 @@
+appId: com.mwfuturetech.algaetree-kiosk
+productName: AlgaeTree Kiosk
+copyright: Copyright © MW FutureTech
+
+directories:
+  output: dist
+
+files:
+  - main.js
+  - preload.js
+  - offline.html
+  - package.json
+
+linux:
+  target:
+    - target: deb
+      arch:
+        - arm64
+  category: Utility
+  maintainer: MW FutureTech
+  vendor: MW FutureTech
+  synopsis: AlgaeTree AI Bio-Reactor Kiosk
+  description: >
+    Fullscreen kiosk application for AlgaeTree AI Bio-Reactor
+    monitoring and conversational AI on Raspberry Pi.
+
+deb:
+  depends:
+    - network-manager
+    - xdotool
+    - unclutter
+    - libgtk-3-0
+    - libnss3
+    - libxss1
+    - libasound2
+    - libatk-bridge2.0-0
+    - libdrm2
+    - libgbm1
+  afterInstall: scripts/postinst.sh
+  afterRemove: scripts/postrm.sh
+
+extraResources:
+  - from: conf/
+    to: conf
+    filter:
+      - "**/*"
