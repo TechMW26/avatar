@@ -64,6 +64,17 @@ const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const DETECTION_INTERVAL_MS = 100; // run detection every 100ms (~10fps detection)
 
+function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
+  const byName = new Map<string, GestureInfo>();
+  gestures.forEach((gesture) => {
+    const existing = byName.get(gesture.name);
+    if (!existing || gesture.confidence > existing.confidence) {
+      byName.set(gesture.name, gesture);
+    }
+  });
+  return Array.from(byName.values()).sort((left, right) => right.confidence - left.confidence);
+}
+
 export function useVisionDetection(): VisionState {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
@@ -565,7 +576,7 @@ export function useVisionDetection(): VisionState {
       }
     }
 
-    setCurrentGestures(frameGestures);
+    setCurrentGestures(dedupeFrameGestures(frameGestures));
 
     rafRef.current = requestAnimationFrame(detect);
   }, []);

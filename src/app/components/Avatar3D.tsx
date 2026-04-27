@@ -1,56 +1,48 @@
 "use client";
 
-import { useRef, useEffect, useState, Suspense, Component, ReactNode, MutableRefObject } from "react";
+import { useRef, useEffect, Suspense, Component, ReactNode, MutableRefObject } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
-import { useFBX } from "@react-three/drei";
+import { useGLTF } from "@react-three/drei";
 import * as THREE from "three";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { Lipsync, VISEMES } from "wawa-lipsync";
 
-const AVATAR_URL = "/avatar.fbx";
+const AVATAR_URL = "/avatar.glb";
 
-/**
- * Map from RPM/Mixamo bone names (used in emote GLBs) to this FBX skeleton's names.
- * The new model uses a custom naming convention:
- *   Neck → neck, Spine1 → Spine01, Spine2 → Spine02, HeadTop_End → head_end
- * Most other names (Head, Hips, LeftArm, etc.) match directly.
- */
-const BONE_NAME_MAP: Record<string, string> = {
-  Neck: 'neck',
-  Spine1: 'Spine01',
-  Spine2: 'Spine02',
-  HeadTop_End: 'head_end',
+// FBX2glTF numbers blendshapes as plain integers "0".."14" (sometimes
+// "m0".."m14"); remap to the viseme names the lipsync code targets. Order
+// is taken from the source FBX morph list.
+const MORPH_NAME_REMAP: Record<string, string> = {
+  "0": "viseme_sil",
+  "1": "viseme_PP",
+  "2": "viseme_FF",
+  "3": "viseme_TH",
+  "4": "viseme_DD",
+  "5": "viseme_kk",
+  "6": "viseme_CH",
+  "7": "viseme_SS",
+  "8": "viseme_nn",
+  "9": "viseme_RR",
+  "10": "viseme_aa",
+  "11": "viseme_E",
+  "12": "viseme_I",
+  "13": "viseme_O",
+  "14": "viseme_U",
+  m0: "viseme_sil",
+  m1: "viseme_PP",
+  m2: "viseme_FF",
+  m3: "viseme_TH",
+  m4: "viseme_DD",
+  m5: "viseme_kk",
+  m6: "viseme_CH",
+  m7: "viseme_SS",
+  m8: "viseme_nn",
+  m9: "viseme_RR",
+  m10: "viseme_aa",
+  m11: "viseme_E",
+  m12: "viseme_I",
+  m13: "viseme_O",
+  m14: "viseme_U",
 };
-
-/**
- * Retarget animation clip track names from RPM emote GLBs to this FBX skeleton.
- */
-function retargetClip(clip: THREE.AnimationClip, boneNames: Set<string>): THREE.AnimationClip {
-  const retargeted = clip.clone();
-  const kept: THREE.KeyframeTrack[] = [];
-  const dropped: string[] = [];
-  retargeted.tracks.forEach(track => {
-    const dotIdx = track.name.indexOf('.');
-    if (dotIdx === -1) { kept.push(track); return; }
-    const boneName = track.name.substring(0, dotIdx);
-    const prop = track.name.substring(dotIdx);
-    // Direct match
-    if (boneNames.has(boneName)) { kept.push(track); return; }
-    // Try name mapping
-    const mapped = BONE_NAME_MAP[boneName];
-    if (mapped && boneNames.has(mapped)) {
-      const newTrack = track.clone();
-      newTrack.name = mapped + prop;
-      kept.push(newTrack);
-      return;
-    }
-    dropped.push(track.name);
-  });
-  retargeted.tracks = kept;
-  if (dropped.length > 0) {
-    console.log(`[Avatar] retarget "${clip.name}": ${kept.length} mapped, ${dropped.length} dropped`);
-  }
-  return retargeted;
-}
 
 /* ── Error boundary ── */
 class AvatarErrorBoundary extends Component<
@@ -123,42 +115,37 @@ const POSE_SEQUENCES = [
 ];
 
 class AudioLipSync {
-  private current: Record<VisemeKey, number>;
-
-  // Audio envelope
-  private volumeFast = 0;   // smoothed follower
-  private volumeSlow = 0;   // slower follower for blend
-  private prevRms = 0;
-
-  // Pose cycling
-  private seqIdx = 0;
-  private poseIdx = 0;
-  private poseTimer = 0;
-  private rng = 42;
+  private current: Record<string, number>;
+  private wawa: Lipsync;
+  private wawaReady = false;
+  private vowelCycleIdx = 0;
+  private vowelCycleTimer = 0;
+  private prevVolume = 0;
+  private static VOWEL_CYCLE: string[] = [
+    VISEMES.aa,
+    VISEMES.O,
+    VISEMES.E,
+    VISEMES.aa,
+    VISEMES.U,
+    VISEMES.I,
+    VISEMES.O,
+    VISEMES.aa,
+  ];
 
   constructor() {
-    this.current = {} as Record<VisemeKey, number>;
-    for (const k of VISEME_KEYS) this.current[k] = 0;
-  }
-
-  private rand() {
-    this.rng = (this.rng * 16807 + 7) % 2147483647;
-    return (this.rng % 1000) / 1000;
-  }
-
-  /** Compute speech-band RMS from FFT data, or fall back to volume */
-  private getRms(freqData: Uint8Array | undefined | null, fallbackVol: number): number {
-    if (freqData && freqData.length > 16) {
-      const lo = Math.max(1, Math.floor(freqData.length * 0.005));
-      const hi = Math.min(freqData.length - 1, Math.floor(freqData.length * 0.18));
-      let sumSq = 0;
-      for (let i = lo; i <= hi; i++) {
-        const v = freqData[i] / 255;
-        sumSq += v * v;
-      }
-      return Math.sqrt(sumSq / (hi - lo + 1));
+    this.current = {};
+    for (const v of Object.values(VISEMES)) this.current[v] = 0;
+    this.current["jawOpen"] = 0;
+    // wawa-lipsync uses its own AudioContext just for the analyser node; we
+    // bypass the internal audio routing and feed it byte-frequency data
+    // captured by the ElevenLabs SDK each frame.
+    try {
+      this.wawa = new Lipsync({ fftSize: 2048, historySize: 10 });
+      this.wawaReady = true;
+    } catch (e) {
+      console.warn("[Avatar] wawa-lipsync init failed:", e);
+      this.wawa = null as unknown as Lipsync;
     }
-    return fallbackVol;
   }
 
   update(
@@ -169,68 +156,94 @@ class AudioLipSync {
     const result: Record<string, number> = {};
 
     // ── Not speaking: gentle decay ──
-    if (!speaking) {
-      for (const k of VISEME_KEYS) {
-        this.current[k] *= 0.55;          // softer falloff so mouth closes smoothly
+    if (!speaking || !freqData || freqData.length < 16 || !this.wawaReady) {
+      for (const k of Object.keys(this.current)) {
+        this.current[k] *= 0.55;
         if (this.current[k] < 0.002) this.current[k] = 0;
         result[k] = this.current[k];
       }
-      this.volumeFast = 0;
-      this.volumeSlow = 0;
-      this.prevRms = 0;
       return result;
     }
 
-    // ── 1. Get audio level ──
-    const rms = this.getRms(freqData, volume);
+    // Push the externally-captured spectrum into wawa-lipsync's internal
+    // dataArray, then bypass its analyser by overriding getByteFrequencyData.
+    const w = this.wawa as unknown as {
+      dataArray: Uint8Array;
+      analyser: AnalyserNode;
+      processAudio: () => void;
+      viseme: string;
+    };
+    const len = Math.min(w.dataArray.length, freqData.length);
+    for (let i = 0; i < len; i++) w.dataArray[i] = freqData[i];
+    // Stub the analyser fetch; data is already populated.
+    w.analyser.getByteFrequencyData = (buf: Uint8Array) => {
+      const n = Math.min(buf.length, w.dataArray.length);
+      for (let i = 0; i < n; i++) buf[i] = w.dataArray[i];
+    };
+    w.processAudio();
 
-    // ── 2. Smoothed envelope followers ──
-    this.volumeFast += (rms - this.volumeFast) * 0.25;
-    this.volumeSlow += (rms - this.volumeSlow) * 0.12;
+    // Compute audio amplitude from RMS of the spectrum (more reliable than
+    // the SDK's volume which can hover near zero for soft TTS).
+    let sumSq = 0;
+    const lo = Math.max(1, Math.floor(len * 0.005));
+    const hi = Math.min(len - 1, Math.floor(len * 0.18));
+    for (let i = lo; i <= hi; i++) {
+      const v = freqData[i] / 255;
+      sumSq += v * v;
+    }
+    const rms = Math.sqrt(sumSq / Math.max(1, hi - lo + 1));
+    const volEst = Math.max(volume, rms * 1.4);
+    const amplitude = Math.min(1, volEst * 1.8);
 
-    // ── 3. Amplitude from blended volume ──
-    // Blend fast + slow followers for smooth but responsive amplitude.
-    const blendedVol = this.volumeFast * 0.6 + this.volumeSlow * 0.4;
-    const gated = Math.max(0, blendedVol - 0.02);
-    const amplitude = gated > 0 ? Math.sqrt(Math.min(1, gated * 3.5)) : 0;
-
-    // ── 4. Transient detection (for pose advancement speed) ──
-    const transient = Math.max(0, rms - this.prevRms);
-    this.prevRms = rms;
-
-    // ── 5. Advance pose sequence ──
-    // Base rate keeps poses moving during any speech; transients speed it up (gentler)
-    const rate = amplitude > 0.1 ? (0.06 + amplitude * 0.04 + transient * 0.8) : 0;
-    this.poseTimer += rate;
-
-    if (this.poseTimer >= 1.0) {
-      this.poseTimer = 0;
-      const seq = POSE_SEQUENCES[this.seqIdx];
-      this.poseIdx = (this.poseIdx + 1) % seq.length;
-      if (this.poseIdx === 0) {
-        this.seqIdx = Math.floor(this.rand() * POSE_SEQUENCES.length);
-      }
+    // Advance vowel cycle when speaking; rate scales with audio energy.
+    const transient = Math.max(0, rms - this.prevVolume);
+    this.prevVolume = rms;
+    this.vowelCycleTimer += 0.06 + amplitude * 0.10 + transient * 1.2;
+    if (this.vowelCycleTimer >= 1.0) {
+      this.vowelCycleTimer = 0;
+      this.vowelCycleIdx = (this.vowelCycleIdx + 1) % AudioLipSync.VOWEL_CYCLE.length;
     }
 
-    // ── 6. Build targets from current pose × amplitude ──
-    const seq = POSE_SEQUENCES[this.seqIdx];
-    const pose = POSES[seq[this.poseIdx]];
+    let dominant = w.viseme || VISEMES.sil;
+    // wawa returns sil whenever band energies fall below its threshold; if
+    // we still have audible speech, fall back to a cycling vowel so the
+    // mouth keeps moving instead of staying closed.
+    if ((dominant === VISEMES.sil) && amplitude > 0.05) {
+      dominant = AudioLipSync.VOWEL_CYCLE[this.vowelCycleIdx];
+    }
 
-    for (const k of VISEME_KEYS) {
-      const poseWeight = pose[k] || 0;
-      const target = poseWeight * amplitude;
-      const prev = this.current[k];
-      // Gentle lerp: rise slower (0.18) so lips don't snap open,
-      // fall even softer (0.10) so they glide shut
-      if (target > prev) {
-        this.current[k] = prev + (target - prev) * 0.18;
-      } else {
-        this.current[k] = prev + (target - prev) * 0.10;
+    // Amplify so morphs reach visible range. The TTS volume hovers
+    // around 0.05-0.2, which produced barely-perceptible mouth motion.
+    // Use a strong floor when speech is detected so the mouth always opens.
+    const speakBoost = 0.55 + amplitude * 1.6; // 0.55 .. ~1.0
+    const visemeStrength = Math.min(1, speakBoost);
+    const jawStrength = Math.min(1, 0.4 + amplitude * 1.8);
+
+    for (const k of Object.keys(this.current)) {
+      let target = 0;
+      if (k !== VISEMES.sil && k === dominant) {
+        target = visemeStrength;
+      } else if (k === "jawOpen") {
+        if (
+          dominant === VISEMES.aa ||
+          dominant === VISEMES.E ||
+          dominant === VISEMES.I ||
+          dominant === VISEMES.O ||
+          dominant === VISEMES.U
+        ) {
+          target = jawStrength;
+        } else {
+          // Even on consonants, crack the jaw a touch so the mouth isn't
+          // glued shut between vowels.
+          target = jawStrength * 0.35;
+        }
       }
+      const prev = this.current[k];
+      const a = target > prev ? 0.55 : 0.28;
+      this.current[k] = prev + (target - prev) * a;
       if (this.current[k] < 0.002) this.current[k] = 0;
       result[k] = this.current[k];
     }
-
     return result;
   }
 }
@@ -248,32 +261,227 @@ type GestureName =
   | "Photo_Pose"
   | null;
 
-// No arm-down correction needed — Avaturn models include a built-in idle
-// animation that naturally positions the arms.
+type ConcreteGestureName = Exclude<GestureName, null>;
+type BoneAxisOffset = Partial<Record<"x" | "y" | "z", number>>;
+type BonePose = Partial<Record<string, BoneAxisOffset>>;
+type RelaxedAimBoneName = "LeftShoulder" | "RightShoulder" | "LeftArm" | "RightArm" | "LeftForeArm" | "RightForeArm";
+type RelaxedAimSpec = {
+  direction: THREE.Vector3;
+  influence: number;
+};
+
+const GESTURE_BLEND_IN = 0.22;
+const GESTURE_BLEND_OUT = 0.32;
+
+// Reuse scratch objects so per-frame posing stays allocation-free.
+const poseEuler = new THREE.Euler();
+const poseQuat = new THREE.Quaternion();
+const poseVec = new THREE.Vector3();
+const poseVec2 = new THREE.Vector3();
+const poseQuat2 = new THREE.Quaternion();
+const slerpQuat = new THREE.Quaternion();
+const aimChildWorld = new THREE.Vector3();
+const aimBoneWorld = new THREE.Vector3();
+const aimCurrentDir = new THREE.Vector3();
+const aimTargetDir = new THREE.Vector3();
+const aimDeltaQuat = new THREE.Quaternion();
+const aimCurrentWorldQuat = new THREE.Quaternion();
+const aimParentWorldQuat = new THREE.Quaternion();
+const aimTargetWorldQuat = new THREE.Quaternion();
+
+// Bring the arms down from T/A-pose to a relaxed hang. Both arm bones
+// share the same parent (Spine02) so a local Z rotation rotates them in
+// the same world direction — to mirror, we use OPPOSITE-SIGN Z values.
+// The forearm Y roll IS mirrored by same-sign because the bind-pose
+// forearm Y is already negated between sides.
+const RELAXED_BODY_POSE: BonePose = {
+  Spine: { x: 0.03 },
+  Spine01: { x: 0.04 },
+  Spine02: { x: 0.02 },
+  LeftArm: { z: 0.55 },
+  RightArm: { z: -0.65 },
+};
+
+// Roll the forearms around their long axis so the palms face inward
+// toward the thighs. Same-sign delta on both sides produces a mirrored
+// roll because the bind-pose forearm Y rotations are already negated
+// between left and right (Mixamo-style mirror).
+const RELAXED_HAND_POSE: BonePose = {
+  LeftForeArm: { y: 0.6 },
+  RightForeArm: { y: 0.6 },
+};
+
+const GESTURE_BODY_POSES: Partial<Record<ConcreteGestureName, BonePose>> = {
+  Open_Palm: {
+    Spine01: { y: 0.025 },
+    Spine02: { y: 0.035 },
+  },
+  Thumb_Up: {
+    Spine01: { y: 0.02 },
+    Spine02: { x: 0.015, y: 0.03 },
+  },
+  Thumb_Down: {
+    Spine01: { y: -0.02 },
+    Spine02: { x: -0.015, y: -0.03 },
+  },
+  Victory: {
+    Spine01: { y: 0.03 },
+    Spine02: { x: 0.01 },
+  },
+  ILoveYou: {
+    Spine01: { y: 0.025 },
+    Spine02: { x: 0.02, y: 0.02 },
+  },
+  Closed_Fist: {
+    Spine01: { x: 0.015 },
+    Spine02: { x: 0.02 },
+  },
+  Pointing_Up: {
+    Spine01: { y: 0.035 },
+    Spine02: { x: 0.015, y: 0.04 },
+  },
+  Namaste: {
+    Spine01: { x: 0.02 },
+    Spine02: { x: 0.03 },
+  },
+  Photo_Pose: {
+    Spine01: { y: 0.015 },
+    Spine02: { x: 0.01, y: 0.015 },
+  },
+};
+
+const ARM_CHAIN_BONE_NAMES = [
+  "LeftShoulder",
+  "LeftArm",
+  "LeftForeArm",
+  "LeftHand",
+  "RightShoulder",
+  "RightArm",
+  "RightForeArm",
+  "RightHand",
+] as const;
+
+// Per-frame WORLD-SPACE arm chain aim. Each frame, after the base pose is
+// applied, we rotate each bone so its child points in the desired world
+// direction. Because we recompute against the parent's *already-rotated*
+// world matrix, chaining shoulder → arm → forearm does not compound and
+// fold. This is bind-pose-agnostic and adapts to the model's local axes.
+type WorldAimSpec = { childBone: string; worldDir: THREE.Vector3 };
+// World-space arm chain aim has been removed. The Mixamo-style rig has
+// a perfectly mirrored bind-pose, so simple symmetric local-Euler
+// offsets in RELAXED_BODY_POSE / RELAXED_HAND_POSE drive both arms
+// without any runtime aim or mirror logic — which avoids the elbow
+// deformation that aiming the upper arm at a world direction caused.
+const ARM_CHAIN_WORLD_AIMS: Array<{ name: RelaxedAimBoneName } & WorldAimSpec> = [];
+
+// Kept for type compatibility with the rest of the file; populated empty
+// because the chain is now driven by ARM_CHAIN_WORLD_AIMS at runtime.
+const RELAXED_ARM_AIMS: Record<RelaxedAimBoneName, RelaxedAimSpec> = {} as Record<RelaxedAimBoneName, RelaxedAimSpec>;
+
+const DRIVEN_BONE_NAMES = Array.from(
+  new Set([
+    "Head",
+    "neck",
+    ...ARM_CHAIN_BONE_NAMES,
+    ...Object.keys(RELAXED_HAND_POSE),
+    ...Object.keys(RELAXED_BODY_POSE),
+    ...Object.values(GESTURE_BODY_POSES).flatMap((pose) => (pose ? Object.keys(pose) : [])),
+  ]),
+);
+
+function addBoneOffset(
+  target: Record<string, BoneAxisOffset>,
+  boneName: string,
+  axis: keyof BoneAxisOffset,
+  amount: number,
+) {
+  if (amount === 0) {
+    return;
+  }
+  const entry = target[boneName] ?? (target[boneName] = {});
+  entry[axis] = (entry[axis] ?? 0) + amount;
+}
+
+function mergeBonePose(
+  target: Record<string, BoneAxisOffset>,
+  pose: BonePose | undefined,
+  weight = 1,
+) {
+  if (!pose || weight <= 0) {
+    return;
+  }
+  Object.entries(pose).forEach(([boneName, axes]) => {
+    if (!axes) {
+      return;
+    }
+    if (axes.x !== undefined) {
+      addBoneOffset(target, boneName, "x", axes.x * weight);
+    }
+    if (axes.y !== undefined) {
+      addBoneOffset(target, boneName, "y", axes.y * weight);
+    }
+    if (axes.z !== undefined) {
+      addBoneOffset(target, boneName, "z", axes.z * weight);
+    }
+  });
+}
+
+function applyBoneOffsetFromRest(
+  bone: THREE.Bone,
+  restQuat: THREE.Quaternion,
+  offset: BoneAxisOffset | undefined,
+) {
+  bone.quaternion.copy(restQuat);
+  if (!offset) {
+    return;
+  }
+  poseEuler.set(offset.x ?? 0, offset.y ?? 0, offset.z ?? 0, "XYZ");
+  poseQuat.setFromEuler(poseEuler);
+  bone.quaternion.multiply(poseQuat);
+}
+
+function findFirstBoneChild(bone: THREE.Bone): THREE.Bone | null {
+  for (const child of bone.children) {
+    if ((child as THREE.Bone).isBone) {
+      return child as THREE.Bone;
+    }
+  }
+  return null;
+}
+
+function createAimPoseQuaternion(
+  bone: THREE.Bone,
+  restQuat: THREE.Quaternion,
+  targetDirectionInParentSpace: THREE.Vector3,
+): THREE.Quaternion | null {
+  const childBone = findFirstBoneChild(bone);
+  if (!childBone || childBone.position.lengthSq() < 1e-6) {
+    return null;
+  }
+
+  const sourceDirLocal = poseVec.copy(childBone.position).normalize();
+  const targetDirLocal = poseVec2
+    .copy(targetDirectionInParentSpace)
+    .normalize()
+    .applyQuaternion(poseQuat2.copy(restQuat).invert())
+    .normalize();
+
+  if (sourceDirLocal.lengthSq() < 1e-6 || targetDirLocal.lengthSq() < 1e-6) {
+    return null;
+  }
+
+  const delta = new THREE.Quaternion().setFromUnitVectors(sourceDirLocal, targetDirLocal);
+  return restQuat.clone().multiply(delta);
+}
 
 /**
- * Emote animation system using motion-captured GLB clips from the
- * Ready Player Me Animation Library (CC-BY-4.0).
- * Each gesture detection maps to a full-body emote animation loaded via
- * THREE.AnimationMixer, giving natural motion-captured body movement.
+ * Gestures are applied as curated local-bone offsets from this model's own
+ * bind pose. This is less flashy than cross-skeleton retargeting, but it is
+ * stable and avoids the body deformation seen with foreign mocap clips.
  */
-const EMOTE_ANIMATIONS: Record<string, string> = {
-  Open_Palm:   "/animations/M_Standing_Expressions_013.glb", // wave / greeting
-  Thumb_Up:    "/animations/M_Standing_Expressions_012.glb", // thumbs up
-  Thumb_Down:  "/animations/M_Standing_Expressions_014.glb", // head shake / disagree
-  Victory:     "/animations/M_Standing_Expressions_005.glb", // celebration / expressive
-  ILoveYou:    "/animations/M_Standing_Expressions_007.glb", // heartfelt / appreciative
-  Closed_Fist: "/animations/M_Standing_Expressions_008.glb", // fist pump / strong
-  Pointing_Up: "/animations/M_Standing_Expressions_010.glb", // pointing / presenting
-  Namaste:     "/animations/M_Standing_Expressions_011.glb", // hand to chest / respectful bow
-  Photo_Pose:  "/animations/M_Standing_Expressions_015.glb", // friendly pose for photo
-};
 
 // How long to keep gesture active after last MediaPipe detection (seconds)
 const GESTURE_HOLD_TIME = 1.5;
-// Blend duration for crossfading into and out of emotes (seconds)
-const EMOTE_BLEND_IN = 0.3;
-const EMOTE_BLEND_OUT = 0.5;
 
 /* ── 3D Model ── */
 function AvatarModel({
@@ -289,28 +497,17 @@ function AvatarModel({
   gestureRef: MutableRefObject<GestureName>;
   userSmileRef: MutableRefObject<number>;
 }) {
-  const fbx = useFBX(AVATAR_URL);
-  const scene = fbx;
+  const gltf = useGLTF(AVATAR_URL);
+  const fbx = gltf;
+  const scene = gltf.scene;
   const morphMeshes = useRef<THREE.Mesh[]>([]);
-  const headBone = useRef<THREE.Object3D | null>(null);
   const lipSync = useRef(new AudioLipSync());
-  // Auto-computed Y offset from bounding box (state to trigger re-render)
-  const [modelYOffset, setModelYOffset] = useState(0);
-  // Store the Hips bone's original position to lock root motion (all axes)
-  const hipsOrigPos = useRef<THREE.Vector3 | null>(null);
-  const hipsBone = useRef<THREE.Bone | null>(null);
+  // Rest-pose quaternions for all driven bones.
+  const boneRestQuats = useRef<Record<string, THREE.Quaternion>>({});
+  const aimedBoneTargets = useRef<Partial<Record<RelaxedAimBoneName, THREE.Quaternion>>>({});
 
-  // Built-in idle animation action ref
-  const idleAction = useRef<THREE.AnimationAction | null>(null);
-  // Set of all bone names in this skeleton (for retargeting emote clips)
-  const skeletonBoneNames = useRef<Set<string>>(new Set());
-
-  // ── Emote animation system ──
-  const mixer = useRef<THREE.AnimationMixer | null>(null);
-  const emoteActions = useRef<Record<string, THREE.AnimationAction>>({});
-  const currentEmoteAction = useRef<THREE.AnimationAction | null>(null);
-  // Smoothed emote blend (0 = rest pose, 1 = full animation)
-  const emoteBlend = useRef(0);
+  // ── Gesture pose system ──
+  const gesturePoseBlend = useRef(0);
   const activeGesture = useRef<GestureName>(null);
   // Gesture hold: keep gesture active for GESTURE_HOLD_TIME after last detection
   const gestureHoldName = useRef<GestureName>(null);
@@ -319,19 +516,66 @@ function AvatarModel({
   const gestureExprBlend = useRef(0);
   // Manual delta time tracking (clock.getDelta() is unreliable with getElapsedTime())
   const lastFrameTime = useRef(0);
-  // All bones (not just arm bones) for animation blending
+  // Smoothed audio envelope (slow attack, slower release) used to drive
+  // visible head nods during speech since the model has no jaw bone and
+  // the bushy beard occludes mouth morph deformation.
+  const speechEnv = useRef(0);
+  const speechPulse = useRef(0);
+  const speechPulseDecay = useRef(0);
+  // All bones by name for procedural posing.
   const allBones = useRef<Record<string, THREE.Bone>>({});
 
   useEffect(() => {
     const meshes: THREE.Mesh[] = [];
+    allBones.current = {};
+    boneRestQuats.current = {};
+    aimedBoneTargets.current = {};
+
+    // Load the base color texture extracted from the source FBX (FBX2glTF
+    // can't embed it because the lipsync FBX strips images).
+    const texLoader = new THREE.TextureLoader();
+    const baseColorTex = texLoader.load("/avatar-base.png");
+    baseColorTex.colorSpace = THREE.SRGBColorSpace;
+    baseColorTex.flipY = false; // glTF convention
+    baseColorTex.anisotropy = 16;
+    baseColorTex.wrapS = THREE.RepeatWrapping;
+    baseColorTex.wrapT = THREE.RepeatWrapping;
+
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
+        if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) {
+          const skinnedMesh = mesh as THREE.SkinnedMesh;
+          skinnedMesh.normalizeSkinWeights();
+        }
         // Enhance skin textures
         if (mesh.material) {
           const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
           mats.forEach((mat) => {
             const m = mat as THREE.MeshStandardMaterial;
+            // FBX2glTF emits a 1x1 stub for baseColorTexture because it can't
+            // find the embedded image. Replace it with the real texture we
+            // extracted from the source FBX.
+            const mapImg = m.map?.image as { width?: number } | undefined;
+            const stubMap = !!m.map && !!mapImg && (mapImg.width ?? 0) <= 4;
+            if (!m.map || stubMap) {
+              if (m.map) m.map.dispose?.();
+              m.map = baseColorTex;
+              m.color = new THREE.Color(0xffffff);
+            }
+            // Kill the all-white emissive that bakes from FBX Phong shading model.
+            if (m.emissiveMap) {
+              m.emissiveMap.dispose?.();
+              m.emissiveMap = null;
+            }
+            m.emissive = new THREE.Color(0x000000);
+            // Drop any stub normalMap (1×1 placeholder from FBX2glTF) which
+            // triggers "Texture marked for update but no image data found".
+            const normalImg = m.normalMap?.image as { width?: number } | undefined;
+            if (m.normalMap && normalImg && (normalImg.width ?? 0) <= 4) {
+              m.normalMap.dispose?.();
+              m.normalMap = null;
+            }
             if (m.map) {
               m.map.anisotropy = 16;
               m.map.minFilter = THREE.LinearMipmapLinearFilter;
@@ -355,22 +599,35 @@ function AvatarModel({
         // Prevent frustum-culling artifacts on large skinned mesh
         mesh.frustumCulled = false;
         if (mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+          // Re-key morphTargetDictionary so the lipsync code can find
+          // viseme_aa, viseme_O, etc. by name (FBX2glTF strips target names).
+          const oldDict = mesh.morphTargetDictionary;
+          const newDict: Record<string, number> = {};
+          for (const [key, idx] of Object.entries(oldDict)) {
+            const remapped = MORPH_NAME_REMAP[key] ?? key;
+            newDict[remapped] = idx as number;
+          }
+          mesh.morphTargetDictionary = newDict;
+          // GLB defaults all viseme weights to 1 (mouth wide open in every
+          // shape simultaneously); reset to 0 so lipsync controls them.
+          for (let i = 0; i < mesh.morphTargetInfluences.length; i++) {
+            mesh.morphTargetInfluences[i] = 0;
+          }
+          console.log('[Avatar] morph dict remapped:', Object.keys(newDict));
           meshes.push(mesh);
         }
       }
-      if (obj.name === "Head") headBone.current = obj;
-      if (obj.name === "Hips") hipsBone.current = obj as THREE.Bone;
-      // Collect ALL bones for animation blending
       if ((obj as THREE.Bone).isBone) {
         allBones.current[obj.name] = obj as THREE.Bone;
-        skeletonBoneNames.current.add(obj.name);
+        boneRestQuats.current[obj.name] = (obj as THREE.Bone).quaternion.clone();
       }
     });
     morphMeshes.current = meshes;
 
     // ── Fixed scale + position ──
     // The model is ~170 units tall (cm). FBXLoader may or may not apply unit conversion.
-    // Reset scale first so React Strict Mode re-runs measure raw model height.
+    // Reset transforms first so React Strict Mode re-runs measure raw model.
+    scene.position.set(0, 0, 0);
     scene.scale.set(1, 1, 1);
     scene.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(scene);
@@ -379,12 +636,13 @@ function AvatarModel({
       min: [box.min.x.toFixed(2), box.min.y.toFixed(2), box.min.z.toFixed(2)],
       max: [box.max.x.toFixed(2), box.max.y.toFixed(2), box.max.z.toFixed(2)],
       height: modelHeight.toFixed(2),
-      bones: [...skeletonBoneNames.current].join(", "),
+      bones: Object.keys(allBones.current).join(", "),
       animations: (fbx.animations || []).map(a => a.name),
     });
 
-    // Force the model to be exactly 1.8 world units tall
-    const desiredHeight = 1.8;
+    // Force the model to be a little shorter than full viewport height so
+    // conversational head motion and hair stay inside frame.
+    const desiredHeight = 2.6;
     if (modelHeight > 0.001) {
       const s = desiredHeight / modelHeight;
       scene.scale.set(s, s, s);
@@ -395,85 +653,27 @@ function AvatarModel({
       console.log("[Avatar] Fallback scale applied (model height was 0)");
     }
 
-    // Recompute after scaling and center vertically
+    // Recompute after scaling and center the avatar in frame.
     scene.updateMatrixWorld(true);
     const scaledBox = new THREE.Box3().setFromObject(scene);
     const scaledCenter = new THREE.Vector3();
     scaledBox.getCenter(scaledCenter);
-    // Place feet at bottom of view: shift so model bottom is at y = -desiredHeight/2
-    const yOffset = -scaledBox.min.y - desiredHeight * 0.45;
+    const framingBiasY = 0;
+    const xOffset = -scaledCenter.x;
+    const yOffset = -scaledCenter.y + framingBiasY;
+    const zOffset = -scaledCenter.z;
     console.log("[Avatar] After scale:", {
+      centerX: scaledCenter.x.toFixed(3),
       min: scaledBox.min.y.toFixed(3),
       max: scaledBox.max.y.toFixed(3),
       center: scaledCenter.y.toFixed(3),
+      xOffset: xOffset.toFixed(3),
       yOffset: yOffset.toFixed(3),
+      zOffset: zOffset.toFixed(3),
     });
-    setModelYOffset(yOffset);
-
-    // ── Create AnimationMixer ──
-    mixer.current = new THREE.AnimationMixer(scene);
-
-    // Record the Hips bone rest position (all axes) to lock it each frame
-    if (hipsBone.current) {
-      hipsOrigPos.current = hipsBone.current.position.clone();
-    }
-
-    // Listen for animation end to clean up
-    mixer.current.addEventListener("finished", () => {
-      // Animation completed its play-through; we'll blend out via emoteBlend
-    });
-
-    // ── Use the model's own built-in animation as idle ──
-    // The FBX ships with "Armature|Armature|clip0|baselayer" which is a proper
-    // idle for this specific skeleton. Using emote-derived idle causes distortion
-    // because the RPM emote quaternions don't match this model's rest pose.
-    if (fbx.animations && fbx.animations.length > 0 && mixer.current) {
-      const builtInClip = fbx.animations[0];
-      const action = mixer.current.clipAction(builtInClip);
-      action.setLoop(THREE.LoopRepeat, Infinity);
-      action.setEffectiveWeight(1);
-      action.play();
-      idleAction.current = action;
-      console.log(`[Avatar] Using built-in idle animation: "${builtInClip.name}" (${builtInClip.tracks.length} tracks, ${builtInClip.duration.toFixed(2)}s)`);
-    }
-
-    // Load all emote animations (gesture overlays only — no idle override).
-    const loader = new GLTFLoader();
-
-    const loadPromises = Object.entries(EMOTE_ANIMATIONS)
-      .map(
-        ([gestureName, url]) =>
-          new Promise<void>((resolve) => {
-            loader.load(
-              url,
-              (emoteGltf) => {
-                if (emoteGltf.animations.length > 0 && mixer.current) {
-                  const rawClip = emoteGltf.animations[0];
-                  const retargeted = retargetClip(rawClip, skeletonBoneNames.current);
-                  // Strip position tracks to prevent root motion
-                  retargeted.tracks = retargeted.tracks.filter(t => !t.name.endsWith('.position'));
-                  retargeted.name = gestureName;
-                  console.log(`[Avatar] Emote "${gestureName}": ${retargeted.tracks.length} tracks → ${retargeted.tracks.map(t => t.name.split('.')[0]).slice(0, 5).join(', ')}...`);
-
-                  const action = mixer.current.clipAction(retargeted);
-                  action.setLoop(THREE.LoopOnce, 1);
-                  action.clampWhenFinished = true;
-                  action.setEffectiveWeight(0);
-                  emoteActions.current[gestureName] = action;
-                }
-                resolve();
-              },
-              undefined,
-              () => resolve(),
-            );
-          }),
-      );
-    Promise.all(loadPromises);
-
-    return () => {
-      mixer.current?.stopAllAction();
-      mixer.current = null;
-    };
+    scene.position.set(xOffset, yOffset, zOffset);
+    // Expose for live tuning from devtools.
+    (window as unknown as { __sage?: unknown }).__sage = { scene, scaledBox, scaledCenter, modelHeight };
   }, [scene, fbx.animations]);
 
   useFrame(({ clock }) => {
@@ -562,7 +762,6 @@ function AvatarModel({
       }
     });
 
-    // ── Emote animation system ──
     const curGesture = gestureRef.current;
     // Manual delta: clock.getDelta() is unreliable when getElapsedTime() is also used
     const now = t;
@@ -570,7 +769,7 @@ function AvatarModel({
     lastFrameTime.current = now;
 
     // Sticky gesture: hold detected gesture active for GESTURE_HOLD_TIME
-    if (curGesture && emoteActions.current[curGesture]) {
+    if (curGesture) {
       gestureHoldName.current = curGesture;
       gestureLastSeen.current = now;
     }
@@ -578,58 +777,22 @@ function AvatarModel({
     const gestureFresh = heldGesture && (now - gestureLastSeen.current) < GESTURE_HOLD_TIME;
 
     if (gestureFresh && heldGesture) {
-      // Start or continue emote
       if (activeGesture.current !== heldGesture) {
-        // Cross-fade: old emote/idle → new emote
-        const action = emoteActions.current[heldGesture];
-        if (action) {
-          // Stop any previous emote cleanly
-          if (currentEmoteAction.current && currentEmoteAction.current !== idleAction.current) {
-            currentEmoteAction.current.fadeOut(EMOTE_BLEND_IN);
-          }
-          action.reset();
-          action.setEffectiveWeight(1);
-          action.setEffectiveTimeScale(1);
-          action.play();
-          // Cross-fade from idle to emote (idle fades out as emote fades in)
-          if (idleAction.current) {
-            action.crossFadeFrom(idleAction.current, EMOTE_BLEND_IN, true);
-          } else {
-            action.fadeIn(EMOTE_BLEND_IN);
-          }
-          currentEmoteAction.current = action;
-        }
         activeGesture.current = heldGesture;
       }
-      emoteBlend.current = Math.min(1, emoteBlend.current + dt / EMOTE_BLEND_IN);
-      gestureExprBlend.current = Math.min(1, gestureExprBlend.current + dt / (EMOTE_BLEND_IN * 1.2));
+      gesturePoseBlend.current = Math.min(1, gesturePoseBlend.current + dt / GESTURE_BLEND_IN);
+      gestureExprBlend.current = Math.min(1, gestureExprBlend.current + dt / (GESTURE_BLEND_IN * 1.2));
     } else {
-      // Blend out emote → back to idle
-      emoteBlend.current = Math.max(0, emoteBlend.current - dt / EMOTE_BLEND_OUT);
-      gestureExprBlend.current = Math.max(0, gestureExprBlend.current - dt / (EMOTE_BLEND_OUT * 1.5));
-      if (activeGesture.current && emoteBlend.current <= 0) {
-        // Cross-fade from emote back to idle
-        if (idleAction.current) {
-          idleAction.current.reset();
-          idleAction.current.setEffectiveWeight(1);
-          idleAction.current.setEffectiveTimeScale(1);
-          idleAction.current.play();
-          if (currentEmoteAction.current) {
-            idleAction.current.crossFadeFrom(currentEmoteAction.current, EMOTE_BLEND_OUT, true);
-          } else {
-            idleAction.current.fadeIn(EMOTE_BLEND_OUT);
-          }
-        } else if (currentEmoteAction.current) {
-          currentEmoteAction.current.fadeOut(EMOTE_BLEND_OUT);
-        }
-        currentEmoteAction.current = null;
+      gesturePoseBlend.current = Math.max(0, gesturePoseBlend.current - dt / GESTURE_BLEND_OUT);
+      gestureExprBlend.current = Math.max(0, gestureExprBlend.current - dt / (GESTURE_BLEND_OUT * 1.5));
+      if (gesturePoseBlend.current <= 0.001) {
         activeGesture.current = null;
         gestureHoldName.current = null;
       }
     }
 
-    const blend = emoteBlend.current;
     const gesture = activeGesture.current;
+    const gestureBlend = gesturePoseBlend.current;
     const exprBlend = gestureExprBlend.current;
 
     // ── Gesture-triggered facial expressions ──
@@ -686,74 +849,118 @@ function AvatarModel({
       });
     }
 
-    // ── Emote bone blending ──
-    // The built-in idle animation runs via the mixer. Emote gestures
-    // crossfade in/out using AnimationAction weight, handled by the mixer.
-    // Just update the mixer each frame.
-    if (mixer.current) {
-      mixer.current.update(dt);
+    // ── Stable procedural body posing ──
+    // Every driven bone is rebuilt from its original bind-pose quaternion each
+    // frame. That prevents the additive drift that was deforming the body.
+    const poseOffsets: Record<string, BoneAxisOffset> = {};
+    mergeBonePose(poseOffsets, RELAXED_BODY_POSE, 1);
+    mergeBonePose(poseOffsets, RELAXED_HAND_POSE, 1);
+    if (gesture && gestureBlend > 0.001) {
+      mergeBonePose(poseOffsets, GESTURE_BODY_POSES[gesture as ConcreteGestureName], gestureBlend);
     }
 
-    // ── Lock Hips position to prevent root-motion drift from any animation ──
-    if (hipsBone.current && hipsOrigPos.current) {
-      hipsBone.current.position.copy(hipsOrigPos.current);
-    }
+    const neck = allBones.current["neck"];
 
-    // ── Bone-based lip sync + speech body motion ──
-    // This model has NO morph targets, so all lip sync is bone-driven.
-    // Applied AFTER mixer.update() so the mixer sets the base pose first,
-    // then we add small additive deltas.
-    if (isSpeaking && idleAction.current) {
-      const v = Math.min(1, vol * 2.5);
+    if (isSpeaking) {
+      const rawV = Math.min(1, vol * 2.5);
       const jawOpen = lsTargets["jawOpen"] ?? 0;
       const vowelOpen = lsTargets["viseme_aa"] ?? 0;
-      const jawAmount = Math.min(1, (jawOpen + vowelOpen) * 2.5);
+      const jawAmount = Math.min(1, (jawOpen + vowelOpen) * 1.5);
 
-      if (headBone.current) {
-        // Jaw simulation: tilt head forward when "mouth opens" (no jaw bone)
-        headBone.current.rotation.x += jawAmount * 0.06;
-        // Conversational head nod + tilt synced to speech rhythm
-        headBone.current.rotation.x += Math.sin(t * 2.0) * 0.015 * (0.3 + v);
-        headBone.current.rotation.y += Math.sin(t * 1.3 + 0.5) * 0.02 * (0.3 + v);
-        headBone.current.rotation.z += Math.sin(t * 0.9 + 1.0) * 0.008 * v;
+      // Smoothed envelope: fast attack, slow release. Each loud syllable
+      // pumps the envelope up; quiet gaps let it fall. Drives a visible
+      // amplitude-reactive head nod — the universal "I'm talking" cue
+      // when the mouth itself is hidden under the beard.
+      const drive = Math.max(rawV, jawAmount * 0.8);
+      if (drive > speechEnv.current) {
+        speechEnv.current += (drive - speechEnv.current) * 0.45; // attack
+      } else {
+        speechEnv.current += (drive - speechEnv.current) * 0.08; // release
       }
-      // Neck: counter-rotate slightly against jaw for realism
-      const neck = allBones.current["neck"];
+      // Per-syllable pulse: rising edge of the envelope triggers a nod.
+      const env = speechEnv.current;
+      if (drive > 0.35 && drive > speechPulse.current * 0.95) {
+        speechPulse.current = drive;
+        speechPulseDecay.current = 1;
+      } else {
+        speechPulseDecay.current *= 0.88;
+      }
+      const pulse = speechPulse.current * speechPulseDecay.current;
+
+      // Big amplitude-driven head nod (down on loud syllables) +
+      // continuous gentle sway so the beard wags even between syllables.
+      const nodDown = env * 0.18 + pulse * 0.10;
+      addBoneOffset(poseOffsets, "Head", "x", nodDown);
+      addBoneOffset(poseOffsets, "Head", "x", Math.sin(t * 6.0) * 0.035 * (0.4 + env));
+      addBoneOffset(poseOffsets, "Head", "y", Math.sin(t * 1.3 + 0.5) * 0.05 * (0.3 + env));
+      addBoneOffset(poseOffsets, "Head", "z", Math.sin(t * 0.9 + 1.0) * 0.025 * env);
       if (neck) {
-        neck.rotation.x += jawAmount * -0.02;
-        neck.rotation.x += Math.sin(t * 1.5 + 0.3) * 0.01 * (0.3 + v);
-        neck.rotation.y += Math.sin(t * 1.0 + 1.2) * 0.012 * (0.3 + v);
+        addBoneOffset(poseOffsets, "neck", "x", nodDown * -0.35);
+        addBoneOffset(poseOffsets, "neck", "x", Math.sin(t * 6.0 + 0.4) * 0.02 * (0.4 + env));
+        addBoneOffset(poseOffsets, "neck", "y", Math.sin(t * 1.0 + 1.2) * 0.025 * (0.3 + env));
       }
-      // Spine02 (upper torso) sway for conversational emphasis
-      const spine02 = allBones.current["Spine02"];
-      if (spine02) {
-        spine02.rotation.x += Math.sin(t * 0.8 + 0.7) * 0.008 * (0.2 + v * 0.3);
-        spine02.rotation.y += Math.sin(t * 0.6 + 2.0) * 0.01 * (0.2 + v * 0.3);
+      addBoneOffset(poseOffsets, "Spine02", "x", nodDown * -0.12);
+      addBoneOffset(poseOffsets, "Spine02", "x", Math.sin(t * 0.8 + 0.7) * 0.014 * (0.2 + env * 0.4));
+      addBoneOffset(poseOffsets, "Spine02", "y", Math.sin(t * 0.6 + 2.0) * 0.016 * (0.2 + env * 0.4));
+      addBoneOffset(poseOffsets, "LeftShoulder", "z", Math.sin(t * 1.8 + 0.5) * 0.008 * env);
+      addBoneOffset(poseOffsets, "RightShoulder", "z", Math.sin(t * 1.8 + 1.5) * 0.008 * env);
+    } else {
+      // Decay speech envelope when not speaking.
+      speechEnv.current *= 0.85;
+      speechPulseDecay.current *= 0.85;
+      addBoneOffset(poseOffsets, "Head", "x", Math.sin(t * 0.3 + 0.5) * 0.002);
+      addBoneOffset(poseOffsets, "Head", "y", Math.sin(t * 0.2 + 1.0) * 0.003);
+      if (neck) {
+        addBoneOffset(poseOffsets, "neck", "x", Math.sin(t * 0.25) * 0.002);
       }
-      // Shoulder micro-motion for breathing/emphasis
-      const lShoulder = allBones.current["LeftShoulder"];
-      const rShoulder = allBones.current["RightShoulder"];
-      if (lShoulder) {
-        lShoulder.rotation.z += Math.sin(t * 1.8 + 0.5) * 0.006 * v;
-      }
-      if (rShoulder) {
-        rShoulder.rotation.z += Math.sin(t * 1.8 + 1.5) * 0.006 * v;
-      }
-    } else if (idleAction.current) {
-      // Idle breathing: subtle spine/shoulder motion even when not speaking
-      const spine02 = allBones.current["Spine02"];
-      if (spine02) {
-        spine02.rotation.x += Math.sin(t * 0.4) * 0.003;
-      }
-      if (headBone.current) {
-        headBone.current.rotation.x += Math.sin(t * 0.3 + 0.5) * 0.002;
-        headBone.current.rotation.y += Math.sin(t * 0.2 + 1.0) * 0.003;
-      }
+      addBoneOffset(poseOffsets, "Spine02", "x", Math.sin(t * 0.4) * 0.003);
     }
+
+    if (gesture && gestureBlend > 0.001) {
+      addBoneOffset(poseOffsets, "Spine01", "y", Math.sin(t * 1.6) * 0.01 * gestureBlend);
+    }
+
+    DRIVEN_BONE_NAMES.forEach((boneName) => {
+      const bone = allBones.current[boneName];
+      const restQuat = boneRestQuats.current[boneName];
+      if (!bone || !restQuat) {
+        return;
+      }
+      applyBoneOffsetFromRest(bone, restQuat, poseOffsets[boneName]);
+    });
+
+    // ── World-space arm chain aim ──
+    // Recompute each bone's local rotation against its parent's *current*
+    // world matrix so the chain does not fold. Order matters: parent first,
+    // child after, with updateMatrixWorld between them.
+    for (const aim of ARM_CHAIN_WORLD_AIMS) {
+      const bone = allBones.current[aim.name];
+      const childBone = allBones.current[aim.childBone];
+      if (!bone || !childBone || !bone.parent) continue;
+
+      bone.parent.updateMatrixWorld(true);
+      bone.updateMatrixWorld(true);
+      childBone.updateMatrixWorld(true);
+
+      bone.getWorldPosition(aimBoneWorld);
+      childBone.getWorldPosition(aimChildWorld);
+      aimCurrentDir.copy(aimChildWorld).sub(aimBoneWorld);
+      if (aimCurrentDir.lengthSq() < 1e-8) continue;
+      aimCurrentDir.normalize();
+      aimTargetDir.copy(aim.worldDir).normalize();
+
+      aimDeltaQuat.setFromUnitVectors(aimCurrentDir, aimTargetDir);
+      bone.getWorldQuaternion(aimCurrentWorldQuat);
+      aimTargetWorldQuat.copy(aimDeltaQuat).multiply(aimCurrentWorldQuat);
+      bone.parent.getWorldQuaternion(aimParentWorldQuat).invert();
+      bone.quaternion.copy(aimParentWorldQuat).multiply(aimTargetWorldQuat);
+      bone.updateMatrixWorld(true);
+    }
+
   });
 
-  // Position model: auto-computed Y offset, rotate 180° to face camera (model faces -Z)
-  return <primitive object={scene} position={[0, modelYOffset, 0]} rotation={[0, Math.PI, 0]} />;
+  // Position model via scene.position in the effect above.
+  return <primitive object={scene} />;
 }
 
 /* ── Loading placeholder ── */
@@ -809,17 +1016,20 @@ export default function Avatar3D({ isSpeaking, getAudioData, getVolume, gesture,
   const volumeRef = useRef(getVolume);
   const gestureRef = useRef<GestureName>(null);
   const userSmileRef = useRef(0);
-  audioDataRef.current = getAudioData;
-  volumeRef.current = getVolume;
-  gestureRef.current = (gesture as GestureName) ?? null;
-  userSmileRef.current = userSmile ?? 0;
+
+  useEffect(() => {
+    audioDataRef.current = getAudioData;
+    volumeRef.current = getVolume;
+    gestureRef.current = (gesture as GestureName) ?? null;
+    userSmileRef.current = userSmile ?? 0;
+  }, [getAudioData, getVolume, gesture, userSmile]);
 
   return (
     <AvatarErrorBoundary fallback={<FallbackOrb isSpeaking={isSpeaking} />}>
       <Suspense fallback={<Loader />}>
         <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
           <Canvas
-            camera={{ position: [0, 0.5, 5], fov: 30 }}
+            camera={{ position: [0, 0.05, 5.7], fov: 36 }}
             gl={{ alpha: true, antialias: true }}
             dpr={[1, 2]}
             onCreated={({ gl }) => {

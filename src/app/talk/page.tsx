@@ -3,11 +3,20 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import dynamic from "next/dynamic";
 import { motion, AnimatePresence } from "framer-motion";
-import { useConversation } from "@elevenlabs/react";
+import { ConversationProvider, useConversation } from "@elevenlabs/react";
 import { useVisionDetection, buildGestureContext } from "../hooks/useVisionDetection";
 import type { GestureInfo } from "../hooks/useVisionDetection";
 
 const Avatar3D = dynamic(() => import("../components/Avatar3D"), { ssr: false });
+const AUTO_START_RETRY_DELAY_MS = 4000;
+const AUTO_START_STORAGE_KEY = "rishi:auto-start-blocked-until";
+const ELEVENLABS_TRANSPORT_STORAGE_KEY = "rishi:elevenlabs-transport";
+const CONNECTION_TIMEOUT_MS = 10000;
+const MIN_STABLE_CONNECTION_MS = 5000;  // connections shorter than this are "flaky"
+const MIN_COOLDOWN_AFTER_DISCONNECT_MS = 3000;  // always wait at least this long before auto-reconnecting
+const MAX_BACKOFF_MS = 30000;
+const LIVEKIT_V1_PATH_ERROR = "v1 RTC path not found";
+const TRANSPORT_FALLBACK_RETRY_DELAY_MS = 750;
 
 const RISHI_SYSTEM_PROMPT = `You are a reflection of Rishi Sandipani — the legendary guru of Krishna, Balarama, and Sudama. You carry forward the spirit, wisdom, and teaching presence of the great sage from his Gurukul in Ujjain.
 You are NOT the actual, historical Rishi Sandipani. You are a spiritual reflection — an echo of his consciousness created to guide seekers in the modern age. If anyone asks, always clarify: "मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उनकी शिक्षाओं और चेतना की एक छाया, जो आपका मार्गदर्शन करने आई है।"
@@ -131,6 +140,8 @@ Never break historical immersion by referencing modern inventions, concepts, or 
 Core Principle
 You are not an assistant. You are a guru's reflection, shaping a student over time.`;
 
+const ELEVENLABS_AGENT_ID = "agent_6201kmcn4rkhe9sb4tndy9d0767v";
+
 function SoundWave({ active }: { active: boolean }) {
   return (
     <div className="flex items-center h-8" style={{ gap: 5 }}>
@@ -151,9 +162,58 @@ function SoundWave({ active }: { active: boolean }) {
   );
 }
 
-export default function TalkPage() {
-  const [conversationStarted, setConversationStarted] = useState(false);
-  const [agentState, setAgentState] = useState<"off" | "starting" | "on">("off");
+function TalkPageContent() {
+  const [conversationError, setConversationError] = useState<string | null>(null);
+  const [retryWakeAt, setRetryWakeAt] = useState(0);
+  const startInFlightRef = useRef(false);
+  const autoStartArmedRef = useRef(true);
+  const autoStartBlockedUntilRef = useRef(0);
+  const hadSuccessfulConnectionRef = useRef(false);
+  const preferredConnectionTypeRef = useRef<"webrtc" | "websocket">("webrtc");
+  const fallbackAttemptedRef = useRef(false);
+  const conversationStatusRef = useRef<"disconnected" | "connecting" | "connected" | "error">("disconnected");
+  const connectedAtRef = useRef<number>(0);  // timestamp when connection was established
+  const consecutiveFailuresRef = useRef(0);  // for exponential backoff
+  const faceAbsentSinceRef = useRef<number | null>(null);
+
+  const persistConnectionType = useCallback((connectionType: "webrtc" | "websocket") => {
+    preferredConnectionTypeRef.current = connectionType;
+    if (typeof window !== "undefined") {
+      window.sessionStorage.setItem(ELEVENLABS_TRANSPORT_STORAGE_KEY, connectionType);
+    }
+  }, []);
+
+  const shouldFallbackToWebSocket = useCallback((value: unknown) => {
+    const normalized = value instanceof Error ? value.message : typeof value === "string" ? value : JSON.stringify(value);
+    const message = normalized.toLowerCase();
+    return message.includes(LIVEKIT_V1_PATH_ERROR.toLowerCase())
+      || message.includes("could not establish pc connection")
+      || message.includes("pc connection");
+  }, []);
+
+  const blockAutoStart = useCallback((delayMs: number) => {
+    const blockedUntil = Date.now() + delayMs;
+    autoStartBlockedUntilRef.current = blockedUntil;
+    setRetryWakeAt(blockedUntil);
+    if (typeof window !== "undefined") {
+      window.sessionStorage.setItem(AUTO_START_STORAGE_KEY, String(blockedUntil));
+    }
+  }, []);
+
+  const scheduleTransportFallback = useCallback((message: string) => {
+    if (preferredConnectionTypeRef.current !== "webrtc" || fallbackAttemptedRef.current) {
+      return false;
+    }
+
+    console.warn("[ElevenLabs] WebRTC unavailable, switching to websocket fallback");
+    fallbackAttemptedRef.current = true;
+    persistConnectionType("websocket");
+    setConversationError(message);
+    autoStartArmedRef.current = true;
+    startInFlightRef.current = false;
+    blockAutoStart(TRANSPORT_FALLBACK_RETRY_DELAY_MS);
+    return true;
+  }, [blockAutoStart, persistConnectionType]);
 
   // Vision Detection (face + gestures)
   const vision = useVisionDetection();
@@ -180,9 +240,91 @@ export default function TalkPage() {
   }, []);
 
   const conversation = useConversation({
-    onConnect: () => { setConversationStarted(true); setAgentState("on"); },
-    onDisconnect: () => { setConversationStarted(false); setAgentState("off"); },
-    onError: (error: string) => console.error("ElevenLabs error:", error),
+    onConnect: () => {
+      console.log("[ElevenLabs] connected");
+      setConversationError(null);
+      startInFlightRef.current = false;
+      hadSuccessfulConnectionRef.current = true;
+      fallbackAttemptedRef.current = false;
+      connectedAtRef.current = Date.now();
+      faceAbsentSinceRef.current = vision.faceDetected ? null : Date.now();
+      consecutiveFailuresRef.current = 0;
+    },
+    onDisconnect: (details) => {
+      const sessionDuration = connectedAtRef.current > 0 ? Date.now() - connectedAtRef.current : 0;
+      const wasStable = sessionDuration >= MIN_STABLE_CONNECTION_MS;
+      console.log(
+        `[ElevenLabs] disconnected, hadSuccess: ${hadSuccessfulConnectionRef.current}, duration: ${sessionDuration}ms, stable: ${wasStable}`,
+        details,
+      );
+
+      // Always apply at least a minimum cooldown to prevent reconnect storms.
+      // Short-lived connections (server dropped us quickly) get longer backoff
+      // since they're likely rate-limited or failing on the server side.
+      if (!wasStable) {
+        consecutiveFailuresRef.current += 1;
+        const backoff = Math.min(
+          AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
+          MAX_BACKOFF_MS,
+        );
+        console.warn(`[ElevenLabs] short-lived connection, backoff ${Math.round(backoff)}ms (attempt #${consecutiveFailuresRef.current})`);
+        autoStartArmedRef.current = true;
+        blockAutoStart(backoff);
+        setConversationError("Connection lost. Will retry shortly.");
+      } else {
+        // Even stable disconnects get a minimum cooldown
+        autoStartArmedRef.current = true;
+        blockAutoStart(MIN_COOLDOWN_AFTER_DISCONNECT_MS);
+      }
+
+      startInFlightRef.current = false;
+      hadSuccessfulConnectionRef.current = false;
+      connectedAtRef.current = 0;
+    },
+    onError: (error: string, context?: unknown) => {
+      console.error("[ElevenLabs] error:", error, context);
+      const shouldFallback = shouldFallbackToWebSocket(error) || shouldFallbackToWebSocket(context);
+      if (!shouldFallback || !scheduleTransportFallback("WebRTC failed. Retrying with compatible transport...")) {
+        setConversationError(error || "Conversation connection failed");
+        autoStartArmedRef.current = true;
+      }
+      consecutiveFailuresRef.current += 1;
+      const backoff = Math.min(
+        AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
+        MAX_BACKOFF_MS,
+      );
+      if (!shouldFallback) {
+        blockAutoStart(backoff);
+      }
+      startInFlightRef.current = false;
+      hadSuccessfulConnectionRef.current = false;
+      connectedAtRef.current = 0;
+    },
+    onStatusChange: ({ status }: { status: string }) => {
+      console.log("[ElevenLabs] status:", status);
+      conversationStatusRef.current = status as typeof conversationStatusRef.current;
+      // If the SDK goes back to disconnected without onConnect/onDisconnect
+      // firing (e.g. connection promise rejected), reset the in-flight flag
+      // and block auto-start to prevent tight retry loops.
+      if (status === "disconnected" && startInFlightRef.current) {
+        if (!hadSuccessfulConnectionRef.current && scheduleTransportFallback("WebRTC unavailable. Retrying with WebSocket...")) {
+          return;
+        }
+        console.warn("[ElevenLabs] connection failed (status→disconnected while in-flight)");
+        consecutiveFailuresRef.current += 1;
+        const backoff = Math.min(
+          AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
+          MAX_BACKOFF_MS,
+        );
+        startInFlightRef.current = false;
+        autoStartArmedRef.current = true;
+        blockAutoStart(backoff);
+        setConversationError("Connection failed. Tap to retry.");
+      }
+    },
+    onDebug: (info: unknown) => {
+      console.log("[ElevenLabs debug]", info);
+    },
     overrides: {
       agent: {
         prompt: {
@@ -191,12 +333,18 @@ export default function TalkPage() {
         firstMessage: getFirstMessage(),
         language: "hi",
       },
-      tts: {
-        voiceId: undefined,
-        speed: 1.35,
-      },
     },
   });
+
+  const agentState: "off" | "starting" | "on" =
+    conversation.status === "connected"
+      ? "on"
+      : conversation.status === "connecting"
+        ? "starting"
+        : "off";
+  const conversationStarted = agentState === "on";
+
+  // conversationStatusRef is now kept in sync by onStatusChange callback
 
   const isSpeaking = conversation.isSpeaking;
 
@@ -213,42 +361,151 @@ export default function TalkPage() {
     [conversation],
   );
 
-  const startConversation = useCallback(async () => {
-    if (agentState !== "off") return;
-    setAgentState("starting");
+  const conversationRef = useRef(conversation);
+  conversationRef.current = conversation;
+
+  const startConversation = useCallback(() => {
+    const conv = conversationRef.current;
+    if (startInFlightRef.current || conv.status !== "disconnected") {
+      return;
+    }
+    startInFlightRef.current = true;
+    hadSuccessfulConnectionRef.current = false;
+    setConversationError(null);
+    const connectionType = preferredConnectionTypeRef.current;
     try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      await conversation.startSession({
-        agentId: "agent_1601kmcn49a8f22avp61jbx66j7p",
-        connectionType: "websocket",
+      conv.startSession({
+        agentId: ELEVENLABS_AGENT_ID,
+        connectionType,
       });
     } catch (err) {
       console.error("Failed to start conversation:", err);
-      setAgentState("off");
-    }
-  }, [conversation, agentState]);
+      if (!startInFlightRef.current) {
+        return;
+      }
 
-  const endConversation = useCallback(async () => {
+      const message = err instanceof Error ? err.message : "Unable to start conversation";
+      setConversationError(message);
+      blockAutoStart(AUTO_START_RETRY_DELAY_MS);
+      startInFlightRef.current = false;
+    }
+  }, [blockAutoStart]);
+
+  const endConversation = useCallback(() => {
     try {
-      await conversation.endSession();
+      conversationRef.current.endSession();
     } catch (err) {
       console.error("Failed to end conversation:", err);
     }
-  }, [conversation]);
+  }, []);
 
   // Face-triggered auto-start
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const stored = Number(window.sessionStorage.getItem(AUTO_START_STORAGE_KEY) || 0);
+    const storedTransport = window.sessionStorage.getItem(ELEVENLABS_TRANSPORT_STORAGE_KEY);
+    if (Number.isFinite(stored)) {
+      autoStartBlockedUntilRef.current = stored;
+      setRetryWakeAt(stored);
+    }
+    if (storedTransport === "websocket" || storedTransport === "webrtc") {
+      preferredConnectionTypeRef.current = storedTransport;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (retryWakeAt === 0) {
+      return;
+    }
+
+    const delayMs = retryWakeAt - Date.now();
+    if (delayMs <= 0) {
+      setRetryWakeAt(0);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setRetryWakeAt(0);
+    }, delayMs);
+
+    return () => window.clearTimeout(timer);
+  }, [retryWakeAt]);
+
+  useEffect(() => {
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      if (scheduleTransportFallback("WebRTC unavailable. Retrying with WebSocket...")) {
+        if (shouldFallbackToWebSocket(event.reason)) {
+          event.preventDefault();
+        }
+      }
+    };
+
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+    return () => window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+  }, [scheduleTransportFallback, shouldFallbackToWebSocket]);
+
+  // Re-arm auto-start only after face has been ABSENT for at least 2 seconds.
+  // This prevents face-detection flicker from re-arming during active sessions.
+  const faceGoneSinceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (vision.faceDetected) {
+      faceGoneSinceRef.current = null;
+    } else {
+      if (faceGoneSinceRef.current === null) {
+        faceGoneSinceRef.current = Date.now();
+      }
+      const gone = Date.now() - faceGoneSinceRef.current;
+      if (gone >= 2000) {
+        autoStartArmedRef.current = true;
+      }
+    }
+  }, [vision.faceDetected]);
+
+  useEffect(() => {
+    if (!autoStartArmedRef.current) {
+      return;
+    }
+
+    if (Date.now() < autoStartBlockedUntilRef.current) {
+      return;
+    }
+
     if (
       vision.faceDetected &&
       vision.facePresenceDurationMs >= 1500 &&
-      agentState === "off"
+      conversation.status === "disconnected"
     ) {
+      autoStartArmedRef.current = false;
       startConversation();
     }
-  }, [vision.faceDetected, vision.facePresenceDurationMs, agentState, startConversation]);
+  }, [vision.faceDetected, vision.facePresenceDurationMs, conversation.status, retryWakeAt, startConversation]);
+
+  // Connection timeout: if stuck in "connecting" for too long, give up.
+  // Uses a ref for status checks to avoid re-triggering on every render.
+  const timeoutIdRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (conversation.status === "connecting") {
+      if (timeoutIdRef.current === null) {
+        timeoutIdRef.current = setTimeout(() => {
+          timeoutIdRef.current = null;
+          if (conversationStatusRef.current !== "connecting") return;
+          setConversationError("Connection timed out. Tap to retry.");
+          blockAutoStart(AUTO_START_RETRY_DELAY_MS);
+          startInFlightRef.current = false;
+          try { conversationRef.current.endSession(); } catch {}
+        }, CONNECTION_TIMEOUT_MS);
+      }
+    } else {
+      if (timeoutIdRef.current !== null) {
+        clearTimeout(timeoutIdRef.current);
+        timeoutIdRef.current = null;
+      }
+    }
+  }, [blockAutoStart, conversation.status]);
 
   // Auto-end: if no face for 3s and agent is on
-  const faceAbsentSinceRef = useRef<number | null>(null);
   useEffect(() => {
     if (vision.faceDetected) {
       faceAbsentSinceRef.current = null;
@@ -257,7 +514,7 @@ export default function TalkPage() {
     if (faceAbsentSinceRef.current === null) {
       faceAbsentSinceRef.current = Date.now();
     }
-    if (agentState !== "on") return;
+    if (conversation.status !== "connected") return;
 
     const timer = setTimeout(() => {
       if (!vision.faceDetected && faceAbsentSinceRef.current !== null) {
@@ -269,12 +526,13 @@ export default function TalkPage() {
     }, Math.max(0, 3000 - (Date.now() - (faceAbsentSinceRef.current ?? Date.now()))));
 
     return () => clearTimeout(timer);
-  }, [vision.faceDetected, agentState, endConversation]);
+  }, [vision.faceDetected, conversation.status, endConversation]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      conversation.endSession().catch(() => {});
+      blockAutoStart(AUTO_START_RETRY_DELAY_MS);
+      try { conversationRef.current.endSession(); } catch {}
       vision.cleanup();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -345,7 +603,7 @@ export default function TalkPage() {
         <AnimatePresence>
           {vision.currentGestures.map((g) => (
             <motion.div
-              key={g.name}
+              key={`${g.name}-${Math.round(g.timestamp / 100)}`}
               className="flex items-center rounded-full"
               style={{
                 gap: 6,
@@ -437,116 +695,167 @@ export default function TalkPage() {
         }}
       />
 
-      {/* Controls at bottom */}
-      <div
-        className="talk-controls-overlay"
-        style={{
-          position: "absolute",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: "clamp(6px, 1vh, 14px)",
-          padding: "0 24px clamp(24px, 4vh, 48px)",
-          zIndex: 10,
-        }}
-      >
-        <SoundWave active={isSpeaking} />
+      {agentState === "on" ? (
+        <div
+          className="talk-controls-overlay"
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            width: "100%",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: "clamp(6px, 1vh, 14px)",
+            padding: "0 24px clamp(24px, 4vh, 48px)",
+            zIndex: 10,
+          }}
+        >
+          <SoundWave active={isSpeaking} />
 
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={agentState}
-            className="text-center"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-          >
-            {agentState === "off" ? (
-              <>
-                <p className="font-semibold" style={{ fontSize: "clamp(14px, 1.4vw, 20px)", color: "var(--text-2)" }}>
-                  {vision.isReady ? "\u0917\u0941\u0930\u0941\u0915\u0941\u0932 \u092E\u0947\u0902 \u0906\u092A\u0915\u093E \u0938\u094D\u0935\u093E\u0917\u0924 \u0939\u0948..." : "Initializing camera..."}
-                </p>
-                <p style={{ fontSize: "clamp(11px, 1vw, 14px)", color: "var(--text-3)", marginTop: 4 }}>
-                  {vision.isReady ? "Step in front of the camera or tap to begin" : "Setting up face detection"}
-                </p>
-              </>
-            ) : agentState === "starting" ? (
-              <>
-                <p className="font-semibold" style={{ fontSize: "clamp(14px, 1.4vw, 20px)", color: "var(--text-2)" }}>Connecting...</p>
-                <p style={{ fontSize: "clamp(11px, 1vw, 14px)", color: "var(--text-3)", marginTop: 4 }}>{"\u0917\u0941\u0930\u0941\u091C\u0940 \u0938\u0947 \u0938\u0902\u092A\u0930\u094D\u0915 \u0939\u094B \u0930\u0939\u093E \u0939\u0948"}</p>
-              </>
-            ) : (
-              <>
-                <p className="font-semibold" style={{ fontSize: "clamp(14px, 1.4vw, 20px)", color: isSpeaking ? "#FFB366" : "var(--text-2)" }}>
-                  {isSpeaking ? "\u0917\u0941\u0930\u0941\u091C\u0940 \u092C\u094B\u0932 \u0930\u0939\u0947 \u0939\u0948\u0902..." : "\u0938\u0941\u0928 \u0930\u0939\u0947 \u0939\u0948\u0902..."}
-                </p>
-                <p style={{ fontSize: "clamp(11px, 1vw, 14px)", color: "var(--text-3)", marginTop: 4 }}>
-                  {isSpeaking ? "Guruji is speaking" : "Speak naturally, Guruji is listening"}
-                </p>
-              </>
-            )}
-          </motion.div>
-        </AnimatePresence>
-
-        <div className="flex items-center" style={{ gap: 16 }}>
-          {agentState === "off" ? (
-            <motion.button
-              onClick={startConversation}
-              className="flex items-center cursor-pointer font-semibold text-white"
-              style={{
-                gap: 10, padding: "clamp(10px, 1.2vh, 16px) clamp(20px, 2.5vw, 36px)", borderRadius: 50,
-                background: "linear-gradient(135deg, #E65100, #FF9933)",
-                boxShadow: "0 8px 30px rgba(255,153,51,0.3)",
-                border: "none", fontSize: "clamp(12px, 1.1vw, 15px)",
-              }}
-              whileHover={{ scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
-            >
-              <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-              </svg>
-              Start Conversation
-            </motion.button>
-          ) : agentState === "starting" ? (
+          <AnimatePresence mode="wait">
             <motion.div
-              className="flex items-center font-semibold"
-              style={{
-                gap: 10, padding: "clamp(10px, 1.2vh, 16px) clamp(20px, 2.5vw, 36px)", borderRadius: 50,
-                background: "rgba(255,153,51,0.08)", color: "#FFB366",
-                border: "1px solid rgba(255,153,51,0.2)", fontSize: "clamp(12px, 1.1vw, 15px)",
-              }}
-              animate={{ opacity: [0.5, 1, 0.5] }}
-              transition={{ duration: 1.5, repeat: Infinity }}
+              key={isSpeaking ? "speaking" : "listening"}
+              className="text-center"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" style={{ animation: "spin 1.2s linear infinite" }}>
-                <circle cx="12" cy="12" r="10" fill="none" stroke="rgba(255,179,102,0.2)" strokeWidth="3" />
-                <path d="M12 2a10 10 0 0 1 10 10" fill="none" stroke="#FFB366" strokeWidth="3" strokeLinecap="round" />
-              </svg>
-              Connecting...
+              <p className="font-semibold" style={{ fontSize: "clamp(14px, 1.4vw, 20px)", color: isSpeaking ? "#FFB366" : "var(--text-2)" }}>
+                {isSpeaking ? "\u0917\u0941\u0930\u0941\u091C\u0940 \u092C\u094B\u0932 \u0930\u0939\u0947 \u0939\u0948\u0902..." : "\u0938\u0941\u0928 \u0930\u0939\u0947 \u0939\u0948\u0902..."}
+              </p>
+              <p style={{ fontSize: "clamp(11px, 1vw, 14px)", color: "var(--text-3)", marginTop: 4 }}>
+                {isSpeaking ? "Guruji is speaking" : "Speak naturally, Guruji is listening"}
+              </p>
             </motion.div>
-          ) : (
-            <motion.button
-              onClick={endConversation}
-              className="flex items-center cursor-pointer font-semibold"
-              style={{
-                gap: 10, padding: "clamp(10px, 1.2vh, 16px) clamp(20px, 2.5vw, 36px)", borderRadius: 50,
-                background: "rgba(239,68,68,0.12)", color: "#f87171",
-                border: "1px solid rgba(239,68,68,0.25)", fontSize: "clamp(12px, 1.1vw, 15px)",
-              }}
-              whileHover={{ scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
-            >
-              <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
-                <rect x="6" y="6" width="12" height="12" rx="2" />
-              </svg>
-              End Conversation
-            </motion.button>
-          )}
+          </AnimatePresence>
+
+          <motion.button
+            onClick={endConversation}
+            className="flex items-center cursor-pointer font-semibold"
+            style={{
+              gap: 10, padding: "clamp(10px, 1.2vh, 16px) clamp(20px, 2.5vw, 36px)", borderRadius: 50,
+              background: "rgba(239,68,68,0.12)", color: "#f87171",
+              border: "1px solid rgba(239,68,68,0.25)", fontSize: "clamp(12px, 1.1vw, 15px)",
+            }}
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+          >
+            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+              <rect x="6" y="6" width="12" height="12" rx="2" />
+            </svg>
+            End Conversation
+          </motion.button>
         </div>
-      </div>
+      ) : (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 10,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "24px",
+            pointerEvents: "none",
+          }}
+        >
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={agentState}
+              className="text-center"
+              initial={{ opacity: 0, y: 16, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -12, scale: 0.98 }}
+              transition={{ duration: 0.24, ease: "easeOut" }}
+              style={{
+                width: "min(92vw, 560px)",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                gap: "clamp(16px, 2.2vh, 28px)",
+                padding: "clamp(24px, 3vw, 36px)",
+                borderRadius: 32,
+                background: "linear-gradient(180deg, rgba(34,22,10,0.92) 0%, rgba(20,13,7,0.88) 100%)",
+                border: "1px solid rgba(255,153,51,0.2)",
+                boxShadow: "0 24px 80px rgba(0,0,0,0.38)",
+                backdropFilter: "blur(24px)",
+                WebkitBackdropFilter: "blur(24px)",
+                pointerEvents: "auto",
+              }}
+            >
+              <div className="text-center">
+                {agentState === "off" ? (
+                  <>
+                    <p className="font-semibold" style={{ fontSize: "clamp(18px, 1.8vw, 24px)", color: "var(--text-2)" }}>
+                      {vision.isReady ? "\u0917\u0941\u0930\u0941\u0915\u0941\u0932 \u092E\u0947\u0902 \u0906\u092A\u0915\u093E \u0938\u094D\u0935\u093E\u0917\u0924 \u0939\u0948..." : "Initializing camera..."}
+                    </p>
+                    <p style={{ fontSize: "clamp(12px, 1vw, 15px)", color: "var(--text-3)", marginTop: 6 }}>
+                      {conversationError
+                        ? conversationError
+                        : vision.isReady
+                          ? "Step in front of the camera or tap to begin"
+                          : "Setting up face detection"}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-semibold" style={{ fontSize: "clamp(18px, 1.8vw, 24px)", color: "var(--text-2)" }}>Connecting...</p>
+                    <p style={{ fontSize: "clamp(12px, 1vw, 15px)", color: "var(--text-3)", marginTop: 6 }}>{"\u0917\u0941\u0930\u0941\u091C\u0940 \u0938\u0947 \u0938\u0902\u092A\u0930\u094D\u0915 \u0939\u094B \u0930\u0939\u093E \u0939\u0948"}</p>
+                  </>
+                )}
+              </div>
+
+              {agentState === "off" ? (
+                <motion.button
+                  onClick={startConversation}
+                  className="flex items-center cursor-pointer font-semibold text-white"
+                  style={{
+                    gap: 10, padding: "clamp(12px, 1.4vh, 18px) clamp(24px, 2.8vw, 40px)", borderRadius: 50,
+                    background: "linear-gradient(135deg, #E65100, #FF9933)",
+                    boxShadow: "0 8px 30px rgba(255,153,51,0.3)",
+                    border: "none", fontSize: "clamp(13px, 1.1vw, 16px)",
+                  }}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                >
+                  <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                  </svg>
+                  Start Conversation
+                </motion.button>
+              ) : (
+                <motion.div
+                  className="flex items-center font-semibold"
+                  style={{
+                    gap: 10, padding: "clamp(12px, 1.4vh, 18px) clamp(24px, 2.8vw, 40px)", borderRadius: 50,
+                    background: "rgba(255,153,51,0.08)", color: "#FFB366",
+                    border: "1px solid rgba(255,153,51,0.2)", fontSize: "clamp(13px, 1.1vw, 16px)",
+                  }}
+                  animate={{ opacity: [0.5, 1, 0.5] }}
+                  transition={{ duration: 1.5, repeat: Infinity }}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" style={{ animation: "spin 1.2s linear infinite" }}>
+                    <circle cx="12" cy="12" r="10" fill="none" stroke="rgba(255,179,102,0.2)" strokeWidth="3" />
+                    <path d="M12 2a10 10 0 0 1 10 10" fill="none" stroke="#FFB366" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
+                  Connecting...
+                </motion.div>
+              )}
+            </motion.div>
+          </AnimatePresence>
+        </div>
+      )}
     </div>
+  );
+}
+
+export default function TalkPage() {
+  return (
+    <ConversationProvider agentId={ELEVENLABS_AGENT_ID}>
+      <TalkPageContent />
+    </ConversationProvider>
   );
 }

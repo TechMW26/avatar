@@ -28,3 +28,10 @@ yarn-error.log*
 
 # OS
 Thumbs.db
+
+# Local scratch / source assets (not needed at runtime)
+.tmp/
+*.fbx
+extract-tex.js
+scan-fbx-textures.js
+public/avatar-old.fbx
