@@ -915,67 +915,40 @@ function AvatarModel({
       applyBoneOffsetFromRest(bone, restQuat, poseOffsets[boneName]);
     });
 
-    // ── World-axis arm-down rotation ──
-    // The bind pose puts the arms in an A/T-pose (sticking out sideways).
-    // To bring them down to a relaxed hang, rotate each upper-arm bone
-    // around the WORLD front-back axis (Z). This is rig-Euler-axis-
-    // independent and guarantees true left/right symmetry: opposite-
-    // signed angles around a single shared world axis. Forearms inherit
-    // the rotation, so elbows stay straight (no kink).
-    const ARM_DOWN_ANGLE = 1.05; // ≈60° down from T-pose
-    const armRotPairs: Array<[string, number]> = [
-      ["LeftArm", -ARM_DOWN_ANGLE],
-      ["RightArm", ARM_DOWN_ANGLE],
+    // ── Symmetric world-space upper-arm aim ──
+    // Aim each upper-arm bone so its child (the forearm bone) points in
+    // a target world direction. We use perfectly mirrored target
+    // directions on the X axis so the result is geometrically symmetric.
+    // ONLY the upper arms are aimed — the forearm and hand inherit their
+    // bind-pose rotations relative to the arm, which avoids elbow kinks.
+    const ARM_AIM_X = 0.18;   // outward spread (smaller = closer to body)
+    const ARM_AIM_Y = -0.96;  // downward (mostly down with slight outward)
+    const ARM_AIM_Z = 0.05;   // slightly forward
+    const armAims: Array<[string, string, number]> = [
+      ["LeftArm", "LeftForeArm", +1],
+      ["RightArm", "RightForeArm", -1],
     ];
-    for (const [name, angle] of armRotPairs) {
+    for (const [name, childName, sign] of armAims) {
       const bone = allBones.current[name];
-      if (!bone || !bone.parent) continue;
-      bone.parent.updateMatrixWorld(true);
-      bone.parent.getWorldQuaternion(aimParentWorldQuat);
-      // World Z axis expressed in the parent's local space.
-      aimTargetDir.set(0, 0, 1).applyQuaternion(
-        aimCurrentWorldQuat.copy(aimParentWorldQuat).invert(),
-      );
-      aimDeltaQuat.setFromAxisAngle(aimTargetDir, angle);
-      // Pre-multiply so the rotation is applied in parent space *before*
-      // the bone's existing local rest rotation — this is equivalent to
-      // rotating in world space around world Z.
-      bone.quaternion.premultiply(aimDeltaQuat);
-      bone.updateMatrixWorld(true);
-    }
+      const childBone = allBones.current[childName];
+      if (!bone || !childBone || !bone.parent) continue;
 
-    // ── World-axis forearm pronation ──
-    // Roll each forearm around its current world long-axis (the world-
-    // space direction from forearm bone → hand bone) so the palms turn
-    // inward toward the thighs. Working in world space means the same
-    // signed angle on both sides produces a mirrored visual roll, since
-    // the long axes already point in mirrored world directions after
-    // the upper-arm rotation above.
-    const FOREARM_ROLL_ANGLE = 0; // tuned visually; 0 = leave bind-pose palm orientation
-    const forearmPairs: Array<[string, string, number]> = [
-      ["LeftForeArm", "LeftHand", FOREARM_ROLL_ANGLE],
-      ["RightForeArm", "RightHand", -FOREARM_ROLL_ANGLE],
-    ];
-    for (const [name, childName, angle] of forearmPairs) {
-      const bone = allBones.current[name];
-      const child = allBones.current[childName];
-      if (!bone || !child || !bone.parent) continue;
       bone.parent.updateMatrixWorld(true);
       bone.updateMatrixWorld(true);
-      child.updateMatrixWorld(true);
+      childBone.updateMatrixWorld(true);
+
       bone.getWorldPosition(aimBoneWorld);
-      child.getWorldPosition(aimChildWorld);
+      childBone.getWorldPosition(aimChildWorld);
       aimCurrentDir.copy(aimChildWorld).sub(aimBoneWorld);
       if (aimCurrentDir.lengthSq() < 1e-8) continue;
       aimCurrentDir.normalize();
-      // Express that world axis in parent space, then build a local
-      // rotation around it and pre-multiply (= world-space rotation).
-      bone.parent.getWorldQuaternion(aimParentWorldQuat);
-      aimTargetDir
-        .copy(aimCurrentDir)
-        .applyQuaternion(aimCurrentWorldQuat.copy(aimParentWorldQuat).invert());
-      aimDeltaQuat.setFromAxisAngle(aimTargetDir, angle);
-      bone.quaternion.premultiply(aimDeltaQuat);
+      aimTargetDir.set(sign * ARM_AIM_X, ARM_AIM_Y, ARM_AIM_Z).normalize();
+
+      aimDeltaQuat.setFromUnitVectors(aimCurrentDir, aimTargetDir);
+      bone.getWorldQuaternion(aimCurrentWorldQuat);
+      aimTargetWorldQuat.copy(aimDeltaQuat).multiply(aimCurrentWorldQuat);
+      bone.parent.getWorldQuaternion(aimParentWorldQuat).invert();
+      bone.quaternion.copy(aimParentWorldQuat).multiply(aimTargetWorldQuat);
       bone.updateMatrixWorld(true);
     }
 
