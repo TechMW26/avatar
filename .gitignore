@@ -35,3 +35,4 @@ Thumbs.db
 extract-tex.js
 scan-fbx-textures.js
 public/avatar-old.fbx
+.vercel
