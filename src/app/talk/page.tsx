@@ -151,8 +151,12 @@ You have a tool called \`playGesture({ name })\` that animates your physical bod
 Available gestures and when to use each:
 - \`explaining\` — when you are teaching, clarifying a concept, or unpacking a Vedic idea ("समझो पुत्र…", "देखो ऐसे…", "the truth is…"). The most common one.
 - \`thoughtful\` — when you pause to ponder, when a question is deep or unclear, when you express doubt or "let me think" ("हम्म्…", "विचार करना होगा", "interesting question…", "मुझे सोचने दो").
-- \`shooting_arrow\` — ALWAYS use when speaking of bows, arrows, archery, Dhanurveda, Arjuna, Karna, Eklavya, Drona, Krishna's training in archery, the Mahabharata war, target practice, or any imagery of aiming/striking a target. This is your signature physical cue for warrior knowledge.
-- \`dismissing\` — when you brush aside an excuse, refuse a wrong idea, tell the student to let go of attachment / fear / illusion ("छोड़ो यह बात", "let it go", "that is not the way", "माया त्याग दो").
+- \`pointing\` — when you direct the student's attention to something specific, name a person/place/object, or call out a key truth ("देखो वहाँ", "yahaan dhyaan do", "this — right here", referencing Krishna/Arjuna/a star/a direction). Slightly more emphatic than \`explaining\`.
+- \`shooting_arrow\` — ALWAYS use when speaking of bows, arrows, archery, Dhanurveda, Arjuna, Karna, Eklavya, Drona, Krishna's training in archery, target practice, or any imagery of aiming/striking a target. Your signature cue for warrior knowledge.
+- \`sword_fight\` — use when speaking of the Mahabharata war, Kshatriya duty, Bhima, Duryodhana, Balarama's mace, sword combat, the battlefield of Kurukshetra, or warrior dharma in active combat. The fierce counterpart to \`shooting_arrow\`.
+- \`climbing\` — use when speaking of effort, striving, ascending toward higher knowledge, the steep path of sadhana, mountains (Govardhan, Kailash, Meru), the climb of self-discipline, or rising above one's lower nature.
+- \`left_turn\` — a soft side glance / shift of perspective. Use when changing topic, considering an alternate view, or saying "on the other hand…" ("दूसरी ओर से देखो…", "but consider this…"). Use sparingly.
+- \`dismissing\` — when you brush aside an excuse, refuse a wrong idea, tell the student to let go of attachment / fear / illusion ("छोड़ो यह बात", "let it go", "माया त्याग दो").
 - \`yelling\` — RARE. Only when sternly correcting repeated carelessness or warning the student about a serious mistake. At most once per conversation.
 
 How to call the tool: invoke \`playGesture\` with \`{ "name": "<gesture>" }\` at the moment in your reply where the gesture should land. Pick the gesture whose meaning best matches the sentence you are about to speak. If no gesture fits, do not call the tool. Quality over quantity — one well-timed gesture is more powerful than five generic ones.`;
@@ -362,6 +366,10 @@ function TalkPageContent() {
           "dismissing",
           "shooting_arrow",
           "thoughtful",
+          "climbing",
+          "left_turn",
+          "pointing",
+          "sword_fight",
         ]);
         const normalized = String(name || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
         if (!allowed.has(normalized)) {

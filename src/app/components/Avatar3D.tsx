@@ -29,6 +29,10 @@ const ANIM_YELLING_URL = "/animations/yelling.fbx";
 const ANIM_DISMISSING_URL = "/animations/dismissing.fbx";
 const ANIM_SHOOTING_ARROW_URL = "/animations/shooting-arrow.fbx";
 const ANIM_THOUGHTFUL_URL = "/animations/thoughtful.fbx";
+const ANIM_CLIMBING_URL = "/animations/climbing.fbx";
+const ANIM_LEFT_TURN_URL = "/animations/left-turn.fbx";
+const ANIM_POINTING_URL = "/animations/pointing.fbx";
+const ANIM_SWORD_FIGHT_URL = "/animations/sword-fight.fbx";
 
 const ALL_ANIM_URLS = [
   ANIM_IDLE_URL,
@@ -43,6 +47,10 @@ const ALL_ANIM_URLS = [
   ANIM_DISMISSING_URL,
   ANIM_SHOOTING_ARROW_URL,
   ANIM_THOUGHTFUL_URL,
+  ANIM_CLIMBING_URL,
+  ANIM_LEFT_TURN_URL,
+  ANIM_POINTING_URL,
+  ANIM_SWORD_FIGHT_URL,
 ] as const;
 
 type AvatarAnimState =
@@ -60,7 +68,11 @@ type AvatarAnimState =
   | "yelling"
   | "dismissing"
   | "shooting_arrow"
-  | "thoughtful";
+  | "thoughtful"
+  | "climbing"
+  | "left_turn"
+  | "pointing"
+  | "sword_fight";
 
 /** The underlying animation clips we actually loaded. Multiple states can
  *  reuse the same clip (walking_in/out share `walking`, the turn states
@@ -77,7 +89,11 @@ type ClipKey =
   | "yelling"
   | "dismissing"
   | "shooting_arrow"
-  | "thoughtful";
+  | "thoughtful"
+  | "climbing"
+  | "left_turn"
+  | "pointing"
+  | "sword_fight";
 
 type GestureName =
   | "Open_Palm"
@@ -131,6 +147,10 @@ const STATE_TARGETS: Record<
   dismissing:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "dismissing" },
   shooting_arrow:{ z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "shooting_arrow" },
   thoughtful:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "thoughtful" },
+  climbing:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "climbing" },
+  left_turn:     { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "left_turn" },
+  pointing:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "pointing" },
+  sword_fight:   { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "sword_fight" },
   turning_away:  { z: FRONT_Z, rotY: Math.PI,  scale: FRONT_SCALE, clipKey: "idle_standing" },
   walking_out:   { z: BACK_Z,  rotY: Math.PI,  scale: BACK_SCALE,  clipKey: "walking" },
   turning_back:  { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "idle_standing" },
@@ -231,7 +251,7 @@ function remapClipToAvatarRig(
    Set the cache name + bump the version when shipping new asset bundles. */
 const ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
-const ASSET_CACHE_NAME = "rishi-avatar-fbx-v2";
+const ASSET_CACHE_NAME = "rishi-avatar-fbx-v3";
 
 function assetUrl(path: string): string {
   if (!ASSET_BASE_URL) return path;
@@ -386,6 +406,10 @@ function AvatarModel({
   const dismissingClips = useFbxClips(ANIM_DISMISSING_URL);
   const shootingArrowClips = useFbxClips(ANIM_SHOOTING_ARROW_URL);
   const thoughtfulClips = useFbxClips(ANIM_THOUGHTFUL_URL);
+  const climbingClips = useFbxClips(ANIM_CLIMBING_URL);
+  const leftTurnClips = useFbxClips(ANIM_LEFT_TURN_URL);
+  const pointingClips = useFbxClips(ANIM_POINTING_URL);
+  const swordFightClips = useFbxClips(ANIM_SWORD_FIGHT_URL);
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -403,8 +427,12 @@ function AvatarModel({
       dismissing: pickClip(dismissingClips),
       shooting_arrow: pickClip(shootingArrowClips),
       thoughtful: pickClip(thoughtfulClips),
+      climbing: pickClip(climbingClips),
+      left_turn: pickClip(leftTurnClips),
+      pointing: pickClip(pointingClips),
+      sword_fight: pickClip(swordFightClips),
     }),
-    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips],
+    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips, climbingClips, leftTurnClips, pointingClips, swordFightClips],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -421,6 +449,10 @@ function AvatarModel({
     dismissing: undefined,
     shooting_arrow: undefined,
     thoughtful: undefined,
+    climbing: undefined,
+    left_turn: undefined,
+    pointing: undefined,
+    sword_fight: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("sitting");
@@ -443,6 +475,10 @@ function AvatarModel({
   const lastDismissAtRef = useRef<number>(0);
   const lastShootAtRef = useRef<number>(0);
   const lastThoughtfulAtRef = useRef<number>(0);
+  const lastClimbAtRef = useRef<number>(0);
+  const lastLeftTurnAtRef = useRef<number>(0);
+  const lastPointAtRef = useRef<number>(0);
+  const lastSwordAtRef = useRef<number>(0);
   const lastAiNonceRef = useRef<number>(-1);
 
   /* ── Foot bones for per-frame ground clamp.
@@ -455,14 +491,19 @@ function AvatarModel({
     right: null,
   });
 
-  // Walking traversal: time-driven so the walking clip plays exactly once
-  // over the trip from one stage mark to the other (no double-loop).
+  // Walking traversal: time-driven so the walking clip plays a whole
+  // number of cycles (no half-step landing). Trip duration is computed
+  // from the clip's natural length × WALK_CYCLES on entry, so the clip
+  // is never sped up or slowed down — it always plays at its authored
+  // pace and the avatar arrives exactly at the end of a full step.
   const walkStartRef = useRef<number>(0);
   const walkFromZRef = useRef<number>(0);
   const walkToZRef = useRef<number>(0);
-  // Total trip duration. Tuned so the walk is brisk but the cycle still
-  // plays through enough to read as walking.
-  const WALK_DURATION_MS = 1800;
+  const walkDurationMsRef = useRef<number>(2000);
+  // Number of full clip cycles per BACK_Z↔FRONT_Z trip. The Standard
+  // Walk clip is ~1s and covers ~1m of forward locomotion at natural
+  // pace, which feels right over the 2m stage trip in two cycles.
+  const WALK_CYCLES = 2;
 
   useEffect(() => {
     /* ── Material polish ──
@@ -559,6 +600,10 @@ function AvatarModel({
       dismissing: undefined,
       shooting_arrow: undefined,
       thoughtful: undefined,
+      climbing: undefined,
+      left_turn: undefined,
+      pointing: undefined,
+      sword_fight: undefined,
     };
 
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
@@ -642,6 +687,10 @@ function AvatarModel({
         dismissing: undefined,
         shooting_arrow: undefined,
         thoughtful: undefined,
+        climbing: undefined,
+        left_turn: undefined,
+        pointing: undefined,
+        sword_fight: undefined,
       };
     };
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
@@ -702,7 +751,7 @@ function AvatarModel({
 
       if (isWalking) {
         const elapsed = performance.now() - walkStartRef.current;
-        const t = Math.max(0, Math.min(1, elapsed / WALK_DURATION_MS));
+        const t = Math.max(0, Math.min(1, elapsed / walkDurationMsRef.current));
         // Smoothstep so foot pacing reads naturally at start and stop.
         const ease = t * t * (3 - 2 * t);
         grp.position.z = walkFromZRef.current
@@ -770,25 +819,21 @@ function AvatarModel({
       notify(next);
       const playing = fadeToClip(STATE_TARGETS[next].clipKey, loop, once, fade);
 
-      // Time-bound the walking traversal and re-rate the walking clip so it
-      // plays in lock-step with the trip rather than freely looping until
-      // the avatar happens to arrive on-mark.
+      // Time-bound the walking traversal so it ends exactly on a full
+      // clip cycle (no half-step landing). The clip itself plays at its
+      // authored rate — we never speed it up or slow it down.
       if ((next === "walking_in" || next === "walking_out") && playing) {
         walkStartRef.current = performance.now();
         walkFromZRef.current = grp ? grp.position.z : STATE_TARGETS[next].z;
         walkToZRef.current = STATE_TARGETS[next].z;
         const walkAction = actions.walking;
         if (walkAction) {
+          walkAction.setEffectiveTimeScale(1);
           const clipDur = walkAction.getClip().duration;
           if (clipDur > 0.001) {
-            walkAction.setEffectiveTimeScale(
-              clipDur / (WALK_DURATION_MS / 1000),
-            );
+            walkDurationMsRef.current = clipDur * WALK_CYCLES * 1000;
           }
         }
-      } else if (actions.walking) {
-        // Restore default rate when leaving a walking state.
-        actions.walking.setEffectiveTimeScale(1);
       }
     };
 
@@ -885,6 +930,50 @@ function AvatarModel({
             lastAiNonceRef.current = ai.nonce;
             lastThoughtfulAtRef.current = now;
             goTo("thoughtful", THREE.LoopOnce, true, 0.4);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "pointing" &&
+            actions.pointing &&
+            now - lastPointAtRef.current > 8_000
+          ) {
+            // Calling out / directing attention / "look there".
+            lastAiNonceRef.current = ai.nonce;
+            lastPointAtRef.current = now;
+            goTo("pointing", THREE.LoopOnce, true, 0.35);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "sword_fight" &&
+            actions.sword_fight &&
+            now - lastSwordAtRef.current > 15_000
+          ) {
+            // Mahabharata war / Kshatriya valor / sword imagery.
+            lastAiNonceRef.current = ai.nonce;
+            lastSwordAtRef.current = now;
+            goTo("sword_fight", THREE.LoopOnce, true, 0.35);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "climbing" &&
+            actions.climbing &&
+            now - lastClimbAtRef.current > 15_000
+          ) {
+            // Effort / striving / ascending toward higher knowledge.
+            lastAiNonceRef.current = ai.nonce;
+            lastClimbAtRef.current = now;
+            goTo("climbing", THREE.LoopOnce, true, 0.4);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "left_turn" &&
+            actions.left_turn &&
+            now - lastLeftTurnAtRef.current > 12_000
+          ) {
+            // Looking aside / changing topic / glancing toward an idea.
+            lastAiNonceRef.current = ai.nonce;
+            lastLeftTurnAtRef.current = now;
+            goTo("left_turn", THREE.LoopOnce, true, 0.4);
           } else if (ai && ai.nonce !== lastAiNonceRef.current) {
             // Consume the nonce even if we couldn't play (cooldown / unknown
             // gesture name) so we don't fire it later when the cooldown ends.
@@ -998,6 +1087,30 @@ function AvatarModel({
       }
     } else if (state === "thoughtful") {
       const action = actions.thoughtful;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
+    } else if (state === "pointing") {
+      const action = actions.pointing;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
+      }
+    } else if (state === "sword_fight") {
+      const action = actions.sword_fight;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
+      }
+    } else if (state === "climbing") {
+      const action = actions.climbing;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
+    } else if (state === "left_turn") {
+      const action = actions.left_turn;
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
         goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
@@ -1186,6 +1299,10 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
       state === "dismissing" ||
       state === "shooting_arrow" ||
       state === "thoughtful" ||
+      state === "climbing" ||
+      state === "left_turn" ||
+      state === "pointing" ||
+      state === "sword_fight" ||
       state === "stopping"
     ) {
       // Keep the camera locked on the close mark for any in-place

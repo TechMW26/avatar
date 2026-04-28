@@ -36,6 +36,10 @@ const ASSETS = [
   'animations/dismissing.fbx',
   'animations/shooting-arrow.fbx',
   'animations/thoughtful.fbx',
+  'animations/climbing.fbx',
+  'animations/left-turn.fbx',
+  'animations/pointing.fbx',
+  'animations/sword-fight.fbx',
 ];
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
