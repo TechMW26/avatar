@@ -24,6 +24,7 @@ const ANIM_STOPPING_URL = "/animations/stop-walking.fbx";
 const ANIM_WALKING_URL = "/animations/walking.fbx";
 const ANIM_WAVING_URL = "/animations/waving.fbx";
 const ANIM_PRAYING_URL = "/animations/praying.fbx";
+const ANIM_EXPLAINING_URL = "/animations/explaining.fbx";
 
 const ALL_ANIM_URLS = [
   ANIM_IDLE_URL,
@@ -33,6 +34,7 @@ const ALL_ANIM_URLS = [
   ANIM_WALKING_URL,
   ANIM_WAVING_URL,
   ANIM_PRAYING_URL,
+  ANIM_EXPLAINING_URL,
 ] as const;
 
 type AvatarAnimState =
@@ -45,7 +47,8 @@ type AvatarAnimState =
   | "stopping"
   | "idle_standing"
   | "waving"
-  | "praying";
+  | "praying"
+  | "explaining";
 
 /** The underlying animation clips we actually loaded. Multiple states can
  *  reuse the same clip (walking_in/out share `walking`, the turn states
@@ -57,7 +60,8 @@ type ClipKey =
   | "stopping"
   | "idle_standing"
   | "waving"
-  | "praying";
+  | "praying"
+  | "explaining";
 
 type GestureName =
   | "Open_Palm"
@@ -106,6 +110,7 @@ const STATE_TARGETS: Record<
   idle_standing: { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "idle_standing" },
   waving:        { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "waving" },
   praying:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "praying" },
+  explaining:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "explaining" },
   turning_away:  { z: FRONT_Z, rotY: Math.PI,  scale: FRONT_SCALE, clipKey: "idle_standing" },
   walking_out:   { z: BACK_Z,  rotY: Math.PI,  scale: BACK_SCALE,  clipKey: "walking" },
   turning_back:  { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "idle_standing" },
@@ -276,11 +281,13 @@ class AvatarErrorBoundary extends Component<
 function AvatarModel({
   gestureRef,
   faceDetectedRef,
+  isSpeakingRef,
   onAnimStateChangeRef,
   onReadyRef,
 }: {
   gestureRef: MutableRefObject<GestureName>;
   faceDetectedRef: MutableRefObject<boolean>;
+  isSpeakingRef: MutableRefObject<boolean>;
   onAnimStateChangeRef: MutableRefObject<(state: AvatarAnimState) => void>;
   onReadyRef: MutableRefObject<(() => void) | undefined>;
 }) {
@@ -298,6 +305,7 @@ function AvatarModel({
   const walkingClips = useFbxClips(ANIM_WALKING_URL);
   const wavingClips = useFbxClips(ANIM_WAVING_URL);
   const prayingClips = useFbxClips(ANIM_PRAYING_URL);
+  const explainingClips = useFbxClips(ANIM_EXPLAINING_URL);
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -310,8 +318,9 @@ function AvatarModel({
       walking: pickClip(walkingClips),
       waving: pickClip(wavingClips),
       praying: pickClip(prayingClips),
+      explaining: pickClip(explainingClips),
     }),
-    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips],
+    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -323,6 +332,7 @@ function AvatarModel({
     idle_standing: undefined,
     waving: undefined,
     praying: undefined,
+    explaining: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("sitting");
@@ -336,6 +346,10 @@ function AvatarModel({
   const noFaceSinceRef = useRef<number | null>(null);
   const lastWaveAtRef = useRef<number>(0);
   const lastPrayAtRef = useRef<number>(0);
+  // Explaining is auto-fired while speaking; long cooldown so it stays
+  // emphatic and doesn't turn into a tic.
+  const lastExplainAtRef = useRef<number>(0);
+  const nextExplainRollAtRef = useRef<number>(0);
 
   // Walking traversal: time-driven so the walking clip plays exactly once
   // over the trip from one stage mark to the other (no double-loop).
@@ -425,6 +439,7 @@ function AvatarModel({
       idle_standing: undefined,
       waving: undefined,
       praying: undefined,
+      explaining: undefined,
     };
 
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
@@ -503,6 +518,7 @@ function AvatarModel({
         idle_standing: undefined,
         waving: undefined,
         praying: undefined,
+        explaining: undefined,
       };
     };
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
@@ -661,6 +677,22 @@ function AvatarModel({
         } else if (wantsWave && actions.waving) {
           lastWaveAtRef.current = now;
           goTo("waving", THREE.LoopOnce, true, 0.4);
+        } else if (
+          // Auto-explain: while the AI is speaking, occasionally fire the
+          // explaining gesture to give the delivery weight. Strong cooldown
+          // (12s) so it stays an emphatic punctuation, not a nervous tic.
+          // Roll once per ~700ms with ~35% chance, gated by the cooldown,
+          // so the avatar lands a gesture roughly 1–2 sentences in.
+          isSpeakingRef.current &&
+          actions.explaining &&
+          now - lastExplainAtRef.current > 12_000 &&
+          now >= nextExplainRollAtRef.current
+        ) {
+          nextExplainRollAtRef.current = now + 700;
+          if (Math.random() < 0.35) {
+            lastExplainAtRef.current = now;
+            goTo("explaining", THREE.LoopOnce, true, 0.35);
+          }
         }
       } else {
         if (noFaceSinceRef.current == null) noFaceSinceRef.current = now;
@@ -742,6 +774,12 @@ function AvatarModel({
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
         goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
+    } else if (state === "explaining") {
+      const action = actions.explaining;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
       }
     }
   });
@@ -894,6 +932,7 @@ export interface Avatar3DProps {
 export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }: Avatar3DProps) {
   const gestureRef = useRef<GestureName>(null);
   const faceDetectedRef = useRef(faceDetected ?? false);
+  const isSpeakingRef = useRef(isSpeaking);
   const cameraTargetRef = useRef(CAMERA_Z_NEAR);
 
   // Sync incoming props into refs so AvatarModel's per-frame loop can read
@@ -901,7 +940,8 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
   useEffect(() => {
     gestureRef.current = (gesture as GestureName) ?? null;
     faceDetectedRef.current = faceDetected ?? false;
-  }, [gesture, faceDetected]);
+    isSpeakingRef.current = isSpeaking;
+  }, [gesture, faceDetected, isSpeaking]);
 
   // Stable callback so AvatarModel's useEffect (which wires up the mixer)
   // doesn't tear down on every parent re-render.
@@ -912,6 +952,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
       state === "idle_standing" ||
       state === "waving" ||
       state === "praying" ||
+      state === "explaining" ||
       state === "stopping"
     ) {
       // Keep the camera locked on the close mark for any in-place
@@ -958,6 +999,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
             <AvatarModel
               gestureRef={gestureRef}
               faceDetectedRef={faceDetectedRef}
+              isSpeakingRef={isSpeakingRef}
               onAnimStateChangeRef={onAnimStateChangeRef}
               onReadyRef={onReadyRef}
             />
