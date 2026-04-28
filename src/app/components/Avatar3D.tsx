@@ -337,6 +337,15 @@ function AvatarModel({
   const lastWaveAtRef = useRef<number>(0);
   const lastPrayAtRef = useRef<number>(0);
 
+  // Walking traversal: time-driven so the walking clip plays exactly once
+  // over the trip from one stage mark to the other (no double-loop).
+  const walkStartRef = useRef<number>(0);
+  const walkFromZRef = useRef<number>(0);
+  const walkToZRef = useRef<number>(0);
+  // Total trip duration. Tuned so the walk is brisk but the cycle still
+  // plays through enough to read as walking.
+  const WALK_DURATION_MS = 1800;
+
   useEffect(() => {
     /* ── Material polish ──
        The Meshy FBX ships its own embedded textures, so we leave the maps
@@ -513,9 +522,12 @@ function AvatarModel({
     let onMark = true;
     let facingTarget = true;
     if (grp) {
-      // Walk pace traversal so the new Walking.fbx clip plays through about
-      // one full cycle before we hand off to the stopping clip for ease-in.
-      const posLerp = Math.min(1, delta * 0.7);
+      // Two traversal modes:
+      //   1. Walking states: linear, time-driven so it ends exactly when
+      //      the walking clip has played for WALK_DURATION_MS. The clip's
+      //      timeScale is set on entry so its playback length matches.
+      //   2. Everything else: exponential ease for snappy snap-to-mark.
+      const isWalking = state === "walking_in" || state === "walking_out";
       const rotLerp = Math.min(1, delta * 3.5);   // ~0.3s to turn
 
       // Sit pose needs a small extra dip because we strip Hips translation.
@@ -523,7 +535,18 @@ function AvatarModel({
       const tgtY = GROUND_Y + yBias;
 
       grp.position.y += (tgtY - grp.position.y) * Math.min(1, delta * 3);
-      grp.position.z += (target.z - grp.position.z) * posLerp;
+
+      if (isWalking) {
+        const elapsed = performance.now() - walkStartRef.current;
+        const t = Math.max(0, Math.min(1, elapsed / WALK_DURATION_MS));
+        // Smoothstep so foot pacing reads naturally at start and stop.
+        const ease = t * t * (3 - 2 * t);
+        grp.position.z = walkFromZRef.current
+          + (walkToZRef.current - walkFromZRef.current) * ease;
+      } else {
+        const posLerp = Math.min(1, delta * 4);
+        grp.position.z += (target.z - grp.position.z) * posLerp;
+      }
 
       // Shortest-path rotation lerp on Y.
       let drot = target.rotY - grp.rotation.y;
@@ -581,7 +604,28 @@ function AvatarModel({
     ) => {
       animStateRef.current = next;
       notify(next);
-      fadeToClip(STATE_TARGETS[next].clipKey, loop, once, fade);
+      const playing = fadeToClip(STATE_TARGETS[next].clipKey, loop, once, fade);
+
+      // Time-bound the walking traversal and re-rate the walking clip so it
+      // plays in lock-step with the trip rather than freely looping until
+      // the avatar happens to arrive on-mark.
+      if ((next === "walking_in" || next === "walking_out") && playing) {
+        walkStartRef.current = performance.now();
+        walkFromZRef.current = grp ? grp.position.z : STATE_TARGETS[next].z;
+        walkToZRef.current = STATE_TARGETS[next].z;
+        const walkAction = actions.walking;
+        if (walkAction) {
+          const clipDur = walkAction.getClip().duration;
+          if (clipDur > 0.001) {
+            walkAction.setEffectiveTimeScale(
+              clipDur / (WALK_DURATION_MS / 1000),
+            );
+          }
+        }
+      } else if (actions.walking) {
+        // Restore default rate when leaving a walking state.
+        actions.walking.setEffectiveTimeScale(1);
+      }
     };
 
     /* ── Debounce face presence/absence ── */
