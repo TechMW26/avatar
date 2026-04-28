@@ -92,7 +92,9 @@ const SIT_GROUND_OFFSET_Y = -0.55;
 const BACK_Z = -2.0;
 const FRONT_Z = 0;
 const BACK_SCALE = 0.65;
-const FRONT_SCALE = 1.0;
+// Reduced from 1.0 → 0.95 (5% smaller close-up scale) so the avatar
+// doesn't feel oversized when on the front mark.
+const FRONT_SCALE = 0.95;
 
 const STATE_TARGETS: Record<
   AvatarAnimState,
@@ -511,11 +513,10 @@ function AvatarModel({
     let onMark = true;
     let facingTarget = true;
     if (grp) {
-      // Slow, foot-paced traversal so the walk cycle reads as actual
-      // walking rather than a dolly-zoom. ~3.5s to cross the stage.
-      const posLerp = Math.min(1, delta * 0.55);
+      // Quicker traversal (~1.6s) so the walk cycle stays brief; the new
+      // shorter walking clip won't loop visibly more than once.
+      const posLerp = Math.min(1, delta * 1.2);
       const rotLerp = Math.min(1, delta * 3.5);   // ~0.3s to turn
-      const scaleLerp = posLerp;
 
       // Sit pose needs a small extra dip because we strip Hips translation.
       const yBias = state === "sitting" ? SIT_GROUND_OFFSET_Y : 0;
@@ -530,9 +531,15 @@ function AvatarModel({
       while (drot < -Math.PI) drot += Math.PI * 2;
       grp.rotation.y += drot * rotLerp;
 
-      const cs = grp.scale.x;
-      const ns = cs + (target.scale - cs) * scaleLerp;
-      grp.scale.setScalar(ns);
+      // Lock scale to z-progress so the zoom-in happens *during* the walk
+      // rather than after, and resolves exactly when z does. Clamped to
+      // the BACK_Z..FRONT_Z range so off-mark states still pick a sane
+      // value.
+      const zProgress =
+        (grp.position.z - BACK_Z) / (FRONT_Z - BACK_Z);
+      const t = Math.max(0, Math.min(1, zProgress));
+      const derivedScale = BACK_SCALE + (FRONT_SCALE - BACK_SCALE) * t;
+      grp.scale.setScalar(derivedScale);
 
       onMark =
         Math.abs(target.z - grp.position.z) < 0.04 &&
