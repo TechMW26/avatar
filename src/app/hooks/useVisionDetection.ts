@@ -75,7 +75,8 @@ function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
   return Array.from(byName.values()).sort((left, right) => right.confidence - left.confidence);
 }
 
-export function useVisionDetection(): VisionState {
+export function useVisionDetection(options?: { enabled?: boolean }): VisionState {
+  const enabled = options?.enabled ?? true;
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
@@ -115,6 +116,7 @@ export function useVisionDetection(): VisionState {
 
   // Initialize MediaPipe models and camera
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
 
     // Suppress noisy TensorFlow Lite INFO messages that MediaPipe logs via console.error
@@ -305,7 +307,7 @@ export function useVisionDetection(): VisionState {
       faceLandmarkerRef.current?.close();
       objectDetectorRef.current?.close();
     };
-  }, []);
+  }, [enabled]);
 
   // Detection loop — runs at DETECTION_INTERVAL_MS via rAF
   const detect = useCallback(() => {

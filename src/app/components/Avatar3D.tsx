@@ -1,254 +1,64 @@
 "use client";
 
-import { useRef, useEffect, Suspense, Component, ReactNode, MutableRefObject } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
-import { useGLTF } from "@react-three/drei";
+import {
+  useRef,
+  useEffect,
+  useMemo,
+  useCallback,
+  Suspense,
+  Component,
+  ReactNode,
+  MutableRefObject,
+} from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
-import { Lipsync, VISEMES } from "wawa-lipsync";
+import { SkeletonUtils, FBXLoader } from "three-stdlib";
 
-const AVATAR_URL = "/avatar.glb";
+const AVATAR_URL = "/avatar.fbx";
 
-// FBX2glTF numbers blendshapes as plain integers "0".."14" (sometimes
-// "m0".."m14"); remap to the viseme names the lipsync code targets. Order
-// is taken from the source FBX morph list.
-const MORPH_NAME_REMAP: Record<string, string> = {
-  "0": "viseme_sil",
-  "1": "viseme_PP",
-  "2": "viseme_FF",
-  "3": "viseme_TH",
-  "4": "viseme_DD",
-  "5": "viseme_kk",
-  "6": "viseme_CH",
-  "7": "viseme_SS",
-  "8": "viseme_nn",
-  "9": "viseme_RR",
-  "10": "viseme_aa",
-  "11": "viseme_E",
-  "12": "viseme_I",
-  "13": "viseme_O",
-  "14": "viseme_U",
-  m0: "viseme_sil",
-  m1: "viseme_PP",
-  m2: "viseme_FF",
-  m3: "viseme_TH",
-  m4: "viseme_DD",
-  m5: "viseme_kk",
-  m6: "viseme_CH",
-  m7: "viseme_SS",
-  m8: "viseme_nn",
-  m9: "viseme_RR",
-  m10: "viseme_aa",
-  m11: "viseme_E",
-  m12: "viseme_I",
-  m13: "viseme_O",
-  m14: "viseme_U",
-};
+// User-provided FBX animation files (Mixamo rigs).
+const ANIM_IDLE_URL = "/animations/breathing-idle.fbx";
+const ANIM_SITTING_URL = "/animations/sitting-idle.fbx";
+const ANIM_STANDING_URL = "/animations/standing.fbx";
+const ANIM_STOPPING_URL = "/animations/stop-walking.fbx";
+const ANIM_WALKING_URL = "/animations/walking.fbx";
+const ANIM_WAVING_URL = "/animations/waving.fbx";
+const ANIM_PRAYING_URL = "/animations/praying.fbx";
 
-/* ── Error boundary ── */
-class AvatarErrorBoundary extends Component<
-  { children: ReactNode; fallback: ReactNode },
-  { hasError: boolean }
-> {
-  state = { hasError: false };
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-  render() {
-    return this.state.hasError ? this.props.fallback : this.props.children;
-  }
-}
-
-/*
- * ── Audio-reactive pose-cycling lip sync ──
- *
- * Production lip sync without phoneme data works by:
- * 1. Cycling through complete mouth POSES (not individual morph targets)
- * 2. Timing transitions to audio transients (syllable onsets)
- * 3. Modulating pose intensity by volume (loud = pronounced, quiet = subtle)
- * 4. Between syllables, blending toward a closed-mouth rest pose
- *
- * This mirrors how Synthesia / D-ID / Ready Player Me handle
- * real-time lip sync when no phoneme stream is available.
- */
-
-// All viseme channel names we drive
-const VISEME_KEYS = [
-  "jawOpen", "viseme_aa", "viseme_E", "viseme_O", "viseme_U",
-  "viseme_SS", "viseme_FF", "viseme_PP", "viseme_TH", "viseme_DD",
-  "viseme_kk", "viseme_RR", "viseme_nn", "viseme_CH",
+const ALL_ANIM_URLS = [
+  ANIM_IDLE_URL,
+  ANIM_SITTING_URL,
+  ANIM_STANDING_URL,
+  ANIM_STOPPING_URL,
+  ANIM_WALKING_URL,
+  ANIM_WAVING_URL,
+  ANIM_PRAYING_URL,
 ] as const;
 
-type VisemeKey = (typeof VISEME_KEYS)[number];
+type AvatarAnimState =
+  | "sitting"
+  | "standing_up"
+  | "walking_in"
+  | "walking_out"
+  | "turning_away"
+  | "turning_back"
+  | "stopping"
+  | "idle_standing"
+  | "waving"
+  | "praying";
 
-// Complete mouth poses — each a distinct, recognizable mouth shape
-const POSES: Partial<Record<VisemeKey, number>>[] = [
-  // 0: Open vowel "ah" — wide open
-  { jawOpen: 0.30, viseme_aa: 0.28 },
-  // 1: Mid vowel "eh" — slightly open, spread
-  { jawOpen: 0.14, viseme_E: 0.24 },
-  // 2: Rounded "oh" — medium open, lips rounded
-  { jawOpen: 0.20, viseme_O: 0.26 },
-  // 3: Tight "oo" — nearly closed, lips pursed
-  { jawOpen: 0.06, viseme_U: 0.20 },
-  // 4: Bilabial "mm/pp" — lips pressed shut
-  { jawOpen: 0.01, viseme_PP: 0.18 },
-  // 5: Fricative "ff/vv" — lower lip to teeth
-  { jawOpen: 0.04, viseme_FF: 0.20 },
-  // 6: Sibilant "ss/sh" — teeth close, spread
-  { jawOpen: 0.04, viseme_SS: 0.20, viseme_E: 0.06 },
-  // 7: Dental/tap "th/d/t" — tongue forward
-  { jawOpen: 0.10, viseme_TH: 0.16, viseme_DD: 0.08 },
-  // 8: Open variant "ah" + liquid
-  { jawOpen: 0.24, viseme_aa: 0.18, viseme_RR: 0.12 },
-  // 9: Velar "k/g" — back tongue, mid open
-  { jawOpen: 0.12, viseme_kk: 0.16, viseme_nn: 0.06 },
-];
+/** The underlying animation clips we actually loaded. Multiple states can
+ *  reuse the same clip (walking_in/out share `walking`, the turn states
+ *  reuse `idle_standing`). */
+type ClipKey =
+  | "sitting"
+  | "standing_up"
+  | "walking"
+  | "stopping"
+  | "idle_standing"
+  | "waving"
+  | "praying";
 
-// Pre-built pose sequences that feel like natural syllable patterns
-const POSE_SEQUENCES = [
-  [0, 7, 1, 4, 2, 6, 0, 5],
-  [1, 0, 9, 4, 8, 6, 3],
-  [2, 5, 0, 1, 7, 3, 6, 0],
-  [0, 6, 8, 4, 1, 0, 7, 5],
-  [3, 0, 7, 2, 4, 1, 9, 0],
-  [8, 1, 5, 0, 3, 7, 2, 4],
-];
-
-class AudioLipSync {
-  private current: Record<string, number>;
-  private wawa: Lipsync;
-  private wawaReady = false;
-  private vowelCycleIdx = 0;
-  private vowelCycleTimer = 0;
-  private prevVolume = 0;
-  private static VOWEL_CYCLE: string[] = [
-    VISEMES.aa,
-    VISEMES.O,
-    VISEMES.E,
-    VISEMES.aa,
-    VISEMES.U,
-    VISEMES.I,
-    VISEMES.O,
-    VISEMES.aa,
-  ];
-
-  constructor() {
-    this.current = {};
-    for (const v of Object.values(VISEMES)) this.current[v] = 0;
-    this.current["jawOpen"] = 0;
-    // wawa-lipsync uses its own AudioContext just for the analyser node; we
-    // bypass the internal audio routing and feed it byte-frequency data
-    // captured by the ElevenLabs SDK each frame.
-    try {
-      this.wawa = new Lipsync({ fftSize: 2048, historySize: 10 });
-      this.wawaReady = true;
-    } catch (e) {
-      console.warn("[Avatar] wawa-lipsync init failed:", e);
-      this.wawa = null as unknown as Lipsync;
-    }
-  }
-
-  update(
-    freqData: Uint8Array | undefined | null,
-    volume: number,
-    speaking: boolean,
-  ): Record<string, number> {
-    const result: Record<string, number> = {};
-
-    // ── Not speaking: gentle decay ──
-    if (!speaking || !freqData || freqData.length < 16 || !this.wawaReady) {
-      for (const k of Object.keys(this.current)) {
-        this.current[k] *= 0.55;
-        if (this.current[k] < 0.002) this.current[k] = 0;
-        result[k] = this.current[k];
-      }
-      return result;
-    }
-
-    // Push the externally-captured spectrum into wawa-lipsync's internal
-    // dataArray, then bypass its analyser by overriding getByteFrequencyData.
-    const w = this.wawa as unknown as {
-      dataArray: Uint8Array;
-      analyser: AnalyserNode;
-      processAudio: () => void;
-      viseme: string;
-    };
-    const len = Math.min(w.dataArray.length, freqData.length);
-    for (let i = 0; i < len; i++) w.dataArray[i] = freqData[i];
-    // Stub the analyser fetch; data is already populated.
-    w.analyser.getByteFrequencyData = (buf: Uint8Array) => {
-      const n = Math.min(buf.length, w.dataArray.length);
-      for (let i = 0; i < n; i++) buf[i] = w.dataArray[i];
-    };
-    w.processAudio();
-
-    // Compute audio amplitude from RMS of the spectrum (more reliable than
-    // the SDK's volume which can hover near zero for soft TTS).
-    let sumSq = 0;
-    const lo = Math.max(1, Math.floor(len * 0.005));
-    const hi = Math.min(len - 1, Math.floor(len * 0.18));
-    for (let i = lo; i <= hi; i++) {
-      const v = freqData[i] / 255;
-      sumSq += v * v;
-    }
-    const rms = Math.sqrt(sumSq / Math.max(1, hi - lo + 1));
-    const volEst = Math.max(volume, rms * 1.4);
-    const amplitude = Math.min(1, volEst * 1.8);
-
-    // Advance vowel cycle when speaking; rate scales with audio energy.
-    const transient = Math.max(0, rms - this.prevVolume);
-    this.prevVolume = rms;
-    this.vowelCycleTimer += 0.06 + amplitude * 0.10 + transient * 1.2;
-    if (this.vowelCycleTimer >= 1.0) {
-      this.vowelCycleTimer = 0;
-      this.vowelCycleIdx = (this.vowelCycleIdx + 1) % AudioLipSync.VOWEL_CYCLE.length;
-    }
-
-    let dominant = w.viseme || VISEMES.sil;
-    // wawa returns sil whenever band energies fall below its threshold; if
-    // we still have audible speech, fall back to a cycling vowel so the
-    // mouth keeps moving instead of staying closed.
-    if ((dominant === VISEMES.sil) && amplitude > 0.05) {
-      dominant = AudioLipSync.VOWEL_CYCLE[this.vowelCycleIdx];
-    }
-
-    // Amplify so morphs reach visible range. The TTS volume hovers
-    // around 0.05-0.2, which produced barely-perceptible mouth motion.
-    // Use a strong floor when speech is detected so the mouth always opens.
-    const speakBoost = 0.55 + amplitude * 1.6; // 0.55 .. ~1.0
-    const visemeStrength = Math.min(1, speakBoost);
-    const jawStrength = Math.min(1, 0.4 + amplitude * 1.8);
-
-    for (const k of Object.keys(this.current)) {
-      let target = 0;
-      if (k !== VISEMES.sil && k === dominant) {
-        target = visemeStrength;
-      } else if (k === "jawOpen") {
-        if (
-          dominant === VISEMES.aa ||
-          dominant === VISEMES.E ||
-          dominant === VISEMES.I ||
-          dominant === VISEMES.O ||
-          dominant === VISEMES.U
-        ) {
-          target = jawStrength;
-        } else {
-          // Even on consonants, crack the jaw a touch so the mouth isn't
-          // glued shut between vowels.
-          target = jawStrength * 0.35;
-        }
-      }
-      const prev = this.current[k];
-      const a = target > prev ? 0.55 : 0.28;
-      this.current[k] = prev + (target - prev) * a;
-      if (this.current[k] < 0.002) this.current[k] = 0;
-      result[k] = this.current[k];
-    }
-    return result;
-  }
-}
-
-/* ── Gesture animation types ── */
 type GestureName =
   | "Open_Palm"
   | "Thumb_Up"
@@ -261,704 +71,632 @@ type GestureName =
   | "Photo_Pose"
   | null;
 
-type ConcreteGestureName = Exclude<GestureName, null>;
-type BoneAxisOffset = Partial<Record<"x" | "y" | "z", number>>;
-type BonePose = Partial<Record<string, BoneAxisOffset>>;
-type RelaxedAimBoneName = "LeftShoulder" | "RightShoulder" | "LeftArm" | "RightArm" | "LeftForeArm" | "RightForeArm";
-type RelaxedAimSpec = {
-  direction: THREE.Vector3;
-  influence: number;
+const CAMERA_Z_FAR = 9.5;
+const CAMERA_Z_NEAR = 5.7;
+// Time without a face before we sit back down. Long enough that the avatar
+// doesn't oscillate when MediaPipe drops a frame or two, but short enough
+// that the kiosk feels responsive when visitors leave.
+const RETURN_TO_SIT_DELAY_MS = 3_000;
+// Required ms of consistent face presence/absence before changing pose.
+const FACE_DEBOUNCE_MS = 350;
+
+/* ── Stage geometry ──
+   The avatar's feet are anchored at y = 0 inside the local scene, so the
+   group's world Y becomes the floor line. Walking just lerps Z (and uniform
+   scale, to fake distance) between two stage marks. */
+const GROUND_Y = -1.3;
+// Sit dip — the Mixamo sit clip rotates the legs into a cross-leg position
+// but we strip the Hips translation track (cm-scale problem), so without a
+// small additional drop the seated pose looks like he's hovering.
+const SIT_GROUND_OFFSET_Y = -0.55;
+const BACK_Z = -2.0;
+const FRONT_Z = 0;
+const BACK_SCALE = 0.65;
+const FRONT_SCALE = 1.0;
+
+const STATE_TARGETS: Record<
+  AvatarAnimState,
+  { z: number; rotY: number; scale: number; clipKey: ClipKey }
+> = {
+  sitting:       { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "sitting" },
+  standing_up:   { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "standing_up" },
+  walking_in:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "walking" },
+  idle_standing: { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "idle_standing" },
+  waving:        { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "waving" },
+  praying:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "praying" },
+  turning_away:  { z: FRONT_Z, rotY: Math.PI,  scale: FRONT_SCALE, clipKey: "idle_standing" },
+  walking_out:   { z: BACK_Z,  rotY: Math.PI,  scale: BACK_SCALE,  clipKey: "walking" },
+  turning_back:  { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "idle_standing" },
+  stopping:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "stopping" },
 };
 
-const GESTURE_BLEND_IN = 0.22;
-const GESTURE_BLEND_OUT = 0.32;
+// Mixamo bone names → avatar rig bone names. The current avatar uses the
+// stock Mixamo names (mixamorigHips, mixamorigSpine, …), so this is empty
+// and only kept around in case a future rig diverges.
+const TRACK_BONE_REMAP: Record<string, string> = {};
 
-// Reuse scratch objects so per-frame posing stays allocation-free.
-const poseEuler = new THREE.Euler();
-const poseQuat = new THREE.Quaternion();
-const poseVec = new THREE.Vector3();
-const poseVec2 = new THREE.Vector3();
-const poseQuat2 = new THREE.Quaternion();
-const slerpQuat = new THREE.Quaternion();
-const aimChildWorld = new THREE.Vector3();
-const aimBoneWorld = new THREE.Vector3();
-const aimCurrentDir = new THREE.Vector3();
-const aimTargetDir = new THREE.Vector3();
-const aimDeltaQuat = new THREE.Quaternion();
-const aimCurrentWorldQuat = new THREE.Quaternion();
-const aimParentWorldQuat = new THREE.Quaternion();
-const aimTargetWorldQuat = new THREE.Quaternion();
-
-const RELAXED_BODY_POSE: BonePose = {
-  Spine: { x: 0.03 },
-  Spine01: { x: 0.04 },
-  Spine02: { x: 0.02 },
-};
-
-const RELAXED_HAND_POSE: BonePose = {};
-
-const GESTURE_BODY_POSES: Partial<Record<ConcreteGestureName, BonePose>> = {
-  Open_Palm: {
-    Spine01: { y: 0.025 },
-    Spine02: { y: 0.035 },
-  },
-  Thumb_Up: {
-    Spine01: { y: 0.02 },
-    Spine02: { x: 0.015, y: 0.03 },
-  },
-  Thumb_Down: {
-    Spine01: { y: -0.02 },
-    Spine02: { x: -0.015, y: -0.03 },
-  },
-  Victory: {
-    Spine01: { y: 0.03 },
-    Spine02: { x: 0.01 },
-  },
-  ILoveYou: {
-    Spine01: { y: 0.025 },
-    Spine02: { x: 0.02, y: 0.02 },
-  },
-  Closed_Fist: {
-    Spine01: { x: 0.015 },
-    Spine02: { x: 0.02 },
-  },
-  Pointing_Up: {
-    Spine01: { y: 0.035 },
-    Spine02: { x: 0.015, y: 0.04 },
-  },
-  Namaste: {
-    Spine01: { x: 0.02 },
-    Spine02: { x: 0.03 },
-  },
-  Photo_Pose: {
-    Spine01: { y: 0.015 },
-    Spine02: { x: 0.01, y: 0.015 },
-  },
-};
-
-const ARM_CHAIN_BONE_NAMES = [
-  "LeftShoulder",
-  "LeftArm",
-  "LeftForeArm",
-  "LeftHand",
-  "RightShoulder",
-  "RightArm",
-  "RightForeArm",
-  "RightHand",
-] as const;
-
-// Per-frame WORLD-SPACE arm chain aim. Each frame, after the base pose is
-// applied, we rotate each bone so its child points in the desired world
-// direction. Because we recompute against the parent's *already-rotated*
-// world matrix, chaining shoulder → arm → forearm does not compound and
-// fold. This is bind-pose-agnostic and adapts to the model's local axes.
-type WorldAimSpec = { childBone: string; worldDir: THREE.Vector3 };
-// World-space arm chain aim has been removed. The Mixamo-style rig has
-// a perfectly mirrored bind-pose, so simple symmetric local-Euler
-// offsets in RELAXED_BODY_POSE / RELAXED_HAND_POSE drive both arms
-// without any runtime aim or mirror logic — which avoids the elbow
-// deformation that aiming the upper arm at a world direction caused.
-const ARM_CHAIN_WORLD_AIMS: Array<{ name: RelaxedAimBoneName } & WorldAimSpec> = [];
-
-// Kept for type compatibility with the rest of the file; populated empty
-// because the chain is now driven by ARM_CHAIN_WORLD_AIMS at runtime.
-const RELAXED_ARM_AIMS: Record<RelaxedAimBoneName, RelaxedAimSpec> = {} as Record<RelaxedAimBoneName, RelaxedAimSpec>;
-
-const DRIVEN_BONE_NAMES = Array.from(
-  new Set([
-    "Head",
-    "neck",
-    ...ARM_CHAIN_BONE_NAMES,
-    ...Object.keys(RELAXED_HAND_POSE),
-    ...Object.keys(RELAXED_BODY_POSE),
-    ...Object.values(GESTURE_BODY_POSES).flatMap((pose) => (pose ? Object.keys(pose) : [])),
-  ]),
-);
-
-function addBoneOffset(
-  target: Record<string, BoneAxisOffset>,
-  boneName: string,
-  axis: keyof BoneAxisOffset,
-  amount: number,
-) {
-  if (amount === 0) {
-    return;
-  }
-  const entry = target[boneName] ?? (target[boneName] = {});
-  entry[axis] = (entry[axis] ?? 0) + amount;
+function stripMixamoPrefix(name: string): string {
+  // FBXLoader strips ':' from bone names so the same source bone can ship as
+  // "mixamorig:Hips", "mixamorigHips", "mixamorig_Hips", or "mixamorig1Hips"
+  // (Mixamo bumps the index for re-uploaded rigs). Strip any of those.
+  const m = name.match(/^mixamorig[0-9]*[:_]?(.+)$/i);
+  return m ? m[1] : name;
 }
 
-function mergeBonePose(
-  target: Record<string, BoneAxisOffset>,
-  pose: BonePose | undefined,
-  weight = 1,
-) {
-  if (!pose || weight <= 0) {
-    return;
-  }
-  Object.entries(pose).forEach(([boneName, axes]) => {
-    if (!axes) {
-      return;
-    }
-    if (axes.x !== undefined) {
-      addBoneOffset(target, boneName, "x", axes.x * weight);
-    }
-    if (axes.y !== undefined) {
-      addBoneOffset(target, boneName, "y", axes.y * weight);
-    }
-    if (axes.z !== undefined) {
-      addBoneOffset(target, boneName, "z", axes.z * weight);
-    }
-  });
+function pickClip(
+  animations: THREE.AnimationClip[] | undefined,
+): THREE.AnimationClip | null {
+  if (!animations || animations.length === 0) return null;
+  const nonZero = animations.find((clip) => clip.duration > 0);
+  return nonZero ?? animations[0] ?? null;
 }
 
-function applyBoneOffsetFromRest(
-  bone: THREE.Bone,
-  restQuat: THREE.Quaternion,
-  offset: BoneAxisOffset | undefined,
-) {
-  bone.quaternion.copy(restQuat);
-  if (!offset) {
-    return;
-  }
-  poseEuler.set(offset.x ?? 0, offset.y ?? 0, offset.z ?? 0, "XYZ");
-  poseQuat.setFromEuler(poseEuler);
-  bone.quaternion.multiply(poseQuat);
-}
+function remapClipToAvatarRig(
+  clip: THREE.AnimationClip,
+  /** Map of `strippedBoneName` → actual rig bone name (preserving the rig's
+   *  prefix so the AnimationMixer can find the bone by name). */
+  avatarBoneByStripped: Map<string, string>,
+): THREE.AnimationClip | null {
+  const tracks: THREE.KeyframeTrack[] = [];
+  const skipped: string[] = [];
 
-function findFirstBoneChild(bone: THREE.Bone): THREE.Bone | null {
-  for (const child of bone.children) {
-    if ((child as THREE.Bone).isBone) {
-      return child as THREE.Bone;
+  for (const track of clip.tracks) {
+    const dot = track.name.indexOf(".");
+    if (dot <= 0) continue;
+
+    const rawBone = stripMixamoPrefix(track.name.slice(0, dot));
+    const property = track.name.slice(dot + 1);
+    const lookup = TRACK_BONE_REMAP[rawBone] ?? rawBone;
+    const actualBoneName = avatarBoneByStripped.get(lookup);
+
+    if (!actualBoneName) {
+      skipped.push(`${rawBone} (sought ${lookup})`);
+      continue;
     }
-  }
-  return null;
-}
 
-function createAimPoseQuaternion(
-  bone: THREE.Bone,
-  restQuat: THREE.Quaternion,
-  targetDirectionInParentSpace: THREE.Vector3,
-): THREE.Quaternion | null {
-  const childBone = findFirstBoneChild(bone);
-  if (!childBone || childBone.position.lengthSq() < 1e-6) {
+    // Mixamo Hips position tracks ship in centimeters; applying them to a
+    // meter-scale rig flings the avatar off-screen. Keep it in place.
+    if (
+      lookup === "Hips" &&
+      (property === "position" || property.startsWith("position["))
+    ) {
+      continue;
+    }
+
+    const cloned = track.clone();
+    cloned.name = `${actualBoneName}.${property}`;
+    tracks.push(cloned);
+  }
+
+  if (tracks.length === 0) {
+    console.warn("[Avatar] clip produced 0 mapped tracks", clip.name, {
+      sampleSourceTracks: clip.tracks.slice(0, 6).map((t) => t.name),
+      skippedSample: skipped.slice(0, 8),
+    });
     return null;
   }
 
-  const sourceDirLocal = poseVec.copy(childBone.position).normalize();
-  const targetDirLocal = poseVec2
-    .copy(targetDirectionInParentSpace)
-    .normalize()
-    .applyQuaternion(poseQuat2.copy(restQuat).invert())
-    .normalize();
-
-  if (sourceDirLocal.lengthSq() < 1e-6 || targetDirLocal.lengthSq() < 1e-6) {
-    return null;
+  if (skipped.length) {
+    console.log(
+      `[Avatar] clip ${clip.name}: ${tracks.length} tracks mapped, ${skipped.length} skipped (e.g. ${skipped.slice(0, 4).join(", ")})`,
+    );
   }
-
-  const delta = new THREE.Quaternion().setFromUnitVectors(sourceDirLocal, targetDirLocal);
-  return restQuat.clone().multiply(delta);
+  return new THREE.AnimationClip(clip.name, clip.duration, tracks);
 }
 
-/**
- * Gestures are applied as curated local-bone offsets from this model's own
- * bind pose. This is less flashy than cross-skeleton retargeting, but it is
- * stable and avoids the body deformation seen with foreign mocap clips.
- */
+/* ── FBX cache (Suspense-friendly) ──
+   We cache both the parsed FBX scene (for the avatar) and the extracted
+   clips (for animation packs whose mesh we don't want). */
+const fbxSceneCache = new Map<string, THREE.Group>();
+const fbxClipCache = new Map<string, THREE.AnimationClip[]>();
+const fbxScenePromises = new Map<string, Promise<THREE.Group>>();
+const fbxClipPromises = new Map<string, Promise<THREE.AnimationClip[]>>();
 
-// How long to keep gesture active after last MediaPipe detection (seconds)
-const GESTURE_HOLD_TIME = 1.5;
+function loadFbxScene(url: string): Promise<THREE.Group> {
+  let p = fbxScenePromises.get(url);
+  if (!p) {
+    const loader = new FBXLoader();
+    p = loader
+      .loadAsync(url)
+      .then((group) => {
+        fbxSceneCache.set(url, group as THREE.Group);
+        return group as THREE.Group;
+      })
+      .catch((err) => {
+        console.error("[Avatar] FBX scene load failed:", url, err);
+        fbxScenePromises.delete(url);
+        throw err;
+      });
+    fbxScenePromises.set(url, p);
+  }
+  return p;
+}
 
-/* ── 3D Model ── */
+function useFbxScene(url: string): THREE.Group {
+  const cached = fbxSceneCache.get(url);
+  if (cached) return cached;
+  throw loadFbxScene(url);
+}
+
+function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
+  let p = fbxClipPromises.get(url);
+  if (!p) {
+    const loader = new FBXLoader();
+    p = loader
+      .loadAsync(url)
+      .then((group) => {
+        const clips = (group.animations || []).map((c) => c.clone());
+        // Drop the heavy mesh data — we only ever needed the AnimationClips.
+        group.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (mesh.isMesh) {
+            mesh.geometry?.dispose?.();
+            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            mats.forEach((m) => (m as THREE.Material | undefined)?.dispose?.());
+          }
+        });
+        fbxClipCache.set(url, clips);
+        return clips;
+      })
+      .catch((err) => {
+        console.error("[Avatar] FBX load failed:", url, err);
+        fbxClipPromises.delete(url);
+        throw err;
+      });
+    fbxClipPromises.set(url, p);
+  }
+  return p;
+}
+
+function useFbxClips(url: string): THREE.AnimationClip[] {
+  const cached = fbxClipCache.get(url);
+  if (cached) return cached;
+  throw loadFbxClips(url);
+}
+
+/* ── Error boundary ── */
+class AvatarErrorBoundary extends Component<
+  { children: ReactNode; fallback: (err: Error | null) => ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  state = { hasError: false, error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error, info: { componentStack?: string }) {
+    console.error("[Avatar] error boundary caught:", error, info);
+  }
+  render() {
+    return this.state.hasError ? this.props.fallback(this.state.error) : this.props.children;
+  }
+}
+
 function AvatarModel({
-  isSpeaking,
-  audioDataRef,
-  volumeRef,
   gestureRef,
-  userSmileRef,
+  faceDetectedRef,
+  onAnimStateChangeRef,
+  onReadyRef,
 }: {
-  isSpeaking: boolean;
-  audioDataRef: MutableRefObject<(() => Uint8Array | undefined) | undefined>;
-  volumeRef: MutableRefObject<(() => number) | undefined>;
   gestureRef: MutableRefObject<GestureName>;
-  userSmileRef: MutableRefObject<number>;
+  faceDetectedRef: MutableRefObject<boolean>;
+  onAnimStateChangeRef: MutableRefObject<(state: AvatarAnimState) => void>;
+  onReadyRef: MutableRefObject<(() => void) | undefined>;
 }) {
-  const gltf = useGLTF(AVATAR_URL);
-  const fbx = gltf;
-  const scene = gltf.scene;
-  const morphMeshes = useRef<THREE.Mesh[]>([]);
-  const lipSync = useRef(new AudioLipSync());
-  // Rest-pose quaternions for all driven bones.
-  const boneRestQuats = useRef<Record<string, THREE.Quaternion>>({});
-  const aimedBoneTargets = useRef<Partial<Record<RelaxedAimBoneName, THREE.Quaternion>>>({});
+  const groupRef = useRef<THREE.Group>(null);
+  const notify = useCallback(
+    (state: AvatarAnimState) => onAnimStateChangeRef.current?.(state),
+    [onAnimStateChangeRef],
+  );
+  const baseFbx = useFbxScene(AVATAR_URL);
 
-  // ── Gesture pose system ──
-  const gesturePoseBlend = useRef(0);
-  const activeGesture = useRef<GestureName>(null);
-  // Gesture hold: keep gesture active for GESTURE_HOLD_TIME after last detection
-  const gestureHoldName = useRef<GestureName>(null);
-  const gestureLastSeen = useRef(0);
-  // Smoothed gesture expression blend for face
-  const gestureExprBlend = useRef(0);
-  // Manual delta time tracking (clock.getDelta() is unreliable with getElapsedTime())
-  const lastFrameTime = useRef(0);
-  // Smoothed audio envelope (slow attack, slower release) used to drive
-  // visible head nods during speech since the model has no jaw bone and
-  // the bushy beard occludes mouth morph deformation.
-  const speechEnv = useRef(0);
-  const speechPulse = useRef(0);
-  const speechPulseDecay = useRef(0);
-  // All bones by name for procedural posing.
-  const allBones = useRef<Record<string, THREE.Bone>>({});
+  const idleClips = useFbxClips(ANIM_IDLE_URL);
+  const sittingClips = useFbxClips(ANIM_SITTING_URL);
+  const standingClips = useFbxClips(ANIM_STANDING_URL);
+  const stoppingClips = useFbxClips(ANIM_STOPPING_URL);
+  const walkingClips = useFbxClips(ANIM_WALKING_URL);
+  const wavingClips = useFbxClips(ANIM_WAVING_URL);
+  const prayingClips = useFbxClips(ANIM_PRAYING_URL);
+
+  const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
+
+  const sourceClips = useMemo(
+    () => ({
+      idle_standing: pickClip(idleClips),
+      sitting: pickClip(sittingClips),
+      standing_up: pickClip(standingClips),
+      stopping: pickClip(stoppingClips),
+      walking: pickClip(walkingClips),
+      waving: pickClip(wavingClips),
+      praying: pickClip(prayingClips),
+    }),
+    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips],
+  );
+
+  const mixerRef = useRef<THREE.AnimationMixer | null>(null);
+  const actionsRef = useRef<Record<ClipKey, THREE.AnimationAction | undefined>>({
+    sitting: undefined,
+    standing_up: undefined,
+    walking: undefined,
+    stopping: undefined,
+    idle_standing: undefined,
+    waving: undefined,
+    praying: undefined,
+  });
+  const currentActionRef = useRef<THREE.AnimationAction | null>(null);
+  const animStateRef = useRef<AvatarAnimState>("sitting");
+
+  // Face debouncing.
+  const stableFaceRef = useRef(false);
+  const lastFaceChangeRef = useRef<number>(0);
+  const lastFaceRawRef = useRef(false);
+
+  // Cooldowns.
+  const noFaceSinceRef = useRef<number | null>(null);
+  const lastWaveAtRef = useRef<number>(0);
+  const lastPrayAtRef = useRef<number>(0);
 
   useEffect(() => {
-    const meshes: THREE.Mesh[] = [];
-    allBones.current = {};
-    boneRestQuats.current = {};
-    aimedBoneTargets.current = {};
-
-    // Load the base color texture extracted from the source FBX (FBX2glTF
-    // can't embed it because the lipsync FBX strips images).
-    const texLoader = new THREE.TextureLoader();
-    const baseColorTex = texLoader.load("/avatar-base.png");
-    baseColorTex.colorSpace = THREE.SRGBColorSpace;
-    baseColorTex.flipY = false; // glTF convention
-    baseColorTex.anisotropy = 16;
-    baseColorTex.wrapS = THREE.RepeatWrapping;
-    baseColorTex.wrapT = THREE.RepeatWrapping;
+    /* ── Material polish ──
+       The Meshy FBX ships its own embedded textures, so we leave the maps
+       alone and just tighten filtering + zero out the all-white emissive
+       that bakes from FBX's Phong shading model. */
+    const avatarBoneByStripped = new Map<string, string>();
 
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
         if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) {
-          const skinnedMesh = mesh as THREE.SkinnedMesh;
-          skinnedMesh.normalizeSkinWeights();
+          (mesh as THREE.SkinnedMesh).normalizeSkinWeights();
         }
-        // Enhance skin textures
-        if (mesh.material) {
-          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-          mats.forEach((mat) => {
-            const m = mat as THREE.MeshStandardMaterial;
-            // FBX2glTF emits a 1x1 stub for baseColorTexture because it can't
-            // find the embedded image. Replace it with the real texture we
-            // extracted from the source FBX.
-            const mapImg = m.map?.image as { width?: number } | undefined;
-            const stubMap = !!m.map && !!mapImg && (mapImg.width ?? 0) <= 4;
-            if (!m.map || stubMap) {
-              if (m.map) m.map.dispose?.();
-              m.map = baseColorTex;
-              m.color = new THREE.Color(0xffffff);
-            }
-            // Kill the all-white emissive that bakes from FBX Phong shading model.
-            if (m.emissiveMap) {
-              m.emissiveMap.dispose?.();
-              m.emissiveMap = null;
-            }
-            m.emissive = new THREE.Color(0x000000);
-            // Drop any stub normalMap (1×1 placeholder from FBX2glTF) which
-            // triggers "Texture marked for update but no image data found".
-            const normalImg = m.normalMap?.image as { width?: number } | undefined;
-            if (m.normalMap && normalImg && (normalImg.width ?? 0) <= 4) {
-              m.normalMap.dispose?.();
-              m.normalMap = null;
-            }
-            if (m.map) {
-              m.map.anisotropy = 16;
-              m.map.minFilter = THREE.LinearMipmapLinearFilter;
-              m.map.magFilter = THREE.LinearFilter;
-              m.map.needsUpdate = true;
-            }
-            if (m.normalMap) {
-              m.normalScale = new THREE.Vector2(1.2, 1.2);
-              m.normalMap.anisotropy = 16;
-              m.normalMap.needsUpdate = true;
-            }
-            // Skin-like roughness
-            m.roughness = Math.max(m.roughness ?? 0.5, 0.45);
-            m.envMapIntensity = 0.4;
-            // Ensure model is visible: render both sides
-            m.side = THREE.DoubleSide;
-            m.needsUpdate = true;
-          });
-          console.log(`[Avatar] Mesh "${mesh.name}": ${mats.length} material(s), hasMap=${!!(mats[0] as THREE.MeshStandardMaterial).map}, color=#${((mats[0] as THREE.MeshStandardMaterial).color || new THREE.Color()).getHexString()}`);
-        }
-        // Prevent frustum-culling artifacts on large skinned mesh
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((mat) => {
+          const m = mat as THREE.MeshStandardMaterial;
+          if (m.map) {
+            m.map.colorSpace = THREE.SRGBColorSpace;
+            m.map.anisotropy = 16;
+            m.map.minFilter = THREE.LinearMipmapLinearFilter;
+            m.map.magFilter = THREE.LinearFilter;
+            m.map.needsUpdate = true;
+          }
+          if (m.emissiveMap) {
+            m.emissiveMap.dispose?.();
+            m.emissiveMap = null;
+          }
+          m.emissive = new THREE.Color(0x000000);
+          if (m.normalMap) {
+            m.normalScale = new THREE.Vector2(1.2, 1.2);
+            m.normalMap.anisotropy = 16;
+            m.normalMap.needsUpdate = true;
+          }
+          m.roughness = Math.max(m.roughness ?? 0.5, 0.45);
+          m.envMapIntensity = 0.4;
+          m.side = THREE.DoubleSide;
+          m.needsUpdate = true;
+        });
         mesh.frustumCulled = false;
-        if (mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
-          // Re-key morphTargetDictionary so the lipsync code can find
-          // viseme_aa, viseme_O, etc. by name (FBX2glTF strips target names).
-          const oldDict = mesh.morphTargetDictionary;
-          const newDict: Record<string, number> = {};
-          for (const [key, idx] of Object.entries(oldDict)) {
-            const remapped = MORPH_NAME_REMAP[key] ?? key;
-            newDict[remapped] = idx as number;
-          }
-          mesh.morphTargetDictionary = newDict;
-          // GLB defaults all viseme weights to 1 (mouth wide open in every
-          // shape simultaneously); reset to 0 so lipsync controls them.
-          for (let i = 0; i < mesh.morphTargetInfluences.length; i++) {
-            mesh.morphTargetInfluences[i] = 0;
-          }
-          console.log('[Avatar] morph dict remapped:', Object.keys(newDict));
-          meshes.push(mesh);
-        }
       }
       if ((obj as THREE.Bone).isBone) {
-        allBones.current[obj.name] = obj as THREE.Bone;
-        boneRestQuats.current[obj.name] = (obj as THREE.Bone).quaternion.clone();
+        avatarBoneByStripped.set(stripMixamoPrefix(obj.name), obj.name);
       }
     });
-    morphMeshes.current = meshes;
 
-    // ── Fixed scale + position ──
-    // The model is ~170 units tall (cm). FBXLoader may or may not apply unit conversion.
-    // Reset transforms first so React Strict Mode re-runs measure raw model.
+    /* ── Scale + ground the avatar ──
+       Anchor the avatar's feet at scene-local y = 0 so the parent group's
+       world Y becomes the literal floor line. Because feet sit at 0 in
+       local space, scaling the group never lifts the feet off the floor
+       — essential for the "walk closer = grow" stage trick below. */
     scene.position.set(0, 0, 0);
     scene.scale.set(1, 1, 1);
     scene.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(scene);
-    const modelHeight = box.max.y - box.min.y;
-    console.log("[Avatar] FBX raw bounding box:", {
-      min: [box.min.x.toFixed(2), box.min.y.toFixed(2), box.min.z.toFixed(2)],
-      max: [box.max.x.toFixed(2), box.max.y.toFixed(2), box.max.z.toFixed(2)],
-      height: modelHeight.toFixed(2),
-      bones: Object.keys(allBones.current).join(", "),
-      animations: (fbx.animations || []).map(a => a.name),
-    });
-
-    // Force the model to be a little shorter than full viewport height so
-    // conversational head motion and hair stay inside frame.
+    const rawBox = new THREE.Box3().setFromObject(scene);
+    const modelHeight = rawBox.max.y - rawBox.min.y;
     const desiredHeight = 2.6;
     if (modelHeight > 0.001) {
       const s = desiredHeight / modelHeight;
-      scene.scale.set(s, s, s);
-      console.log("[Avatar] Applied scale:", s.toFixed(6), "modelHeight:", modelHeight.toFixed(2));
-    } else {
-      // Fallback: assume 170cm model that FBXLoader didn't scale
-      scene.scale.set(0.0106, 0.0106, 0.0106);
-      console.log("[Avatar] Fallback scale applied (model height was 0)");
+      scene.scale.setScalar(s);
     }
-
-    // Recompute after scaling and center the avatar in frame.
     scene.updateMatrixWorld(true);
     const scaledBox = new THREE.Box3().setFromObject(scene);
-    const scaledCenter = new THREE.Vector3();
-    scaledBox.getCenter(scaledCenter);
-    const framingBiasY = 0;
-    const xOffset = -scaledCenter.x;
-    const yOffset = -scaledCenter.y + framingBiasY;
-    const zOffset = -scaledCenter.z;
-    console.log("[Avatar] After scale:", {
-      centerX: scaledCenter.x.toFixed(3),
-      min: scaledBox.min.y.toFixed(3),
-      max: scaledBox.max.y.toFixed(3),
-      center: scaledCenter.y.toFixed(3),
-      xOffset: xOffset.toFixed(3),
-      yOffset: yOffset.toFixed(3),
-      zOffset: zOffset.toFixed(3),
+    const center = new THREE.Vector3();
+    scaledBox.getCenter(center);
+    scene.position.set(-center.x, -scaledBox.min.y, -center.z);
+    scene.updateMatrixWorld(true);
+
+    /* ── Build mixer + actions ── */
+    const mixer = new THREE.AnimationMixer(scene);
+    mixerRef.current = mixer;
+
+    const nextActions: Record<ClipKey, THREE.AnimationAction | undefined> = {
+      sitting: undefined,
+      standing_up: undefined,
+      walking: undefined,
+      stopping: undefined,
+      idle_standing: undefined,
+      waving: undefined,
+      praying: undefined,
+    };
+
+    (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
+      const clip = sourceClips[key];
+      if (!clip) return;
+      const mapped = remapClipToAvatarRig(clip, avatarBoneByStripped);
+      if (!mapped) return;
+      const action = mixer.clipAction(mapped, scene);
+      action.enabled = true;
+      action.setEffectiveWeight(1);
+      action.setEffectiveTimeScale(1);
+      nextActions[key] = action;
     });
-    scene.position.set(xOffset, yOffset, zOffset);
-    // Expose for live tuning from devtools.
-    (window as unknown as { __sage?: unknown }).__sage = { scene, scaledBox, scaledCenter, modelHeight };
-  }, [scene, fbx.animations]);
 
-  useFrame(({ clock }) => {
-    const t = clock.getElapsedTime();
+    actionsRef.current = nextActions;
 
-    // Get real-time audio data from ElevenLabs
-    const freqData = audioDataRef.current?.() ?? undefined;
-    const vol = volumeRef.current?.() ?? 0;
+    // Default pose with no one around is sitting; a face triggers the
+    // stand-up → walk-in → idle sequence below.
+    const initialState: AvatarAnimState =
+      (nextActions.sitting && "sitting") ||
+      (nextActions.idle_standing && "idle_standing") ||
+      "idle_standing";
 
-    // Audio-driven lip sync — compute viseme weights
-    const lsTargets = lipSync.current.update(freqData, vol, isSpeaking);
+    const initialClip = STATE_TARGETS[initialState].clipKey;
+    const initialAction = nextActions[initialClip];
+    if (initialAction) {
+      initialAction
+        .reset()
+        .setLoop(
+          initialState === "idle_standing" || initialState === "sitting"
+            ? THREE.LoopRepeat
+            : THREE.LoopOnce,
+          Infinity,
+        )
+        .play();
+      initialAction.setEffectiveWeight(1);
+      currentActionRef.current = initialAction;
+      animStateRef.current = initialState;
 
-    // NOTE: Speech bone motion is applied AFTER mixer.update() below so that
-    // the mixer sets the base pose first, then we add small deltas on top.
+      // Snap the group to the initial state's stage marks so the very first
+      // frame is already on-mark (no slide-in from the origin).
+      const grp = groupRef.current;
+      if (grp) {
+        const t = STATE_TARGETS[initialState];
+        grp.position.set(0, GROUND_Y + (initialState === "sitting" ? SIT_GROUND_OFFSET_Y : 0), t.z);
+        grp.rotation.y = t.rotY;
+        grp.scale.setScalar(t.scale);
+      }
 
-    morphMeshes.current.forEach((mesh) => {
-      const d = mesh.morphTargetDictionary!;
-      const inf = mesh.morphTargetInfluences!;
+      mixer.update(0);
+      notify(initialState);
+      // Tell the host the avatar is on screen so it can spin up the camera
+      // pipeline now — we deliberately defer onReady to the next frame so
+      // React commits the Canvas before MediaPipe starts hammering the GPU.
+      requestAnimationFrame(() => onReadyRef.current?.());
+    }
 
-      // Blinking (~every 3-4s with slight variation)
-      const blinkCycle = 3.2 + Math.sin(t * 0.13) * 0.8;
-      const blinkPhase = (t % blinkCycle) / blinkCycle;
-      const blinkVal =
-        blinkPhase > 0.96 ? 1 : blinkPhase > 0.94 ? (blinkPhase - 0.94) * 50 : 0;
-      if (d.eyeBlinkLeft !== undefined) inf[d.eyeBlinkLeft] = blinkVal;
-      if (d.eyeBlinkRight !== undefined) inf[d.eyeBlinkRight] = blinkVal;
+    console.log("[Avatar] ready", {
+      bones: avatarBoneByStripped.size,
+      actions: Object.entries(nextActions)
+        .filter(([, a]) => !!a)
+        .map(([n]) => n),
+      initialState,
+    });
 
-      // Apply lip-sync morph targets
-      for (const [name, weight] of Object.entries(lsTargets)) {
-        if (d[name] !== undefined) {
-          inf[d[name]] = weight;
+    return () => {
+      mixer.stopAllAction();
+      mixer.uncacheRoot(scene);
+      mixerRef.current = null;
+      currentActionRef.current = null;
+      actionsRef.current = {
+        sitting: undefined,
+        standing_up: undefined,
+        walking: undefined,
+        stopping: undefined,
+        idle_standing: undefined,
+        waving: undefined,
+        praying: undefined,
+      };
+    };
+    // `notify` is stable (refs only); intentionally NOT a dep so we don't
+    // tear down the mixer on every parent re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scene, sourceClips]);
+
+  useFrame((_, delta) => {
+    const mixer = mixerRef.current;
+    const actions = actionsRef.current;
+    if (mixer) mixer.update(Math.min(delta, 0.05));
+
+    /* ── Smoothly drive group transform toward the current state's marks ── */
+    const grp = groupRef.current;
+    const state = animStateRef.current;
+    const target = STATE_TARGETS[state];
+    let onMark = true;
+    let facingTarget = true;
+    if (grp) {
+      // Slow, foot-paced traversal so the walk cycle reads as actual
+      // walking rather than a dolly-zoom. ~3.5s to cross the stage.
+      const posLerp = Math.min(1, delta * 0.55);
+      const rotLerp = Math.min(1, delta * 3.5);   // ~0.3s to turn
+      const scaleLerp = posLerp;
+
+      // Sit pose needs a small extra dip because we strip Hips translation.
+      const yBias = state === "sitting" ? SIT_GROUND_OFFSET_Y : 0;
+      const tgtY = GROUND_Y + yBias;
+
+      grp.position.y += (tgtY - grp.position.y) * Math.min(1, delta * 3);
+      grp.position.z += (target.z - grp.position.z) * posLerp;
+
+      // Shortest-path rotation lerp on Y.
+      let drot = target.rotY - grp.rotation.y;
+      while (drot > Math.PI) drot -= Math.PI * 2;
+      while (drot < -Math.PI) drot += Math.PI * 2;
+      grp.rotation.y += drot * rotLerp;
+
+      const cs = grp.scale.x;
+      const ns = cs + (target.scale - cs) * scaleLerp;
+      grp.scale.setScalar(ns);
+
+      onMark =
+        Math.abs(target.z - grp.position.z) < 0.04 &&
+        Math.abs(target.scale - grp.scale.x) < 0.008;
+      facingTarget = Math.abs(drot) < 0.05;
+    }
+
+    const fadeToClip = (
+      clipKey: ClipKey,
+      loop: THREE.AnimationActionLoopStyles,
+      once = false,
+      fade = 0.5,
+    ) => {
+      const next = actions[clipKey];
+      if (!next) return false;
+
+      next.reset().setLoop(loop, once ? 1 : Infinity);
+      next.clampWhenFinished = once;
+      next.enabled = true;
+      next.setEffectiveWeight(1);
+
+      const prev = currentActionRef.current;
+      if (prev && prev !== next) {
+        prev.crossFadeTo(next, fade, false);
+      } else {
+        next.fadeIn(fade);
+      }
+
+      next.play();
+      currentActionRef.current = next;
+      return true;
+    };
+
+    const goTo = (
+      next: AvatarAnimState,
+      loop: THREE.AnimationActionLoopStyles = THREE.LoopRepeat,
+      once = false,
+      fade = 0.5,
+    ) => {
+      animStateRef.current = next;
+      notify(next);
+      fadeToClip(STATE_TARGETS[next].clipKey, loop, once, fade);
+    };
+
+    /* ── Debounce face presence/absence ── */
+    const now = performance.now();
+    const rawFace = faceDetectedRef.current;
+    if (rawFace !== lastFaceRawRef.current) {
+      lastFaceRawRef.current = rawFace;
+      lastFaceChangeRef.current = now;
+    }
+    if (
+      rawFace !== stableFaceRef.current &&
+      now - lastFaceChangeRef.current >= FACE_DEBOUNCE_MS
+    ) {
+      stableFaceRef.current = rawFace;
+    }
+    const faceNow = stableFaceRef.current;
+
+    /* ── State machine ──
+       sitting ─face→ standing_up ─done→ walking_in ─arrived→ idle_standing
+       idle_standing ─no face 3s→ turning_away ─faced→ walking_out
+                       ─arrived→ turning_back ─faced→ sitting
+       Open_Palm in idle_standing → waving (one-shot) → idle_standing      */
+    if (state === "idle_standing") {
+      if (faceNow) {
+        noFaceSinceRef.current = null;
+        const wantsPray =
+          gestureRef.current === "Namaste" && now - lastPrayAtRef.current > 3500;
+        const wantsWave =
+          gestureRef.current === "Open_Palm" && now - lastWaveAtRef.current > 2500;
+        if (wantsPray && actions.praying) {
+          lastPrayAtRef.current = now;
+          goTo("praying", THREE.LoopOnce, true, 0.4);
+        } else if (wantsWave && actions.waving) {
+          lastWaveAtRef.current = now;
+          goTo("waving", THREE.LoopOnce, true, 0.4);
+        }
+      } else {
+        if (noFaceSinceRef.current == null) noFaceSinceRef.current = now;
+        if (now - noFaceSinceRef.current > RETURN_TO_SIT_DELAY_MS) {
+          noFaceSinceRef.current = null;
+          // Begin the "go home" sequence: face away first.
+          goTo("turning_away", THREE.LoopRepeat, false, 0.4);
         }
       }
-
-      if (isSpeaking) {
-        // Micro-expressions that accompany speech
-        if (d.mouthSmileLeft !== undefined)
-          inf[d.mouthSmileLeft] = 0.04 + Math.sin(t * 0.9) * 0.03;
-        if (d.mouthSmileRight !== undefined)
-          inf[d.mouthSmileRight] = 0.04 + Math.sin(t * 0.9 + 0.3) * 0.03;
-        if (d.browInnerUp !== undefined)
-          inf[d.browInnerUp] = Math.max(0, Math.sin(t * 1.5) * 0.08);
-        if (d.browOuterUpLeft !== undefined)
-          inf[d.browOuterUpLeft] = Math.max(0, Math.sin(t * 1.1 + 1.0) * 0.04);
-        if (d.browOuterUpRight !== undefined)
-          inf[d.browOuterUpRight] = Math.max(0, Math.sin(t * 1.1 + 1.2) * 0.04);
-        if (d.cheekSquintLeft !== undefined)
-          inf[d.cheekSquintLeft] = Math.max(0, Math.sin(t * 1.3) * 0.04);
-        if (d.cheekSquintRight !== undefined)
-          inf[d.cheekSquintRight] = Math.max(0, Math.sin(t * 1.3 + 0.15) * 0.04);
-        if (d.noseSneerLeft !== undefined)
-          inf[d.noseSneerLeft] = Math.max(0, Math.sin(t * 2.3) * 0.02);
-        if (d.noseSneerRight !== undefined)
-          inf[d.noseSneerRight] = Math.max(0, Math.sin(t * 2.3 + 0.1) * 0.02);
-      } else {
-        // Idle — gentle resting expression
-        const idleTargets = [
-          "mouthSmileLeft", "mouthSmileRight", "browInnerUp",
-          "browOuterUpLeft", "browOuterUpRight",
-          "cheekSquintLeft", "cheekSquintRight",
-          "noseSneerLeft", "noseSneerRight",
-        ];
-        idleTargets.forEach((name) => {
-          if (d[name] !== undefined && inf[d[name]] > 0.001) {
-            inf[d[name]] *= 0.9;
-          }
-        });
-      }
-
-      // ── Smile mirroring: when user smiles, avatar smiles back ──
-      const smile = userSmileRef.current;
-      if (smile > 0.05) {
-        const s = Math.min(smile * 1.2, 1); // slightly amplify
-        if (d.mouthSmileLeft !== undefined)
-          inf[d.mouthSmileLeft] = Math.max(inf[d.mouthSmileLeft], s * 0.55);
-        if (d.mouthSmileRight !== undefined)
-          inf[d.mouthSmileRight] = Math.max(inf[d.mouthSmileRight], s * 0.55);
-        if (d.cheekSquintLeft !== undefined)
-          inf[d.cheekSquintLeft] = Math.max(inf[d.cheekSquintLeft], s * 0.25);
-        if (d.cheekSquintRight !== undefined)
-          inf[d.cheekSquintRight] = Math.max(inf[d.cheekSquintRight], s * 0.25);
-        if (d.browOuterUpLeft !== undefined)
-          inf[d.browOuterUpLeft] = Math.max(inf[d.browOuterUpLeft], s * 0.08);
-        if (d.browOuterUpRight !== undefined)
-          inf[d.browOuterUpRight] = Math.max(inf[d.browOuterUpRight], s * 0.08);
-      }
-    });
-
-    const curGesture = gestureRef.current;
-    // Manual delta: clock.getDelta() is unreliable when getElapsedTime() is also used
-    const now = t;
-    const dt = lastFrameTime.current > 0 ? Math.min(now - lastFrameTime.current, 0.05) : 0.016;
-    lastFrameTime.current = now;
-
-    // Sticky gesture: hold detected gesture active for GESTURE_HOLD_TIME
-    if (curGesture) {
-      gestureHoldName.current = curGesture;
-      gestureLastSeen.current = now;
-    }
-    const heldGesture = gestureHoldName.current;
-    const gestureFresh = heldGesture && (now - gestureLastSeen.current) < GESTURE_HOLD_TIME;
-
-    if (gestureFresh && heldGesture) {
-      if (activeGesture.current !== heldGesture) {
-        activeGesture.current = heldGesture;
-      }
-      gesturePoseBlend.current = Math.min(1, gesturePoseBlend.current + dt / GESTURE_BLEND_IN);
-      gestureExprBlend.current = Math.min(1, gestureExprBlend.current + dt / (GESTURE_BLEND_IN * 1.2));
-    } else {
-      gesturePoseBlend.current = Math.max(0, gesturePoseBlend.current - dt / GESTURE_BLEND_OUT);
-      gestureExprBlend.current = Math.max(0, gestureExprBlend.current - dt / (GESTURE_BLEND_OUT * 1.5));
-      if (gesturePoseBlend.current <= 0.001) {
-        activeGesture.current = null;
-        gestureHoldName.current = null;
-      }
-    }
-
-    const gesture = activeGesture.current;
-    const gestureBlend = gesturePoseBlend.current;
-    const exprBlend = gestureExprBlend.current;
-
-    // ── Gesture-triggered facial expressions ──
-    if (exprBlend > 0.001) {
-      morphMeshes.current.forEach((mesh) => {
-        const d = mesh.morphTargetDictionary!;
-        const inf = mesh.morphTargetInfluences!;
-
-        const smileAmount = exprBlend * 0.35;
-        if (d.mouthSmileLeft !== undefined)
-          inf[d.mouthSmileLeft] = Math.max(inf[d.mouthSmileLeft], smileAmount);
-        if (d.mouthSmileRight !== undefined)
-          inf[d.mouthSmileRight] = Math.max(inf[d.mouthSmileRight], smileAmount);
-        if (d.cheekSquintLeft !== undefined)
-          inf[d.cheekSquintLeft] = Math.max(inf[d.cheekSquintLeft], exprBlend * 0.2);
-        if (d.cheekSquintRight !== undefined)
-          inf[d.cheekSquintRight] = Math.max(inf[d.cheekSquintRight], exprBlend * 0.2);
-
-        if (gesture === "Thumb_Up") {
-          if (d.mouthSmileLeft !== undefined) inf[d.mouthSmileLeft] = exprBlend * 0.5;
-          if (d.mouthSmileRight !== undefined) inf[d.mouthSmileRight] = exprBlend * 0.5;
-          if (d.browInnerUp !== undefined) inf[d.browInnerUp] = exprBlend * 0.15;
-          if (d.browOuterUpLeft !== undefined) inf[d.browOuterUpLeft] = exprBlend * 0.12;
-          if (d.browOuterUpRight !== undefined) inf[d.browOuterUpRight] = exprBlend * 0.12;
-        } else if (gesture === "Open_Palm") {
-          if (d.mouthSmileLeft !== undefined) inf[d.mouthSmileLeft] = exprBlend * 0.4;
-          if (d.mouthSmileRight !== undefined) inf[d.mouthSmileRight] = exprBlend * 0.4;
-          if (d.browOuterUpLeft !== undefined) inf[d.browOuterUpLeft] = exprBlend * 0.1;
-          if (d.browOuterUpRight !== undefined) inf[d.browOuterUpRight] = exprBlend * 0.1;
-        } else if (gesture === "Victory" || gesture === "ILoveYou") {
-          if (d.mouthSmileLeft !== undefined) inf[d.mouthSmileLeft] = exprBlend * 0.45;
-          if (d.mouthSmileRight !== undefined) inf[d.mouthSmileRight] = exprBlend * 0.45;
-          if (d.browInnerUp !== undefined) inf[d.browInnerUp] = exprBlend * 0.1;
-        } else if (gesture === "Thumb_Down") {
-          if (d.mouthSmileLeft !== undefined) inf[d.mouthSmileLeft] = 0;
-          if (d.mouthSmileRight !== undefined) inf[d.mouthSmileRight] = 0;
-          if (d.browInnerUp !== undefined) inf[d.browInnerUp] = exprBlend * 0.2;
-          if (d.mouthFrownLeft !== undefined) inf[d.mouthFrownLeft] = exprBlend * 0.15;
-          if (d.mouthFrownRight !== undefined) inf[d.mouthFrownRight] = exprBlend * 0.15;
-        } else if (gesture === "Namaste") {
-          if (d.mouthSmileLeft !== undefined) inf[d.mouthSmileLeft] = exprBlend * 0.35;
-          if (d.mouthSmileRight !== undefined) inf[d.mouthSmileRight] = exprBlend * 0.35;
-          if (d.browInnerUp !== undefined) inf[d.browInnerUp] = exprBlend * 0.12;
-          if (d.cheekSquintLeft !== undefined) inf[d.cheekSquintLeft] = exprBlend * 0.15;
-          if (d.cheekSquintRight !== undefined) inf[d.cheekSquintRight] = exprBlend * 0.15;
-        } else if (gesture === "Photo_Pose") {
-          if (d.mouthSmileLeft !== undefined) inf[d.mouthSmileLeft] = exprBlend * 0.6;
-          if (d.mouthSmileRight !== undefined) inf[d.mouthSmileRight] = exprBlend * 0.6;
-          if (d.cheekSquintLeft !== undefined) inf[d.cheekSquintLeft] = exprBlend * 0.3;
-          if (d.cheekSquintRight !== undefined) inf[d.cheekSquintRight] = exprBlend * 0.3;
-          if (d.browOuterUpLeft !== undefined) inf[d.browOuterUpLeft] = exprBlend * 0.12;
-          if (d.browOuterUpRight !== undefined) inf[d.browOuterUpRight] = exprBlend * 0.12;
+    } else if (state === "sitting") {
+      if (faceNow) {
+        noFaceSinceRef.current = null;
+        if (actions.standing_up) {
+          goTo("standing_up", THREE.LoopOnce, true, 0.6);
+        } else {
+          goTo("walking_in", THREE.LoopRepeat, false, 0.5);
         }
-      });
-    }
-
-    // ── Stable procedural body posing ──
-    // Every driven bone is rebuilt from its original bind-pose quaternion each
-    // frame. That prevents the additive drift that was deforming the body.
-    const poseOffsets: Record<string, BoneAxisOffset> = {};
-    mergeBonePose(poseOffsets, RELAXED_BODY_POSE, 1);
-    mergeBonePose(poseOffsets, RELAXED_HAND_POSE, 1);
-    if (gesture && gestureBlend > 0.001) {
-      mergeBonePose(poseOffsets, GESTURE_BODY_POSES[gesture as ConcreteGestureName], gestureBlend);
-    }
-
-    const neck = allBones.current["neck"];
-
-    if (isSpeaking) {
-      const rawV = Math.min(1, vol * 2.5);
-      const jawOpen = lsTargets["jawOpen"] ?? 0;
-      const vowelOpen = lsTargets["viseme_aa"] ?? 0;
-      const jawAmount = Math.min(1, (jawOpen + vowelOpen) * 1.5);
-
-      // Smoothed envelope: fast attack, slow release. Each loud syllable
-      // pumps the envelope up; quiet gaps let it fall. Drives a visible
-      // amplitude-reactive head nod — the universal "I'm talking" cue
-      // when the mouth itself is hidden under the beard.
-      const drive = Math.max(rawV, jawAmount * 0.8);
-      if (drive > speechEnv.current) {
-        speechEnv.current += (drive - speechEnv.current) * 0.45; // attack
+      }
+    } else if (state === "standing_up") {
+      const action = actions.standing_up;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        // Walk forward toward the camera.
+        if (actions.walking) {
+          goTo("walking_in", THREE.LoopRepeat, false, 0.4);
+        } else {
+          goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        }
+      }
+    } else if (state === "walking_in") {
+      // If the visitor leaves mid-walk, abort and turn around.
+      if (!faceNow) {
+        if (noFaceSinceRef.current == null) noFaceSinceRef.current = now;
       } else {
-        speechEnv.current += (drive - speechEnv.current) * 0.08; // release
+        noFaceSinceRef.current = null;
       }
-      // Per-syllable pulse: rising edge of the envelope triggers a nod.
-      const env = speechEnv.current;
-      if (drive > 0.35 && drive > speechPulse.current * 0.95) {
-        speechPulse.current = drive;
-        speechPulseDecay.current = 1;
-      } else {
-        speechPulseDecay.current *= 0.88;
+      if (onMark) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
       }
-      const pulse = speechPulse.current * speechPulseDecay.current;
-
-      // Big amplitude-driven head nod (down on loud syllables) +
-      // continuous gentle sway so the beard wags even between syllables.
-      const nodDown = env * 0.18 + pulse * 0.10;
-      addBoneOffset(poseOffsets, "Head", "x", nodDown);
-      addBoneOffset(poseOffsets, "Head", "x", Math.sin(t * 6.0) * 0.035 * (0.4 + env));
-      addBoneOffset(poseOffsets, "Head", "y", Math.sin(t * 1.3 + 0.5) * 0.05 * (0.3 + env));
-      addBoneOffset(poseOffsets, "Head", "z", Math.sin(t * 0.9 + 1.0) * 0.025 * env);
-      if (neck) {
-        addBoneOffset(poseOffsets, "neck", "x", nodDown * -0.35);
-        addBoneOffset(poseOffsets, "neck", "x", Math.sin(t * 6.0 + 0.4) * 0.02 * (0.4 + env));
-        addBoneOffset(poseOffsets, "neck", "y", Math.sin(t * 1.0 + 1.2) * 0.025 * (0.3 + env));
+    } else if (state === "turning_away") {
+      // If the visitor comes back before he finishes turning, abort.
+      if (faceNow) {
+        noFaceSinceRef.current = null;
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
+      } else if (facingTarget) {
+        goTo("walking_out", THREE.LoopRepeat, false, 0.4);
       }
-      addBoneOffset(poseOffsets, "Spine02", "x", nodDown * -0.12);
-      addBoneOffset(poseOffsets, "Spine02", "x", Math.sin(t * 0.8 + 0.7) * 0.014 * (0.2 + env * 0.4));
-      addBoneOffset(poseOffsets, "Spine02", "y", Math.sin(t * 0.6 + 2.0) * 0.016 * (0.2 + env * 0.4));
-      addBoneOffset(poseOffsets, "LeftShoulder", "z", Math.sin(t * 1.8 + 0.5) * 0.008 * env);
-      addBoneOffset(poseOffsets, "RightShoulder", "z", Math.sin(t * 1.8 + 1.5) * 0.008 * env);
-    } else {
-      // Decay speech envelope when not speaking.
-      speechEnv.current *= 0.85;
-      speechPulseDecay.current *= 0.85;
-      addBoneOffset(poseOffsets, "Head", "x", Math.sin(t * 0.3 + 0.5) * 0.002);
-      addBoneOffset(poseOffsets, "Head", "y", Math.sin(t * 0.2 + 1.0) * 0.003);
-      if (neck) {
-        addBoneOffset(poseOffsets, "neck", "x", Math.sin(t * 0.25) * 0.002);
+    } else if (state === "walking_out") {
+      if (faceNow) {
+        noFaceSinceRef.current = null;
+        // Visitor returned mid-walk-out: turn back toward camera & re-engage.
+        goTo("walking_in", THREE.LoopRepeat, false, 0.4);
+      } else if (onMark) {
+        goTo("turning_back", THREE.LoopRepeat, false, 0.4);
       }
-      addBoneOffset(poseOffsets, "Spine02", "x", Math.sin(t * 0.4) * 0.003);
+    } else if (state === "turning_back") {
+      if (facingTarget) {
+        goTo("sitting", THREE.LoopRepeat, false, 0.6);
+      }
+    } else if (state === "stopping") {
+      const action = actions.stopping;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
+    } else if (state === "waving") {
+      const action = actions.waving;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
+    } else if (state === "praying") {
+      const action = actions.praying;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
     }
-
-    if (gesture && gestureBlend > 0.001) {
-      addBoneOffset(poseOffsets, "Spine01", "y", Math.sin(t * 1.6) * 0.01 * gestureBlend);
-    }
-
-    DRIVEN_BONE_NAMES.forEach((boneName) => {
-      const bone = allBones.current[boneName];
-      const restQuat = boneRestQuats.current[boneName];
-      if (!bone || !restQuat) {
-        return;
-      }
-      applyBoneOffsetFromRest(bone, restQuat, poseOffsets[boneName]);
-    });
-
-    // ── Symmetric world-space upper-arm aim ──
-    // Aim each upper-arm bone so its child (the forearm bone) points in
-    // a target world direction. We use perfectly mirrored target
-    // directions on the X axis so the result is geometrically symmetric.
-    // ONLY the upper arms are aimed — the forearm and hand inherit their
-    // bind-pose rotations relative to the arm, which avoids elbow kinks.
-    const ARM_AIM_X = 0.18;   // outward spread (smaller = closer to body)
-    const ARM_AIM_Y = -0.96;  // downward (mostly down with slight outward)
-    const ARM_AIM_Z = 0.05;   // slightly forward
-    const armAims: Array<[string, string, number]> = [
-      ["LeftArm", "LeftForeArm", +1],
-      ["RightArm", "RightForeArm", -1],
-    ];
-    for (const [name, childName, sign] of armAims) {
-      const bone = allBones.current[name];
-      const childBone = allBones.current[childName];
-      if (!bone || !childBone || !bone.parent) continue;
-
-      bone.parent.updateMatrixWorld(true);
-      bone.updateMatrixWorld(true);
-      childBone.updateMatrixWorld(true);
-
-      bone.getWorldPosition(aimBoneWorld);
-      childBone.getWorldPosition(aimChildWorld);
-      aimCurrentDir.copy(aimChildWorld).sub(aimBoneWorld);
-      if (aimCurrentDir.lengthSq() < 1e-8) continue;
-      aimCurrentDir.normalize();
-      aimTargetDir.set(sign * ARM_AIM_X, ARM_AIM_Y, ARM_AIM_Z).normalize();
-
-      aimDeltaQuat.setFromUnitVectors(aimCurrentDir, aimTargetDir);
-      bone.getWorldQuaternion(aimCurrentWorldQuat);
-      aimTargetWorldQuat.copy(aimDeltaQuat).multiply(aimCurrentWorldQuat);
-      bone.parent.getWorldQuaternion(aimParentWorldQuat).invert();
-      bone.quaternion.copy(aimParentWorldQuat).multiply(aimTargetWorldQuat);
-      bone.updateMatrixWorld(true);
-    }
-
   });
 
-  // Position model via scene.position in the effect above.
-  return <primitive object={scene} />;
+  return (
+    <group ref={groupRef}>
+      <primitive object={scene} />
+    </group>
+  );
 }
 
-/* ── Loading placeholder ── */
 function Loader() {
   return (
     <div
@@ -969,64 +707,177 @@ function Loader() {
         className="pulse-dot rounded-full"
         style={{ width: 14, height: 14, background: "#FF9933" }}
       />
-      <span style={{ fontSize: 13, color: "var(--text-3)" }}>Loading avatar…</span>
+      <span style={{ fontSize: 13, color: "var(--text-3)" }}>Loading avatar...</span>
     </div>
   );
 }
 
-/* ── Fallback orb if FBX fails ── */
-function FallbackOrb({ isSpeaking }: { isSpeaking: boolean }) {
+function FallbackOrb({ isSpeaking, error }: { isSpeaking: boolean; error?: Error | null }) {
   return (
     <div
-      className={`rounded-full flex items-center justify-center ${
-        isSpeaking ? "orb-speaking" : "orb-idle"
-      }`}
       style={{
-        width: 200,
-        height: 200,
-        background: "radial-gradient(circle at 30% 30%, #3a2a1a, #1f170d, #120d08)",
-        border: "2px solid rgba(255,153,51,0.25)",
-        boxShadow: isSpeaking
-          ? "0 0 80px rgba(255,153,51,0.2)"
-          : "0 0 40px rgba(255,153,51,0.08)",
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 16,
       }}
     >
-      <span style={{ fontSize: 64 }}>🙏</span>
+      <div
+        className={`rounded-full flex items-center justify-center ${
+          isSpeaking ? "orb-speaking" : "orb-idle"
+        }`}
+        style={{
+          width: 200,
+          height: 200,
+          background: "radial-gradient(circle at 30% 30%, #3a2a1a, #1f170d, #120d08)",
+          border: "2px solid rgba(255,153,51,0.25)",
+          boxShadow: isSpeaking
+            ? "0 0 80px rgba(255,153,51,0.2)"
+            : "0 0 40px rgba(255,153,51,0.08)",
+        }}
+      >
+        <span style={{ fontSize: 64 }}>🙏</span>
+      </div>
+      {error ? (
+        <pre
+          style={{
+            maxWidth: 600,
+            fontSize: 11,
+            color: "#ff8a8a",
+            whiteSpace: "pre-wrap",
+            textAlign: "center",
+            padding: 8,
+            background: "rgba(0,0,0,0.4)",
+            borderRadius: 8,
+          }}
+        >
+          {error.name}: {error.message}
+          {error.stack ? "\n\n" + error.stack.split("\n").slice(0, 6).join("\n") : ""}
+        </pre>
+      ) : null}
     </div>
   );
 }
 
-/* ── Public component ── */
+function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }) {
+  const { camera } = useThree();
+  useFrame((_, delta) => {
+    const target = targetZRef.current;
+    // eslint-disable-next-line react-hooks/immutability
+    camera.position.z += (target - camera.position.z) * Math.min(1, delta * 1.5);
+  });
+  return null;
+}
+
+/* ── Ground ──
+   A soft circular shadow disc beneath the avatar so the feet have something
+   to stand on visually. Rendered with a procedural radial-fade canvas so it
+   blends into any background without needing an asset. */
+function Ground() {
+  const texture = useMemo(() => {
+    const size = 256;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d")!;
+    const grad = ctx.createRadialGradient(
+      size / 2,
+      size / 2,
+      size * 0.05,
+      size / 2,
+      size / 2,
+      size * 0.5,
+    );
+    grad.addColorStop(0, "rgba(0, 0, 0, 0.55)");
+    grad.addColorStop(0.55, "rgba(0, 0, 0, 0.18)");
+    grad.addColorStop(1, "rgba(0, 0, 0, 0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 8;
+    return tex;
+  }, []);
+
+  // Slightly above GROUND_Y so it sits on top of the floor plane (avoids
+  // z-fighting with the avatar's foot soles).
+  return (
+    <mesh
+      rotation={[-Math.PI / 2, 0, 0]}
+      position={[0, GROUND_Y + 0.001, -0.6]}
+      renderOrder={-1}
+    >
+      <planeGeometry args={[6, 6]} />
+      <meshBasicMaterial
+        map={texture}
+        transparent
+        depthWrite={false}
+        toneMapped={false}
+      />
+    </mesh>
+  );
+}
+
 export interface Avatar3DProps {
   isSpeaking: boolean;
   getAudioData?: () => Uint8Array | undefined;
   getVolume?: () => number;
   gesture?: string | null;
   userSmile?: number;
+  faceDetected?: boolean;
+  /** Fired once the avatar mesh + animations are loaded and the first idle
+   *  frame is on screen. Use this to defer expensive work like the camera
+   *  vision pipeline so the avatar always renders before face detection
+   *  starts firing state-machine transitions. */
+  onReady?: () => void;
 }
 
-export default function Avatar3D({ isSpeaking, getAudioData, getVolume, gesture, userSmile }: Avatar3DProps) {
-  // Stable refs so we don't re-render the Canvas when callbacks change
-  const audioDataRef = useRef(getAudioData);
-  const volumeRef = useRef(getVolume);
+export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }: Avatar3DProps) {
   const gestureRef = useRef<GestureName>(null);
-  const userSmileRef = useRef(0);
+  const faceDetectedRef = useRef(faceDetected ?? false);
+  const cameraTargetRef = useRef(CAMERA_Z_NEAR);
 
+  // Sync incoming props into refs so AvatarModel's per-frame loop can read
+  // the latest values without re-rendering the Canvas tree.
   useEffect(() => {
-    audioDataRef.current = getAudioData;
-    volumeRef.current = getVolume;
     gestureRef.current = (gesture as GestureName) ?? null;
-    userSmileRef.current = userSmile ?? 0;
-  }, [getAudioData, getVolume, gesture, userSmile]);
+    faceDetectedRef.current = faceDetected ?? false;
+  }, [gesture, faceDetected]);
+
+  // Stable callback so AvatarModel's useEffect (which wires up the mixer)
+  // doesn't tear down on every parent re-render.
+  const handleAnimStateChange = useCallback((state: AvatarAnimState) => {
+    if (state === "sitting") {
+      cameraTargetRef.current = CAMERA_Z_FAR;
+    } else if (state === "idle_standing" || state === "waving") {
+      cameraTargetRef.current = CAMERA_Z_NEAR;
+    } else {
+      cameraTargetRef.current = (CAMERA_Z_FAR + CAMERA_Z_NEAR) / 2;
+    }
+  }, []);
+
+  const onAnimStateChangeRef = useRef(handleAnimStateChange);
+  useEffect(() => {
+    onAnimStateChangeRef.current = handleAnimStateChange;
+  }, [handleAnimStateChange]);
+
+  const onReadyRef = useRef(onReady);
+  useEffect(() => {
+    onReadyRef.current = onReady;
+  }, [onReady]);
 
   return (
-    <AvatarErrorBoundary fallback={<FallbackOrb isSpeaking={isSpeaking} />}>
+    <AvatarErrorBoundary fallback={(err) => <FallbackOrb isSpeaking={isSpeaking} error={err} />}>
       <Suspense fallback={<Loader />}>
         <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
           <Canvas
-            camera={{ position: [0, 0.05, 5.7], fov: 36 }}
+            camera={{ position: [0, 0.05, CAMERA_Z_NEAR], fov: 36 }}
             gl={{ alpha: true, antialias: true }}
             dpr={[1, 2]}
+            shadows
             onCreated={({ gl }) => {
               gl.toneMapping = THREE.ACESFilmicToneMapping;
               gl.toneMappingExposure = 1.15;
@@ -1039,7 +890,14 @@ export default function Avatar3D({ isSpeaking, getAudioData, getVolume, gesture,
             <directionalLight position={[-1.5, 2, 1]} intensity={0.35} color="#ffeedd" />
             <directionalLight position={[-2, 1, -1]} intensity={0.15} color="#FF9933" />
             <pointLight position={[0, 0.3, 0.9]} intensity={0.3} color="#ffe4c9" />
-            <AvatarModel isSpeaking={isSpeaking} audioDataRef={audioDataRef} volumeRef={volumeRef} gestureRef={gestureRef} userSmileRef={userSmileRef} />
+            <CameraAnimator targetZRef={cameraTargetRef} />
+            <Ground />
+            <AvatarModel
+              gestureRef={gestureRef}
+              faceDetectedRef={faceDetectedRef}
+              onAnimStateChangeRef={onAnimStateChangeRef}
+              onReadyRef={onReadyRef}
+            />
           </Canvas>
         </div>
       </Suspense>
@@ -1047,3 +905,11 @@ export default function Avatar3D({ isSpeaking, getAudioData, getVolume, gesture,
   );
 }
 
+// Warm the FBX caches so the avatar + animations are ready by the time the
+// component mounts (avoids a Suspense fallback flicker after first paint).
+if (typeof window !== "undefined") {
+  void loadFbxScene(AVATAR_URL);
+  ALL_ANIM_URLS.forEach((url) => {
+    void loadFbxClips(url);
+  });
+}

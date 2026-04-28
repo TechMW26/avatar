@@ -215,8 +215,11 @@ function TalkPageContent() {
     return true;
   }, [blockAutoStart, persistConnectionType]);
 
-  // Vision Detection (face + gestures)
-  const vision = useVisionDetection();
+  // Vision Detection (face + gestures) — deferred until the 3D avatar has
+  // mounted so the heavy MediaPipe pipeline doesn't compete with the FBX
+  // load on first paint.
+  const [avatarReady, setAvatarReady] = useState(false);
+  const vision = useVisionDetection({ enabled: avatarReady });
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
 
@@ -258,9 +261,6 @@ function TalkPageContent() {
         details,
       );
 
-      // Always apply at least a minimum cooldown to prevent reconnect storms.
-      // Short-lived connections (server dropped us quickly) get longer backoff
-      // since they're likely rate-limited or failing on the server side.
       if (!wasStable) {
         consecutiveFailuresRef.current += 1;
         const backoff = Math.min(
@@ -272,7 +272,6 @@ function TalkPageContent() {
         blockAutoStart(backoff);
         setConversationError("Connection lost. Will retry shortly.");
       } else {
-        // Even stable disconnects get a minimum cooldown
         autoStartArmedRef.current = true;
         blockAutoStart(MIN_COOLDOWN_AFTER_DISCONNECT_MS);
       }
@@ -322,9 +321,11 @@ function TalkPageContent() {
         setConversationError("Connection failed. Tap to retry.");
       }
     },
-    onDebug: (info: unknown) => {
-      console.log("[ElevenLabs debug]", info);
-    },
+    // NOTE: onDebug fires on every audio/event packet. Logging it to the
+    // devtools console causes the audio worklet to stall under load and is
+    // the primary cause of audible crackling after a short period of speech.
+    // Leave it as a no-op (and definitely do NOT call console.log here).
+    onDebug: () => {},
     overrides: {
       agent: {
         prompt: {
@@ -677,7 +678,7 @@ function TalkPageContent() {
         className={`talk-avatar-container ${conversationStarted ? "" : "cursor-pointer"}`}
         style={{ position: "absolute", inset: 0, zIndex: 1 }}
       >
-        <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} />
+        <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} onReady={() => setAvatarReady(true)} />
       </div>
 
       {/* Dark gradient at bottom */}
@@ -752,12 +753,13 @@ function TalkPageContent() {
         <div
           style={{
             position: "fixed",
-            inset: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
             zIndex: 10,
             display: "flex",
-            alignItems: "center",
             justifyContent: "center",
-            padding: "24px",
+            padding: "0 16px clamp(18px, 3.2vh, 36px)",
             pointerEvents: "none",
           }}
         >
@@ -765,33 +767,33 @@ function TalkPageContent() {
             <motion.div
               key={agentState}
               className="text-center"
-              initial={{ opacity: 0, y: 16, scale: 0.98 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -12, scale: 0.98 }}
-              transition={{ duration: 0.24, ease: "easeOut" }}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
               style={{
-                width: "min(92vw, 560px)",
+                width: "min(94vw, 460px)",
                 display: "flex",
                 flexDirection: "column",
                 alignItems: "center",
-                gap: "clamp(16px, 2.2vh, 28px)",
-                padding: "clamp(24px, 3vw, 36px)",
-                borderRadius: 32,
-                background: "linear-gradient(180deg, rgba(34,22,10,0.92) 0%, rgba(20,13,7,0.88) 100%)",
-                border: "1px solid rgba(255,153,51,0.2)",
-                boxShadow: "0 24px 80px rgba(0,0,0,0.38)",
-                backdropFilter: "blur(24px)",
-                WebkitBackdropFilter: "blur(24px)",
+                gap: "clamp(10px, 1.6vh, 16px)",
+                padding: "clamp(12px, 1.6vh, 18px) clamp(14px, 2vw, 22px)",
+                borderRadius: 18,
+                background: "rgba(15,10,6,0.68)",
+                border: "1px solid rgba(255,153,51,0.18)",
+                boxShadow: "0 10px 30px rgba(0,0,0,0.28)",
+                backdropFilter: "blur(14px)",
+                WebkitBackdropFilter: "blur(14px)",
                 pointerEvents: "auto",
               }}
             >
               <div className="text-center">
                 {agentState === "off" ? (
                   <>
-                    <p className="font-semibold" style={{ fontSize: "clamp(18px, 1.8vw, 24px)", color: "var(--text-2)" }}>
+                    <p className="font-semibold" style={{ fontSize: "clamp(14px, 1.4vw, 18px)", color: "var(--text-2)" }}>
                       {vision.isReady ? "\u0917\u0941\u0930\u0941\u0915\u0941\u0932 \u092E\u0947\u0902 \u0906\u092A\u0915\u093E \u0938\u094D\u0935\u093E\u0917\u0924 \u0939\u0948..." : "Initializing camera..."}
                     </p>
-                    <p style={{ fontSize: "clamp(12px, 1vw, 15px)", color: "var(--text-3)", marginTop: 6 }}>
+                    <p style={{ fontSize: "clamp(11px, 0.95vw, 13px)", color: "var(--text-3)", marginTop: 4 }}>
                       {conversationError
                         ? conversationError
                         : vision.isReady
@@ -801,8 +803,8 @@ function TalkPageContent() {
                   </>
                 ) : (
                   <>
-                    <p className="font-semibold" style={{ fontSize: "clamp(18px, 1.8vw, 24px)", color: "var(--text-2)" }}>Connecting...</p>
-                    <p style={{ fontSize: "clamp(12px, 1vw, 15px)", color: "var(--text-3)", marginTop: 6 }}>{"\u0917\u0941\u0930\u0941\u091C\u0940 \u0938\u0947 \u0938\u0902\u092A\u0930\u094D\u0915 \u0939\u094B \u0930\u0939\u093E \u0939\u0948"}</p>
+                    <p className="font-semibold" style={{ fontSize: "clamp(14px, 1.4vw, 18px)", color: "var(--text-2)" }}>Connecting...</p>
+                    <p style={{ fontSize: "clamp(11px, 0.95vw, 13px)", color: "var(--text-3)", marginTop: 4 }}>{"\u0917\u0941\u0930\u0941\u091C\u0940 \u0938\u0947 \u0938\u0902\u092A\u0930\u094D\u0915 \u0939\u094B \u0930\u0939\u093E \u0939\u0948"}</p>
                   </>
                 )}
               </div>
@@ -812,10 +814,10 @@ function TalkPageContent() {
                   onClick={startConversation}
                   className="flex items-center cursor-pointer font-semibold text-white"
                   style={{
-                    gap: 10, padding: "clamp(12px, 1.4vh, 18px) clamp(24px, 2.8vw, 40px)", borderRadius: 50,
+                    gap: 8, padding: "clamp(10px, 1.1vh, 14px) clamp(16px, 2vw, 24px)", borderRadius: 999,
                     background: "linear-gradient(135deg, #E65100, #FF9933)",
-                    boxShadow: "0 8px 30px rgba(255,153,51,0.3)",
-                    border: "none", fontSize: "clamp(13px, 1.1vw, 16px)",
+                    boxShadow: "0 6px 18px rgba(255,153,51,0.26)",
+                    border: "none", fontSize: "clamp(12px, 1vw, 14px)",
                   }}
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
@@ -830,16 +832,16 @@ function TalkPageContent() {
                 <motion.div
                   className="flex items-center font-semibold"
                   style={{
-                    gap: 10, padding: "clamp(12px, 1.4vh, 18px) clamp(24px, 2.8vw, 40px)", borderRadius: 50,
+                    gap: 8, padding: "clamp(10px, 1.1vh, 14px) clamp(16px, 2vw, 24px)", borderRadius: 999,
                     background: "rgba(255,153,51,0.08)", color: "#FFB366",
-                    border: "1px solid rgba(255,153,51,0.2)", fontSize: "clamp(13px, 1.1vw, 16px)",
+                    border: "1px solid rgba(255,153,51,0.2)", fontSize: "clamp(12px, 1vw, 14px)",
                   }}
                   animate={{ opacity: [0.5, 1, 0.5] }}
                   transition={{ duration: 1.5, repeat: Infinity }}
                 >
-                  <svg width="18" height="18" viewBox="0 0 24 24" style={{ animation: "spin 1.2s linear infinite" }}>
-                    <circle cx="12" cy="12" r="10" fill="none" stroke="rgba(255,179,102,0.2)" strokeWidth="3" />
-                    <path d="M12 2a10 10 0 0 1 10 10" fill="none" stroke="#FFB366" strokeWidth="3" strokeLinecap="round" />
+                  <svg width="14" height="14" viewBox="0 0 24 24" style={{ animation: "spin 1.2s linear infinite" }}>
+                    <circle cx="12" cy="12" r="9" fill="none" stroke="rgba(255,179,102,0.2)" strokeWidth="2.5" />
+                    <path d="M12 3a9 9 0 0 1 9 9" fill="none" stroke="#FFB366" strokeWidth="2.5" strokeLinecap="round" />
                   </svg>
                   Connecting...
                 </motion.div>
