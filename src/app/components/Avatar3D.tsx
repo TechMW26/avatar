@@ -12,20 +12,18 @@ import {
 } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
-import { SkeletonUtils, GLTFLoader } from "three-stdlib";
+import { SkeletonUtils, FBXLoader } from "three-stdlib";
 
-// Avatar mesh + Mixamo animation packs are shipped as GLB so they fit in
-// git/Vercel and load fast. (Original Mixamo FBXs were ~77 MB each; the
-// converted animation-only GLBs are ~100–500 KB each.)
-const AVATAR_URL = "/avatar.glb";
+const AVATAR_URL = "/avatar.fbx";
 
-const ANIM_IDLE_URL = "/animations/breathing-idle.glb";
-const ANIM_SITTING_URL = "/animations/sitting-idle.glb";
-const ANIM_STANDING_URL = "/animations/standing.glb";
-const ANIM_STOPPING_URL = "/animations/stop-walking.glb";
-const ANIM_WALKING_URL = "/animations/walking.glb";
-const ANIM_WAVING_URL = "/animations/waving.glb";
-const ANIM_PRAYING_URL = "/animations/praying.glb";
+// User-provided FBX animation files (Mixamo rigs).
+const ANIM_IDLE_URL = "/animations/breathing-idle.fbx";
+const ANIM_SITTING_URL = "/animations/sitting-idle.fbx";
+const ANIM_STANDING_URL = "/animations/standing.fbx";
+const ANIM_STOPPING_URL = "/animations/stop-walking.fbx";
+const ANIM_WALKING_URL = "/animations/walking.fbx";
+const ANIM_WAVING_URL = "/animations/waving.fbx";
+const ANIM_PRAYING_URL = "/animations/praying.fbx";
 
 const ALL_ANIM_URLS = [
   ANIM_IDLE_URL,
@@ -188,56 +186,50 @@ function remapClipToAvatarRig(
   return new THREE.AnimationClip(clip.name, clip.duration, tracks);
 }
 
-/* ── GLTF cache (Suspense-friendly) ──
-   Single shared GLTFLoader. We cache the parsed scene (for the avatar)
-   and the extracted clips (for animation-only GLBs). */
-const gltfLoader = new GLTFLoader();
-const gltfSceneCache = new Map<string, THREE.Group>();
-const gltfClipCache = new Map<string, THREE.AnimationClip[]>();
-const gltfScenePromises = new Map<string, Promise<THREE.Group>>();
-const gltfClipPromises = new Map<string, Promise<THREE.AnimationClip[]>>();
+/* ── FBX cache (Suspense-friendly) ──
+   We cache both the parsed FBX scene (for the avatar) and the extracted
+   clips (for animation packs whose mesh we don't want). */
+const fbxSceneCache = new Map<string, THREE.Group>();
+const fbxClipCache = new Map<string, THREE.AnimationClip[]>();
+const fbxScenePromises = new Map<string, Promise<THREE.Group>>();
+const fbxClipPromises = new Map<string, Promise<THREE.AnimationClip[]>>();
 
-function loadGltfScene(url: string): Promise<THREE.Group> {
-  let p = gltfScenePromises.get(url);
+function loadFbxScene(url: string): Promise<THREE.Group> {
+  let p = fbxScenePromises.get(url);
   if (!p) {
-    p = gltfLoader
+    const loader = new FBXLoader();
+    p = loader
       .loadAsync(url)
-      .then((gltf) => {
-        const scene = gltf.scene as THREE.Group;
-        // Some GLBs ship animations alongside the mesh — stash them under the
-        // same URL so callers can opt in if they want them.
-        if (gltf.animations?.length) {
-          gltfClipCache.set(url, gltf.animations.map((c) => c.clone()));
-        }
-        gltfSceneCache.set(url, scene);
-        return scene;
+      .then((group) => {
+        fbxSceneCache.set(url, group as THREE.Group);
+        return group as THREE.Group;
       })
       .catch((err) => {
-        console.error("[Avatar] GLB scene load failed:", url, err);
-        gltfScenePromises.delete(url);
+        console.error("[Avatar] FBX scene load failed:", url, err);
+        fbxScenePromises.delete(url);
         throw err;
       });
-    gltfScenePromises.set(url, p);
+    fbxScenePromises.set(url, p);
   }
   return p;
 }
 
-function useGltfScene(url: string): THREE.Group {
-  const cached = gltfSceneCache.get(url);
+function useFbxScene(url: string): THREE.Group {
+  const cached = fbxSceneCache.get(url);
   if (cached) return cached;
-  throw loadGltfScene(url);
+  throw loadFbxScene(url);
 }
 
-function loadGltfClips(url: string): Promise<THREE.AnimationClip[]> {
-  let p = gltfClipPromises.get(url);
+function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
+  let p = fbxClipPromises.get(url);
   if (!p) {
-    p = gltfLoader
+    const loader = new FBXLoader();
+    p = loader
       .loadAsync(url)
-      .then((gltf) => {
-        const clips = (gltf.animations || []).map((c) => c.clone());
-        // Drop any mesh data — animation-only GLBs shouldn't have meshes,
-        // but defensively dispose anything that slipped through.
-        gltf.scene?.traverse?.((obj) => {
+      .then((group) => {
+        const clips = (group.animations || []).map((c) => c.clone());
+        // Drop the heavy mesh data — we only ever needed the AnimationClips.
+        group.traverse((obj) => {
           const mesh = obj as THREE.Mesh;
           if (mesh.isMesh) {
             mesh.geometry?.dispose?.();
@@ -245,23 +237,23 @@ function loadGltfClips(url: string): Promise<THREE.AnimationClip[]> {
             mats.forEach((m) => (m as THREE.Material | undefined)?.dispose?.());
           }
         });
-        gltfClipCache.set(url, clips);
+        fbxClipCache.set(url, clips);
         return clips;
       })
       .catch((err) => {
-        console.error("[Avatar] GLB clip load failed:", url, err);
-        gltfClipPromises.delete(url);
+        console.error("[Avatar] FBX load failed:", url, err);
+        fbxClipPromises.delete(url);
         throw err;
       });
-    gltfClipPromises.set(url, p);
+    fbxClipPromises.set(url, p);
   }
   return p;
 }
 
-function useGltfClips(url: string): THREE.AnimationClip[] {
-  const cached = gltfClipCache.get(url);
+function useFbxClips(url: string): THREE.AnimationClip[] {
+  const cached = fbxClipCache.get(url);
   if (cached) return cached;
-  throw loadGltfClips(url);
+  throw loadFbxClips(url);
 }
 
 /* ── Error boundary ── */
@@ -297,17 +289,17 @@ function AvatarModel({
     (state: AvatarAnimState) => onAnimStateChangeRef.current?.(state),
     [onAnimStateChangeRef],
   );
-  const baseScene = useGltfScene(AVATAR_URL);
+  const baseFbx = useFbxScene(AVATAR_URL);
 
-  const idleClips = useGltfClips(ANIM_IDLE_URL);
-  const sittingClips = useGltfClips(ANIM_SITTING_URL);
-  const standingClips = useGltfClips(ANIM_STANDING_URL);
-  const stoppingClips = useGltfClips(ANIM_STOPPING_URL);
-  const walkingClips = useGltfClips(ANIM_WALKING_URL);
-  const wavingClips = useGltfClips(ANIM_WAVING_URL);
-  const prayingClips = useGltfClips(ANIM_PRAYING_URL);
+  const idleClips = useFbxClips(ANIM_IDLE_URL);
+  const sittingClips = useFbxClips(ANIM_SITTING_URL);
+  const standingClips = useFbxClips(ANIM_STANDING_URL);
+  const stoppingClips = useFbxClips(ANIM_STOPPING_URL);
+  const walkingClips = useFbxClips(ANIM_WALKING_URL);
+  const wavingClips = useFbxClips(ANIM_WAVING_URL);
+  const prayingClips = useFbxClips(ANIM_PRAYING_URL);
 
-  const scene = useMemo(() => SkeletonUtils.clone(baseScene) as THREE.Group, [baseScene]);
+  const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
   const sourceClips = useMemo(
     () => ({
@@ -976,11 +968,11 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
   );
 }
 
-// Warm the GLB caches so the avatar + animations are ready by the time the
+// Warm the FBX caches so the avatar + animations are ready by the time the
 // component mounts (avoids a Suspense fallback flicker after first paint).
 if (typeof window !== "undefined") {
-  void loadGltfScene(AVATAR_URL);
+  void loadFbxScene(AVATAR_URL);
   ALL_ANIM_URLS.forEach((url) => {
-    void loadGltfClips(url);
+    void loadFbxClips(url);
   });
 }
