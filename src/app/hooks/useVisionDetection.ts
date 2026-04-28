@@ -457,10 +457,13 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     }
 
     // ── Namaste Detection from hand landmarks ──
-    // Real namaste: palms together, hands raised. MediaPipe sometimes loses
-    // one hand when palms fully touch (occlusion), so we accept either:
-    //   (A) two hands, wrists close, fingertips close, both pointing up; or
-    //   (B) two hands, wrists close & both pointing up (looser tip dist).
+    // Aggressive heuristic: any of the following counts as a namaste so the
+    // sage reliably reciprocates from a webcam at varying distances.
+    //   (A) Two hands tracked, wrists "close" and both pointing up; or
+    //   (B) Two hands tracked, fingertips clustered (palms touching) even if
+    //       MediaPipe couldn't keep both wrists separated; or
+    //   (C) Two hands tracked, both pointing up and roughly horizontally
+    //       aligned (similar y), even if the depth of the hands varies.
     let namasteDetected = false;
     if (gestureResult?.landmarks && gestureResult.landmarks.length >= 2) {
       const hand0 = gestureResult.landmarks[0];
@@ -471,13 +474,16 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       const mid1 = hand1[12];
       const wristDist = Math.sqrt((wrist0.x - wrist1.x) ** 2 + (wrist0.y - wrist1.y) ** 2);
       const tipDist = Math.sqrt((mid0.x - mid1.x) ** 2 + (mid0.y - mid1.y) ** 2);
-      // Fingertips pointing up (normalized coords: y=0 is top).
-      // Allow a small slack so a slight tilt still counts.
-      const fingersUp0 = mid0.y < wrist0.y - 0.02;
-      const fingersUp1 = mid1.y < wrist1.y - 0.02;
-      const wristsClose = wristDist < 0.30;
-      const tipsClose = tipDist < 0.22;
-      if (wristsClose && tipsClose && fingersUp0 && fingersUp1) {
+      // Pointing up = middle fingertip y noticeably above wrist (y axis is
+      // inverted in normalized image coords).
+      const fingersUp0 = mid0.y < wrist0.y;
+      const fingersUp1 = mid1.y < wrist1.y;
+      const wristsAligned = Math.abs(wrist0.y - wrist1.y) < 0.20;
+
+      const caseA = wristDist < 0.45 && fingersUp0 && fingersUp1;
+      const caseB = tipDist < 0.30 && fingersUp0 && fingersUp1;
+      const caseC = wristsAligned && fingersUp0 && fingersUp1 && wristDist < 0.55;
+      if (caseA || caseB || caseC) {
         namasteDetected = true;
       }
     }
