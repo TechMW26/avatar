@@ -193,7 +193,58 @@ function remapClipToAvatarRig(
 
 /* ── FBX cache (Suspense-friendly) ──
    We cache both the parsed FBX scene (for the avatar) and the extracted
-   clips (for animation packs whose mesh we don't want). */
+   clips (for animation packs whose mesh we don't want).
+
+   Asset hosting strategy:
+   - In dev (`NEXT_PUBLIC_ASSET_BASE_URL` unset) we serve straight from
+     `/public/animations/*.fbx` for fast local iteration.
+   - In production we host the FBXs on Vercel Blob (or any CDN) and set
+     `NEXT_PUBLIC_ASSET_BASE_URL=https://<hash>.public.blob.vercel-storage.com`
+     so the giant FBX files don't have to ship through git or the
+     Next.js build output (which has a 100MB hard limit per asset on
+     Vercel's serverless deployments).
+   - On the device we wrap fetch with the browser's Cache Storage API so
+     the FBX files are only downloaded once per device and subsequent
+     loads come from local disk \u2014 the kiosk is responsive even on flaky
+     connections.
+
+   Set the cache name + bump the version when shipping new asset bundles. */
+const ASSET_BASE_URL =
+  (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
+const ASSET_CACHE_NAME = "rishi-avatar-fbx-v1";
+
+function assetUrl(path: string): string {
+  if (!ASSET_BASE_URL) return path;
+  // Strip leading slash so we don't end up with `https://host//animations/...`.
+  return `${ASSET_BASE_URL.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
+}
+
+/** Fetch through Cache Storage so the second visit is instant.
+ *  Falls back to a plain fetch when Cache Storage is unavailable
+ *  (SSR, private mode, etc.). Returns an ArrayBuffer ready for FBXLoader.parse. */
+async function fetchAssetCached(path: string): Promise<ArrayBuffer> {
+  const url = assetUrl(path);
+  if (typeof caches !== "undefined") {
+    try {
+      const cache = await caches.open(ASSET_CACHE_NAME);
+      const hit = await cache.match(url);
+      if (hit) return await hit.arrayBuffer();
+      const resp = await fetch(url, { credentials: "omit" });
+      if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} for ${url}`);
+      // Clone before consuming so the cache gets a fresh copy.
+      cache.put(url, resp.clone()).catch((e) => {
+        console.warn("[Avatar] cache.put failed (non-fatal):", e);
+      });
+      return await resp.arrayBuffer();
+    } catch (e) {
+      console.warn("[Avatar] cache fetch fallback for", url, e);
+    }
+  }
+  const resp = await fetch(url, { credentials: "omit" });
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText} for ${url}`);
+  return await resp.arrayBuffer();
+}
+
 const fbxSceneCache = new Map<string, THREE.Group>();
 const fbxClipCache = new Map<string, THREE.AnimationClip[]>();
 const fbxScenePromises = new Map<string, Promise<THREE.Group>>();
@@ -203,8 +254,8 @@ function loadFbxScene(url: string): Promise<THREE.Group> {
   let p = fbxScenePromises.get(url);
   if (!p) {
     const loader = new FBXLoader();
-    p = loader
-      .loadAsync(url)
+    p = fetchAssetCached(url)
+      .then((buf) => loader.parse(buf, ""))
       .then((group) => {
         fbxSceneCache.set(url, group as THREE.Group);
         return group as THREE.Group;
@@ -229,8 +280,8 @@ function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
   let p = fbxClipPromises.get(url);
   if (!p) {
     const loader = new FBXLoader();
-    p = loader
-      .loadAsync(url)
+    p = fetchAssetCached(url)
+      .then((buf) => loader.parse(buf, ""))
       .then((group) => {
         const clips = (group.animations || []).map((c) => c.clone());
         // Drop the heavy mesh data — we only ever needed the AnimationClips.
@@ -282,12 +333,17 @@ function AvatarModel({
   gestureRef,
   faceDetectedRef,
   isSpeakingRef,
+  aiGestureRef,
   onAnimStateChangeRef,
   onReadyRef,
 }: {
   gestureRef: MutableRefObject<GestureName>;
   faceDetectedRef: MutableRefObject<boolean>;
   isSpeakingRef: MutableRefObject<boolean>;
+  /** AI-triggered gesture (e.g. ElevenLabs clientTool fires it on a
+   *  high-weight phrase). The avatar plays the named gesture once and
+   *  then ignores subsequent ticks until the nonce changes again. */
+  aiGestureRef: MutableRefObject<{ name: string; nonce: number } | null>;
   onAnimStateChangeRef: MutableRefObject<(state: AvatarAnimState) => void>;
   onReadyRef: MutableRefObject<(() => void) | undefined>;
 }) {
@@ -346,10 +402,20 @@ function AvatarModel({
   const noFaceSinceRef = useRef<number | null>(null);
   const lastWaveAtRef = useRef<number>(0);
   const lastPrayAtRef = useRef<number>(0);
-  // Explaining is auto-fired while speaking; long cooldown so it stays
-  // emphatic and doesn't turn into a tic.
+  // Last explicit AI-triggered explain firing. Long cooldown so even if
+  // the AI sends rapid triggers we space them out.
   const lastExplainAtRef = useRef<number>(0);
-  const nextExplainRollAtRef = useRef<number>(0);
+  const lastAiNonceRef = useRef<number>(-1);
+
+  /* ── Foot bones for per-frame ground clamp.
+     Mixamo idle/breathing clips routinely shift the Hips Y a few cm above
+     the bind pose, which makes the avatar look like it's hovering. We grab
+     the toe bones at mount and, each frame, snap the group's Y so the
+     lower toe sits exactly on GROUND_Y. */
+  const footBonesRef = useRef<{ left: THREE.Object3D | null; right: THREE.Object3D | null }>({
+    left: null,
+    right: null,
+  });
 
   // Walking traversal: time-driven so the walking clip plays exactly once
   // over the trip from one stage mark to the other (no double-loop).
@@ -401,7 +467,18 @@ function AvatarModel({
         mesh.frustumCulled = false;
       }
       if ((obj as THREE.Bone).isBone) {
-        avatarBoneByStripped.set(stripMixamoPrefix(obj.name), obj.name);
+        const stripped = stripMixamoPrefix(obj.name);
+        avatarBoneByStripped.set(stripped, obj.name);
+        if (stripped === "LeftToeBase" || stripped === "LeftFoot") {
+          // Prefer the toe (lowest), but fall back to foot if the rig has no toe.
+          if (!footBonesRef.current.left || stripped === "LeftToeBase") {
+            footBonesRef.current.left = obj;
+          }
+        } else if (stripped === "RightToeBase" || stripped === "RightFoot") {
+          if (!footBonesRef.current.right || stripped === "RightToeBase") {
+            footBonesRef.current.right = obj;
+          }
+        }
       }
     });
 
@@ -552,6 +629,31 @@ function AvatarModel({
 
       grp.position.y += (tgtY - grp.position.y) * Math.min(1, delta * 3);
 
+      /* ── Foot-to-floor clamp ──
+         Mixamo's breathing-idle clip lifts the Hips a few cm above the
+         bind pose. Without correction the toes float above GROUND_Y. We
+         sample whichever toe is currently lower (so during a step-shift
+         the planted foot stays planted) and offset the group's Y by the
+         shortfall. Skipped during walking (already time-driven) and
+         sitting (cross-leg pose has its own offset). */
+      if (!isWalking && state !== "sitting") {
+        const lf = footBonesRef.current.left;
+        const rf = footBonesRef.current.right;
+        if (lf || rf) {
+          // Make sure transforms are up to date for the new mixer pose.
+          scene.updateMatrixWorld();
+          let minFootY = Infinity;
+          const v = new THREE.Vector3();
+          if (lf) { lf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
+          if (rf) { rf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
+          if (Number.isFinite(minFootY)) {
+            const drift = minFootY - GROUND_Y;
+            // Smooth correction so we don't pop on state transitions.
+            grp.position.y -= drift * Math.min(1, delta * 8);
+          }
+        }
+      }
+
       if (isWalking) {
         const elapsed = performance.now() - walkStartRef.current;
         const t = Math.max(0, Math.min(1, elapsed / WALK_DURATION_MS));
@@ -677,21 +779,25 @@ function AvatarModel({
         } else if (wantsWave && actions.waving) {
           lastWaveAtRef.current = now;
           goTo("waving", THREE.LoopOnce, true, 0.4);
-        } else if (
-          // Auto-explain: while the AI is speaking, occasionally fire the
-          // explaining gesture to give the delivery weight. Strong cooldown
-          // (12s) so it stays an emphatic punctuation, not a nervous tic.
-          // Roll once per ~700ms with ~35% chance, gated by the cooldown,
-          // so the avatar lands a gesture roughly 1–2 sentences in.
-          isSpeakingRef.current &&
-          actions.explaining &&
-          now - lastExplainAtRef.current > 12_000 &&
-          now >= nextExplainRollAtRef.current
-        ) {
-          nextExplainRollAtRef.current = now + 700;
-          if (Math.random() < 0.35) {
+        } else {
+          // Explicit AI-driven gestures (e.g. ElevenLabs clientTool fires
+          // an `aiGesture` with a fresh nonce on a high-weight phrase).
+          // No random firing — the agent decides when it matters.
+          const ai = aiGestureRef.current;
+          if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "explaining" &&
+            actions.explaining &&
+            now - lastExplainAtRef.current > 8_000
+          ) {
+            lastAiNonceRef.current = ai.nonce;
             lastExplainAtRef.current = now;
             goTo("explaining", THREE.LoopOnce, true, 0.35);
+          } else if (ai && ai.nonce !== lastAiNonceRef.current) {
+            // Consume the nonce even if we couldn't play (cooldown / unknown
+            // gesture name) so we don't fire it later when the cooldown ends.
+            lastAiNonceRef.current = ai.nonce;
           }
         }
       } else {
@@ -922,6 +1028,12 @@ export interface Avatar3DProps {
   gesture?: string | null;
   userSmile?: number;
   faceDetected?: boolean;
+  /** Imperative trigger for AI-decided gestures. Pass `{ name: "explaining",
+   *  nonce: <unique-per-trigger> }` and the avatar will play it once when
+   *  it next reaches `idle_standing` (subject to the gesture's cooldown).
+   *  Reuse the same nonce to avoid re-firing. Examples of valid names:
+   *  `"explaining"`. More to come. */
+  aiGesture?: { name: string; nonce: number } | null;
   /** Fired once the avatar mesh + animations are loaded and the first idle
    *  frame is on screen. Use this to defer expensive work like the camera
    *  vision pipeline so the avatar always renders before face detection
@@ -929,10 +1041,11 @@ export interface Avatar3DProps {
   onReady?: () => void;
 }
 
-export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }: Avatar3DProps) {
+export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture, onReady }: Avatar3DProps) {
   const gestureRef = useRef<GestureName>(null);
   const faceDetectedRef = useRef(faceDetected ?? false);
   const isSpeakingRef = useRef(isSpeaking);
+  const aiGestureRef = useRef<{ name: string; nonce: number } | null>(aiGesture ?? null);
   const cameraTargetRef = useRef(CAMERA_Z_NEAR);
 
   // Sync incoming props into refs so AvatarModel's per-frame loop can read
@@ -941,7 +1054,8 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
     gestureRef.current = (gesture as GestureName) ?? null;
     faceDetectedRef.current = faceDetected ?? false;
     isSpeakingRef.current = isSpeaking;
-  }, [gesture, faceDetected, isSpeaking]);
+    aiGestureRef.current = aiGesture ?? null;
+  }, [gesture, faceDetected, isSpeaking, aiGesture]);
 
   // Stable callback so AvatarModel's useEffect (which wires up the mixer)
   // doesn't tear down on every parent re-render.
@@ -1000,6 +1114,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
               gestureRef={gestureRef}
               faceDetectedRef={faceDetectedRef}
               isSpeakingRef={isSpeakingRef}
+              aiGestureRef={aiGestureRef}
               onAnimStateChangeRef={onAnimStateChangeRef}
               onReadyRef={onReadyRef}
             />
