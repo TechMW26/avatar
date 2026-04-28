@@ -513,9 +513,9 @@ function AvatarModel({
     let onMark = true;
     let facingTarget = true;
     if (grp) {
-      // Quicker traversal (~1.6s) so the walk cycle stays brief; the new
-      // shorter walking clip won't loop visibly more than once.
-      const posLerp = Math.min(1, delta * 1.2);
+      // Walk pace traversal so the new Walking.fbx clip plays through about
+      // one full cycle before we hand off to the stopping clip for ease-in.
+      const posLerp = Math.min(1, delta * 0.7);
       const rotLerp = Math.min(1, delta * 3.5);   // ~0.3s to turn
 
       // Sit pose needs a small extra dip because we strip Hips translation.
@@ -608,7 +608,7 @@ function AvatarModel({
       if (faceNow) {
         noFaceSinceRef.current = null;
         const wantsPray =
-          gestureRef.current === "Namaste" && now - lastPrayAtRef.current > 3500;
+          gestureRef.current === "Namaste" && now - lastPrayAtRef.current > 1200;
         const wantsWave =
           gestureRef.current === "Open_Palm" && now - lastWaveAtRef.current > 2500;
         if (wantsPray && actions.praying) {
@@ -654,7 +654,12 @@ function AvatarModel({
         noFaceSinceRef.current = null;
       }
       if (onMark) {
-        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        // Hand off to the stop-walking clip for a soft ease-in to idle.
+        if (actions.stopping) {
+          goTo("stopping", THREE.LoopOnce, true, 0.25);
+        } else {
+          goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        }
       }
     } else if (state === "turning_away") {
       // If the visitor comes back before he finishes turning, abort.
@@ -862,10 +867,11 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
     } else if (
       state === "idle_standing" ||
       state === "waving" ||
-      state === "praying"
+      state === "praying" ||
+      state === "stopping"
     ) {
       // Keep the camera locked on the close mark for any in-place
-      // gesture so we never zoom out mid-wave/mid-pray.
+      // gesture or arrival ease-in so we never zoom out mid-pose.
       cameraTargetRef.current = CAMERA_Z_NEAR;
     } else {
       cameraTargetRef.current = (CAMERA_Z_FAR + CAMERA_Z_NEAR) / 2;
