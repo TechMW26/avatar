@@ -25,6 +25,7 @@ const ANIM_WALKING_URL = "/animations/walking.fbx";
 const ANIM_WAVING_URL = "/animations/waving.fbx";
 const ANIM_PRAYING_URL = "/animations/praying.fbx";
 const ANIM_EXPLAINING_URL = "/animations/explaining.fbx";
+const ANIM_YELLING_URL = "/animations/yelling.fbx";
 
 const ALL_ANIM_URLS = [
   ANIM_IDLE_URL,
@@ -35,6 +36,7 @@ const ALL_ANIM_URLS = [
   ANIM_WAVING_URL,
   ANIM_PRAYING_URL,
   ANIM_EXPLAINING_URL,
+  ANIM_YELLING_URL,
 ] as const;
 
 type AvatarAnimState =
@@ -48,7 +50,8 @@ type AvatarAnimState =
   | "idle_standing"
   | "waving"
   | "praying"
-  | "explaining";
+  | "explaining"
+  | "yelling";
 
 /** The underlying animation clips we actually loaded. Multiple states can
  *  reuse the same clip (walking_in/out share `walking`, the turn states
@@ -61,7 +64,8 @@ type ClipKey =
   | "idle_standing"
   | "waving"
   | "praying"
-  | "explaining";
+  | "explaining"
+  | "yelling";
 
 type GestureName =
   | "Open_Palm"
@@ -111,6 +115,7 @@ const STATE_TARGETS: Record<
   waving:        { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "waving" },
   praying:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "praying" },
   explaining:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "explaining" },
+  yelling:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "yelling" },
   turning_away:  { z: FRONT_Z, rotY: Math.PI,  scale: FRONT_SCALE, clipKey: "idle_standing" },
   walking_out:   { z: BACK_Z,  rotY: Math.PI,  scale: BACK_SCALE,  clipKey: "walking" },
   turning_back:  { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "idle_standing" },
@@ -362,6 +367,7 @@ function AvatarModel({
   const wavingClips = useFbxClips(ANIM_WAVING_URL);
   const prayingClips = useFbxClips(ANIM_PRAYING_URL);
   const explainingClips = useFbxClips(ANIM_EXPLAINING_URL);
+  const yellingClips = useFbxClips(ANIM_YELLING_URL);
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -375,8 +381,9 @@ function AvatarModel({
       waving: pickClip(wavingClips),
       praying: pickClip(prayingClips),
       explaining: pickClip(explainingClips),
+      yelling: pickClip(yellingClips),
     }),
-    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips],
+    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -389,6 +396,7 @@ function AvatarModel({
     waving: undefined,
     praying: undefined,
     explaining: undefined,
+    yelling: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("sitting");
@@ -405,6 +413,8 @@ function AvatarModel({
   // Last explicit AI-triggered explain firing. Long cooldown so even if
   // the AI sends rapid triggers we space them out.
   const lastExplainAtRef = useRef<number>(0);
+  // Yelling is a rare "shoo away" gesture — even longer cooldown.
+  const lastYellAtRef = useRef<number>(0);
   const lastAiNonceRef = useRef<number>(-1);
 
   /* ── Foot bones for per-frame ground clamp.
@@ -517,6 +527,7 @@ function AvatarModel({
       waving: undefined,
       praying: undefined,
       explaining: undefined,
+      yelling: undefined,
     };
 
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
@@ -596,6 +607,7 @@ function AvatarModel({
         waving: undefined,
         praying: undefined,
         explaining: undefined,
+        yelling: undefined,
       };
     };
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
@@ -794,6 +806,18 @@ function AvatarModel({
             lastAiNonceRef.current = ai.nonce;
             lastExplainAtRef.current = now;
             goTo("explaining", THREE.LoopOnce, true, 0.35);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "yelling" &&
+            actions.yelling &&
+            now - lastYellAtRef.current > 30_000
+          ) {
+            // Rare "shoo them away" gesture. Snap-in (short fade) so the
+            // motion lands aggressively, then return to idle.
+            lastAiNonceRef.current = ai.nonce;
+            lastYellAtRef.current = now;
+            goTo("yelling", THREE.LoopOnce, true, 0.2);
           } else if (ai && ai.nonce !== lastAiNonceRef.current) {
             // Consume the nonce even if we couldn't play (cooldown / unknown
             // gesture name) so we don't fire it later when the cooldown ends.
@@ -886,6 +910,12 @@ function AvatarModel({
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
         goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
+      }
+    } else if (state === "yelling") {
+      const action = actions.yelling;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
       }
     }
   });
@@ -1032,7 +1062,7 @@ export interface Avatar3DProps {
    *  nonce: <unique-per-trigger> }` and the avatar will play it once when
    *  it next reaches `idle_standing` (subject to the gesture's cooldown).
    *  Reuse the same nonce to avoid re-firing. Examples of valid names:
-   *  `"explaining"`. More to come. */
+   *  `"explaining"`, `"yelling"`. More to come. */
   aiGesture?: { name: string; nonce: number } | null;
   /** Fired once the avatar mesh + animations are loaded and the first idle
    *  frame is on screen. Use this to defer expensive work like the camera
@@ -1067,6 +1097,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
       state === "waving" ||
       state === "praying" ||
       state === "explaining" ||
+      state === "yelling" ||
       state === "stopping"
     ) {
       // Keep the camera locked on the close mark for any in-place

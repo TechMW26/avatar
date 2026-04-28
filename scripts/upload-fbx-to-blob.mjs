@@ -32,6 +32,7 @@ const ASSETS = [
   'animations/waving.fbx',
   'animations/praying.fbx',
   'animations/explaining.fbx',
+  'animations/yelling.fbx',
 ];
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
