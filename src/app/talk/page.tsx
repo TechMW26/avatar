@@ -244,12 +244,65 @@ function TalkPageContent() {
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
 
-  // AI-driven body gesture trigger. The agent calls the `playGesture`
-  // clientTool and we bump the nonce so Avatar3D plays the named gesture
-  // exactly once.
+  // AI-driven body gesture trigger. Two pathways feed this:
+  //   1. ElevenLabs `clientTools.playGesture` (if the tool is registered
+  //      in the agent dashboard — the LLM calls it directly).
+  //   2. `onMessage` text scanning of the agent's spoken reply for
+  //      keyword cues (always on, works even without the tool).
+  // Both paths funnel through `triggerAiGesture` which bumps the nonce so
+  // Avatar3D plays the gesture exactly once.
   const [aiGesture, setAiGesture] = useState<{ name: string; nonce: number } | null>(null);
   const triggerAiGesture = useCallback((name: string) => {
-    setAiGesture({ name, nonce: Date.now() });
+    setAiGesture({ name, nonce: Date.now() + Math.floor(Math.random() * 1000) });
+  }, []);
+
+  /** Detect body-language cues in the agent's spoken text. The agent is
+   *  instructed to speak naturally (no tool names) — we listen for vivid
+   *  imagery and pick the best-matching gesture. Order matters: the most
+   *  specific imagery wins (warrior > general teaching). */
+  const detectGestureFromText = useCallback((raw: string): string | null => {
+    const text = raw.toLowerCase();
+    const has = (...needles: string[]) => needles.some((n) => text.includes(n));
+    // Romanised/Devanagari/English keywords side by side.
+    if (has(
+      "bow", "arrow", "archer", "dhanurveda", "dhanush",
+      "arjuna", "karna", "eklavya", "drona", "dronacharya",
+      "धनुष", "बाण", "तीर", "अर्जुन", "कर्ण", "एकलव्य", "द्रोण",
+      "target", "लक्ष्य",
+    )) return "shooting_arrow";
+    if (has(
+      "sword", "mace", "war", "battle", "warrior",
+      "mahabharata", "kurukshetra", "bhima", "duryodhana", "balarama's mace",
+      "तलवार", "गदा", "युद्ध", "योद्धा", "महाभारत", "कुरुक्षेत्र", "भीम", "दुर्योधन",
+    )) return "sword_fight";
+    if (has(
+      "mountain", "climb", "ascend", "summit", "peak", "sadhana", "strive", "steep",
+      "govardhan", "kailash", "meru",
+      "पर्वत", "चढ़ना", "चढ़ना", "शिखर", "साधना", "गोवर्धन", "कैलाश", "मेरु",
+    )) return "climbing";
+    if (has(
+      "hmm", "hmmm", "let me think", "i wonder", "i ponder", "perhaps", "interesting",
+      "हम्म", "विचार", "सोचना", "सोचूँ", "सोचने दो", "शायद", "चिंतन",
+    )) return "thoughtful";
+    if (has(
+      "let go", "forget it", "set aside", "that is not", "do not worry about", "no, no",
+      "छोड़ो", "छोड़ दो", "त्याग", "माया", "भ्रम", "मत सोचो",
+    )) return "dismissing";
+    if (has(
+      "look there", "see this", "behold", "observe", "right here", "this very",
+      "देखो", "यहाँ देखो", "वहाँ देखो", "इसे समझो", "ध्यान दो",
+    )) return "pointing";
+    if (has(
+      "on the other hand", "however", "but consider", "another way",
+      "दूसरी ओर", "किंतु", "परन्तु", "दूसरे दृष्टिकोण",
+    )) return "left_turn";
+    // Catch-all: any reasonably teaching-flavoured sentence becomes
+    // `explaining` so the avatar gestures while delivering content.
+    if (text.length > 25 && has(
+      "because", "therefore", "truth", "dharma", "meaning", "understand", "know",
+      "समझो", "सत्य", "धर्म", "ज्ञान", "जानो", "अर्थ", "कारण",
+    )) return "explaining";
+    return null;
   }, []);
 
   const getLivePrompt = useCallback(() => {
@@ -355,6 +408,16 @@ function TalkPageContent() {
     // the primary cause of audible crackling after a short period of speech.
     // Leave it as a no-op (and definitely do NOT call console.log here).
     onDebug: () => {},
+    // Listen to agent transcripts and trigger gestures based on keyword
+    // detection. This is the primary path — it works whether or not the
+    // `playGesture` clientTool is registered in the ElevenLabs dashboard.
+    onMessage: ({ message, source }: { message: string; source: "user" | "ai" }) => {
+      if (source !== "ai" || !message) return;
+      const detected = detectGestureFromText(message);
+      if (detected) {
+        triggerAiGesture(detected);
+      }
+    },
     // Body-language tools the agent can call mid-speech to make the avatar
     // gesture in time with what it's saying. Each tool just bumps the
     // aiGesture nonce — Avatar3D handles cooldowns + state transitions.

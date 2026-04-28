@@ -183,9 +183,19 @@ function remapClipToAvatarRig(
   /** Map of `strippedBoneName` → actual rig bone name (preserving the rig's
    *  prefix so the AnimationMixer can find the bone by name). */
   avatarBoneByStripped: Map<string, string>,
+  /** When true, drop all tracks targeting the lower body (UpLeg/Leg/Foot/Toe).
+   *  Used for the breathing-idle clip so the legs stay planted in bind pose
+   *  while the upper body still breathes — fixes the visible left/right foot
+   *  sway that comes from Mixamo's hip-shifted breathing animation. */
+  lockLegs = false,
 ): THREE.AnimationClip | null {
   const tracks: THREE.KeyframeTrack[] = [];
   const skipped: string[] = [];
+
+  const LEG_BONES = new Set([
+    "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase", "LeftToe_End",
+    "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase", "RightToe_End",
+  ]);
 
   for (const track of clip.tracks) {
     const dot = track.name.indexOf(".");
@@ -207,6 +217,10 @@ function remapClipToAvatarRig(
       lookup === "Hips" &&
       (property === "position" || property.startsWith("position["))
     ) {
+      continue;
+    }
+
+    if (lockLegs && LEG_BONES.has(lookup)) {
       continue;
     }
 
@@ -609,7 +623,11 @@ function AvatarModel({
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
       const clip = sourceClips[key];
       if (!clip) return;
-      const mapped = remapClipToAvatarRig(clip, avatarBoneByStripped);
+      // Only the breathing-idle clip locks legs — every other clip needs
+      // its full lower-body motion (walking, sitting cross-leg, gestures
+      // that shift weight, etc.).
+      const lockLegs = key === "idle_standing";
+      const mapped = remapClipToAvatarRig(clip, avatarBoneByStripped, lockLegs);
       if (!mapped) return;
       const action = mixer.clipAction(mapped, scene);
       action.enabled = true;
@@ -880,7 +898,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "explaining" &&
             actions.explaining &&
-            now - lastExplainAtRef.current > 8_000
+            now - lastExplainAtRef.current > 3_500
           ) {
             lastAiNonceRef.current = ai.nonce;
             lastExplainAtRef.current = now;
@@ -890,7 +908,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "yelling" &&
             actions.yelling &&
-            now - lastYellAtRef.current > 30_000
+            now - lastYellAtRef.current > 20_000
           ) {
             // Rare "shoo them away" gesture. Snap-in (short fade) so the
             // motion lands aggressively, then return to idle.
@@ -902,7 +920,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "shooting_arrow" &&
             actions.shooting_arrow &&
-            now - lastShootAtRef.current > 12_000
+            now - lastShootAtRef.current > 6_000
           ) {
             // Bow-and-arrow / Dhanurveda / Arjuna references.
             lastAiNonceRef.current = ai.nonce;
@@ -913,7 +931,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "dismissing" &&
             actions.dismissing &&
-            now - lastDismissAtRef.current > 10_000
+            now - lastDismissAtRef.current > 5_000
           ) {
             // Refusing / letting go / brushing aside doubts.
             lastAiNonceRef.current = ai.nonce;
@@ -924,7 +942,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "thoughtful" &&
             actions.thoughtful &&
-            now - lastThoughtfulAtRef.current > 10_000
+            now - lastThoughtfulAtRef.current > 5_000
           ) {
             // Deep contemplation / pondering / reflective questions.
             lastAiNonceRef.current = ai.nonce;
@@ -935,7 +953,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "pointing" &&
             actions.pointing &&
-            now - lastPointAtRef.current > 8_000
+            now - lastPointAtRef.current > 4_000
           ) {
             // Calling out / directing attention / "look there".
             lastAiNonceRef.current = ai.nonce;
@@ -946,7 +964,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "sword_fight" &&
             actions.sword_fight &&
-            now - lastSwordAtRef.current > 15_000
+            now - lastSwordAtRef.current > 8_000
           ) {
             // Mahabharata war / Kshatriya valor / sword imagery.
             lastAiNonceRef.current = ai.nonce;
@@ -957,7 +975,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "climbing" &&
             actions.climbing &&
-            now - lastClimbAtRef.current > 15_000
+            now - lastClimbAtRef.current > 8_000
           ) {
             // Effort / striving / ascending toward higher knowledge.
             lastAiNonceRef.current = ai.nonce;
@@ -968,7 +986,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "left_turn" &&
             actions.left_turn &&
-            now - lastLeftTurnAtRef.current > 12_000
+            now - lastLeftTurnAtRef.current > 6_000
           ) {
             // Looking aside / changing topic / glancing toward an idea.
             lastAiNonceRef.current = ai.nonce;
