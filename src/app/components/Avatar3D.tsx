@@ -751,10 +751,30 @@ function AvatarModel({
       const rotLerp = Math.min(1, delta * 3.5);   // ~0.3s to turn
 
       // Sit pose needs a small extra dip because we strip Hips translation.
-      const yBias = state === "sitting" ? SIT_GROUND_OFFSET_Y : 0;
+      // Climbing should visibly travel upward — Mixamo's clip is in-place,
+      // so we drive a synthetic lift curve based on the action's progress.
+      let yBias = 0;
+      if (state === "sitting") {
+        yBias = SIT_GROUND_OFFSET_Y;
+      } else if (state === "climbing") {
+        const ca = actions.climbing;
+        if (ca) {
+          const dur = ca.getClip().duration || 1;
+          const p = Math.max(0, Math.min(1, ca.time / dur));
+          // Ramp up over first 30%, hold, ease back down over last 25%.
+          const ss = (a: number, b: number, x: number) => {
+            const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+            return t * t * (3 - 2 * t);
+          };
+          const CLIMB_LIFT_MAX = 0.9;
+          yBias = CLIMB_LIFT_MAX * (ss(0, 0.30, p) - ss(0.75, 1, p));
+        }
+      }
       const tgtY = GROUND_Y + yBias;
 
-      grp.position.y += (tgtY - grp.position.y) * Math.min(1, delta * 3);
+      // Snappier follow during climb so the lift tracks the curve closely.
+      const yLerp = state === "climbing" ? Math.min(1, delta * 8) : Math.min(1, delta * 3);
+      grp.position.y += (tgtY - grp.position.y) * yLerp;
 
       /* ── Foot-to-floor clamp ──
          Mixamo's breathing-idle clip lifts the Hips a few cm above the
@@ -763,7 +783,7 @@ function AvatarModel({
          the planted foot stays planted) and offset the group's Y by the
          shortfall. Skipped during walking (already time-driven) and
          sitting (cross-leg pose has its own offset). */
-      if (!isWalking && state !== "sitting") {
+      if (!isWalking && state !== "sitting" && state !== "climbing") {
         const lf = footBonesRef.current.left;
         const rf = footBonesRef.current.right;
         if (lf || rf) {
