@@ -495,6 +495,20 @@ function AvatarModel({
   const lastSwordAtRef = useRef<number>(0);
   const lastAiNonceRef = useRef<number>(-1);
 
+  /* ── Attract mode ──
+     If the sage sits with no visitor for a long random interval, he
+     spontaneously stands up, walks toward the screen (zoomed in 20%
+     beyond the normal close mark), performs the `climbing` gesture, then
+     walks back and sits down. Designed to draw passers-by toward the
+     kiosk. The ATTRACT_DELAY is re-rolled each time the avatar enters
+     the sitting state. */
+  const attractModeRef = useRef(false);
+  const sittingSinceRef = useRef<number>(0);
+  const nextAttractAtRef = useRef<number>(0);
+  const ATTRACT_MIN_IDLE_MS = 60_000;   // 1 min
+  const ATTRACT_MAX_IDLE_MS = 180_000;  // 3 min
+  const ATTRACT_SCALE_MULT = 1.2;       // 20% larger than normal close-up
+
   /* ── Foot bones for per-frame ground clamp.
      Mixamo idle/breathing clips routinely shift the Hips Y a few cm above
      the bind pose, which makes the avatar look like it's hovering. We grab
@@ -793,11 +807,14 @@ function AvatarModel({
         (grp.position.z - BACK_Z) / (FRONT_Z - BACK_Z);
       const t = Math.max(0, Math.min(1, zProgress));
       const derivedScale = BACK_SCALE + (FRONT_SCALE - BACK_SCALE) * t;
-      grp.scale.setScalar(derivedScale);
+      // Attract mode zooms 20% beyond the normal front-mark scale so the
+      // climbing gesture really commands attention.
+      const scaleMult = attractModeRef.current ? ATTRACT_SCALE_MULT : 1;
+      grp.scale.setScalar(derivedScale * scaleMult);
 
       onMark =
         Math.abs(target.z - grp.position.z) < 0.04 &&
-        Math.abs(target.scale - grp.scale.x) < 0.008;
+        Math.abs(target.scale * scaleMult - grp.scale.x) < 0.012;
       facingTarget = Math.abs(drot) < 0.05;
     }
 
@@ -1009,10 +1026,30 @@ function AvatarModel({
     } else if (state === "sitting") {
       if (faceNow) {
         noFaceSinceRef.current = null;
+        sittingSinceRef.current = 0;
+        nextAttractAtRef.current = 0;
         if (actions.standing_up) {
           goTo("standing_up", THREE.LoopOnce, true, 0.6);
         } else {
           goTo("walking_in", THREE.LoopRepeat, false, 0.5);
+        }
+      } else {
+        // Schedule a random attract window the first frame we sit idle.
+        if (sittingSinceRef.current === 0) {
+          sittingSinceRef.current = now;
+          nextAttractAtRef.current = now
+            + ATTRACT_MIN_IDLE_MS
+            + Math.random() * (ATTRACT_MAX_IDLE_MS - ATTRACT_MIN_IDLE_MS);
+        }
+        if (
+          !attractModeRef.current
+          && now >= nextAttractAtRef.current
+          && actions.standing_up
+          && actions.climbing
+        ) {
+          attractModeRef.current = true;
+          sittingSinceRef.current = 0;
+          goTo("standing_up", THREE.LoopOnce, true, 0.6);
         }
       }
     } else if (state === "standing_up") {
@@ -1027,8 +1064,9 @@ function AvatarModel({
         }
       }
     } else if (state === "walking_in") {
-      // If the visitor leaves mid-walk, abort and turn around.
-      if (!faceNow) {
+      // If the visitor leaves mid-walk, abort and turn around — unless we
+      // are in attract mode (no visitor expected; the sage is performing).
+      if (!faceNow && !attractModeRef.current) {
         if (noFaceSinceRef.current == null) noFaceSinceRef.current = now;
       } else {
         noFaceSinceRef.current = null;
@@ -1037,6 +1075,9 @@ function AvatarModel({
         // Hand off to the stop-walking clip for a soft ease-in to idle.
         if (actions.stopping) {
           goTo("stopping", THREE.LoopOnce, true, 0.25);
+        } else if (attractModeRef.current && actions.climbing) {
+          lastClimbAtRef.current = now;
+          goTo("climbing", THREE.LoopOnce, true, 0.4);
         } else {
           goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
         }
@@ -1059,13 +1100,22 @@ function AvatarModel({
       }
     } else if (state === "turning_back") {
       if (facingTarget) {
+        // Clear attract mode on arrival home so future sit cycles can re-roll.
+        attractModeRef.current = false;
+        sittingSinceRef.current = 0;
+        nextAttractAtRef.current = 0;
         goTo("sitting", THREE.LoopRepeat, false, 0.6);
       }
     } else if (state === "stopping") {
       const action = actions.stopping;
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
-        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        if (attractModeRef.current && actions.climbing) {
+          lastClimbAtRef.current = now;
+          goTo("climbing", THREE.LoopOnce, true, 0.4);
+        } else {
+          goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        }
       }
     } else if (state === "waving") {
       const action = actions.waving;
@@ -1125,7 +1175,13 @@ function AvatarModel({
       const action = actions.climbing;
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
-        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        if (attractModeRef.current) {
+          // Performance over — head home. The sage faces away, walks back
+          // to the bench, turns around, and sits.
+          goTo("turning_away", THREE.LoopRepeat, false, 0.4);
+        } else {
+          goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        }
       }
     } else if (state === "left_turn") {
       const action = actions.left_turn;
