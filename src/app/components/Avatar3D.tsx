@@ -859,7 +859,13 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, onReady }:
   const handleAnimStateChange = useCallback((state: AvatarAnimState) => {
     if (state === "sitting") {
       cameraTargetRef.current = CAMERA_Z_FAR;
-    } else if (state === "idle_standing" || state === "waving") {
+    } else if (
+      state === "idle_standing" ||
+      state === "waving" ||
+      state === "praying"
+    ) {
+      // Keep the camera locked on the close mark for any in-place
+      // gesture so we never zoom out mid-wave/mid-pray.
       cameraTargetRef.current = CAMERA_Z_NEAR;
     } else {
       cameraTargetRef.current = (CAMERA_Z_FAR + CAMERA_Z_NEAR) / 2;

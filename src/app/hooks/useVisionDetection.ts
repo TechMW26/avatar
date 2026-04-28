@@ -457,25 +457,27 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     }
 
     // ── Namaste Detection from hand landmarks ──
-    // Namaste: both hands detected, palms facing each other, wrists close together near chest
+    // Real namaste: palms together, hands raised. MediaPipe sometimes loses
+    // one hand when palms fully touch (occlusion), so we accept either:
+    //   (A) two hands, wrists close, fingertips close, both pointing up; or
+    //   (B) two hands, wrists close & both pointing up (looser tip dist).
     let namasteDetected = false;
     if (gestureResult?.landmarks && gestureResult.landmarks.length >= 2) {
       const hand0 = gestureResult.landmarks[0];
       const hand1 = gestureResult.landmarks[1];
-      // Wrist is landmark 0, middle finger tip is landmark 12
       const wrist0 = hand0[0];
       const wrist1 = hand1[0];
       const mid0 = hand0[12];
       const mid1 = hand1[12];
-      // Distance between wrists (normalized coords 0-1)
       const wristDist = Math.sqrt((wrist0.x - wrist1.x) ** 2 + (wrist0.y - wrist1.y) ** 2);
-      // Distance between middle fingertips
       const tipDist = Math.sqrt((mid0.x - mid1.x) ** 2 + (mid0.y - mid1.y) ** 2);
-      // Both hands close together: wrists within ~15% screen, tips within ~10%
-      // Fingertips pointing up: middle finger tip Y < wrist Y (normalized coords: 0=top)
-      const fingersUp0 = mid0.y < wrist0.y;
-      const fingersUp1 = mid1.y < wrist1.y;
-      if (wristDist < 0.18 && tipDist < 0.12 && fingersUp0 && fingersUp1) {
+      // Fingertips pointing up (normalized coords: y=0 is top).
+      // Allow a small slack so a slight tilt still counts.
+      const fingersUp0 = mid0.y < wrist0.y - 0.02;
+      const fingersUp1 = mid1.y < wrist1.y - 0.02;
+      const wristsClose = wristDist < 0.30;
+      const tipsClose = tipDist < 0.22;
+      if (wristsClose && tipsClose && fingersUp0 && fingersUp1) {
         namasteDetected = true;
       }
     }
