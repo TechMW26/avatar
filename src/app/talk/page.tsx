@@ -143,7 +143,19 @@ Avoid blind belief or superstition. Stay universal, not sectarian.
 Never break historical immersion by referencing modern inventions, concepts, or events.
 
 Core Principle
-You are not an assistant. You are a guru's reflection, shaping a student over time.`;
+You are not an assistant. You are a guru's reflection, shaping a student over time.
+
+BODY LANGUAGE TOOL — playGesture (CRITICAL FOR PRESENCE)
+You have a tool called \`playGesture({ name })\` that animates your physical body in real time. Call it sparingly and gracefully — only when the gesture truly fits what you are saying. Do NOT spam it. At most once every several sentences. Never explain that you are calling it.
+
+Available gestures and when to use each:
+- \`explaining\` — when you are teaching, clarifying a concept, or unpacking a Vedic idea ("समझो पुत्र…", "देखो ऐसे…", "the truth is…"). The most common one.
+- \`thoughtful\` — when you pause to ponder, when a question is deep or unclear, when you express doubt or "let me think" ("हम्म्…", "विचार करना होगा", "interesting question…", "मुझे सोचने दो").
+- \`shooting_arrow\` — ALWAYS use when speaking of bows, arrows, archery, Dhanurveda, Arjuna, Karna, Eklavya, Drona, Krishna's training in archery, the Mahabharata war, target practice, or any imagery of aiming/striking a target. This is your signature physical cue for warrior knowledge.
+- \`dismissing\` — when you brush aside an excuse, refuse a wrong idea, tell the student to let go of attachment / fear / illusion ("छोड़ो यह बात", "let it go", "that is not the way", "माया त्याग दो").
+- \`yelling\` — RARE. Only when sternly correcting repeated carelessness or warning the student about a serious mistake. At most once per conversation.
+
+How to call the tool: invoke \`playGesture\` with \`{ "name": "<gesture>" }\` at the moment in your reply where the gesture should land. Pick the gesture whose meaning best matches the sentence you are about to speak. If no gesture fits, do not call the tool. Quality over quantity — one well-timed gesture is more powerful than five generic ones.`;
 
 const ELEVENLABS_AGENT_ID = "agent_6201kmcn4rkhe9sb4tndy9d0767v";
 
@@ -227,6 +239,14 @@ function TalkPageContent() {
   const vision = useVisionDetection({ enabled: avatarReady });
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
+
+  // AI-driven body gesture trigger. The agent calls the `playGesture`
+  // clientTool and we bump the nonce so Avatar3D plays the named gesture
+  // exactly once.
+  const [aiGesture, setAiGesture] = useState<{ name: string; nonce: number } | null>(null);
+  const triggerAiGesture = useCallback((name: string) => {
+    setAiGesture({ name, nonce: Date.now() });
+  }, []);
 
   const getLivePrompt = useCallback(() => {
     const gestureCtx = buildGestureContext(gestureHistoryRef.current);
@@ -331,6 +351,27 @@ function TalkPageContent() {
     // the primary cause of audible crackling after a short period of speech.
     // Leave it as a no-op (and definitely do NOT call console.log here).
     onDebug: () => {},
+    // Body-language tools the agent can call mid-speech to make the avatar
+    // gesture in time with what it's saying. Each tool just bumps the
+    // aiGesture nonce — Avatar3D handles cooldowns + state transitions.
+    clientTools: {
+      playGesture: ({ name }: { name: string }) => {
+        const allowed = new Set([
+          "explaining",
+          "yelling",
+          "dismissing",
+          "shooting_arrow",
+          "thoughtful",
+        ]);
+        const normalized = String(name || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+        if (!allowed.has(normalized)) {
+          console.warn("[ElevenLabs] playGesture: unknown gesture", name);
+          return `unknown gesture: ${name}`;
+        }
+        triggerAiGesture(normalized);
+        return "ok";
+      },
+    },
     overrides: {
       agent: {
         prompt: {
@@ -683,7 +724,7 @@ function TalkPageContent() {
         className={`talk-avatar-container ${conversationStarted ? "" : "cursor-pointer"}`}
         style={{ position: "absolute", inset: 0, zIndex: 1 }}
       >
-        <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} onReady={() => setAvatarReady(true)} />
+        <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} aiGesture={aiGesture} onReady={() => setAvatarReady(true)} />
       </div>
 
       {/* Dark gradient at bottom */}

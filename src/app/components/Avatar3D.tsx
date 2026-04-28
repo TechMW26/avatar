@@ -26,6 +26,9 @@ const ANIM_WAVING_URL = "/animations/waving.fbx";
 const ANIM_PRAYING_URL = "/animations/praying.fbx";
 const ANIM_EXPLAINING_URL = "/animations/explaining.fbx";
 const ANIM_YELLING_URL = "/animations/yelling.fbx";
+const ANIM_DISMISSING_URL = "/animations/dismissing.fbx";
+const ANIM_SHOOTING_ARROW_URL = "/animations/shooting-arrow.fbx";
+const ANIM_THOUGHTFUL_URL = "/animations/thoughtful.fbx";
 
 const ALL_ANIM_URLS = [
   ANIM_IDLE_URL,
@@ -37,6 +40,9 @@ const ALL_ANIM_URLS = [
   ANIM_PRAYING_URL,
   ANIM_EXPLAINING_URL,
   ANIM_YELLING_URL,
+  ANIM_DISMISSING_URL,
+  ANIM_SHOOTING_ARROW_URL,
+  ANIM_THOUGHTFUL_URL,
 ] as const;
 
 type AvatarAnimState =
@@ -51,7 +57,10 @@ type AvatarAnimState =
   | "waving"
   | "praying"
   | "explaining"
-  | "yelling";
+  | "yelling"
+  | "dismissing"
+  | "shooting_arrow"
+  | "thoughtful";
 
 /** The underlying animation clips we actually loaded. Multiple states can
  *  reuse the same clip (walking_in/out share `walking`, the turn states
@@ -65,7 +74,10 @@ type ClipKey =
   | "waving"
   | "praying"
   | "explaining"
-  | "yelling";
+  | "yelling"
+  | "dismissing"
+  | "shooting_arrow"
+  | "thoughtful";
 
 type GestureName =
   | "Open_Palm"
@@ -116,6 +128,9 @@ const STATE_TARGETS: Record<
   praying:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "praying" },
   explaining:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "explaining" },
   yelling:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "yelling" },
+  dismissing:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "dismissing" },
+  shooting_arrow:{ z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "shooting_arrow" },
+  thoughtful:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "thoughtful" },
   turning_away:  { z: FRONT_Z, rotY: Math.PI,  scale: FRONT_SCALE, clipKey: "idle_standing" },
   walking_out:   { z: BACK_Z,  rotY: Math.PI,  scale: BACK_SCALE,  clipKey: "walking" },
   turning_back:  { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "idle_standing" },
@@ -216,7 +231,7 @@ function remapClipToAvatarRig(
    Set the cache name + bump the version when shipping new asset bundles. */
 const ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
-const ASSET_CACHE_NAME = "rishi-avatar-fbx-v1";
+const ASSET_CACHE_NAME = "rishi-avatar-fbx-v2";
 
 function assetUrl(path: string): string {
   if (!ASSET_BASE_URL) return path;
@@ -368,6 +383,9 @@ function AvatarModel({
   const prayingClips = useFbxClips(ANIM_PRAYING_URL);
   const explainingClips = useFbxClips(ANIM_EXPLAINING_URL);
   const yellingClips = useFbxClips(ANIM_YELLING_URL);
+  const dismissingClips = useFbxClips(ANIM_DISMISSING_URL);
+  const shootingArrowClips = useFbxClips(ANIM_SHOOTING_ARROW_URL);
+  const thoughtfulClips = useFbxClips(ANIM_THOUGHTFUL_URL);
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -382,8 +400,11 @@ function AvatarModel({
       praying: pickClip(prayingClips),
       explaining: pickClip(explainingClips),
       yelling: pickClip(yellingClips),
+      dismissing: pickClip(dismissingClips),
+      shooting_arrow: pickClip(shootingArrowClips),
+      thoughtful: pickClip(thoughtfulClips),
     }),
-    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips],
+    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -397,6 +418,9 @@ function AvatarModel({
     praying: undefined,
     explaining: undefined,
     yelling: undefined,
+    dismissing: undefined,
+    shooting_arrow: undefined,
+    thoughtful: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("sitting");
@@ -415,6 +439,10 @@ function AvatarModel({
   const lastExplainAtRef = useRef<number>(0);
   // Yelling is a rare "shoo away" gesture — even longer cooldown.
   const lastYellAtRef = useRef<number>(0);
+  // Per-gesture cooldowns for AI-triggered cues.
+  const lastDismissAtRef = useRef<number>(0);
+  const lastShootAtRef = useRef<number>(0);
+  const lastThoughtfulAtRef = useRef<number>(0);
   const lastAiNonceRef = useRef<number>(-1);
 
   /* ── Foot bones for per-frame ground clamp.
@@ -528,6 +556,9 @@ function AvatarModel({
       praying: undefined,
       explaining: undefined,
       yelling: undefined,
+      dismissing: undefined,
+      shooting_arrow: undefined,
+      thoughtful: undefined,
     };
 
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
@@ -608,6 +639,9 @@ function AvatarModel({
         praying: undefined,
         explaining: undefined,
         yelling: undefined,
+        dismissing: undefined,
+        shooting_arrow: undefined,
+        thoughtful: undefined,
       };
     };
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
@@ -818,6 +852,39 @@ function AvatarModel({
             lastAiNonceRef.current = ai.nonce;
             lastYellAtRef.current = now;
             goTo("yelling", THREE.LoopOnce, true, 0.2);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "shooting_arrow" &&
+            actions.shooting_arrow &&
+            now - lastShootAtRef.current > 12_000
+          ) {
+            // Bow-and-arrow / Dhanurveda / Arjuna references.
+            lastAiNonceRef.current = ai.nonce;
+            lastShootAtRef.current = now;
+            goTo("shooting_arrow", THREE.LoopOnce, true, 0.35);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "dismissing" &&
+            actions.dismissing &&
+            now - lastDismissAtRef.current > 10_000
+          ) {
+            // Refusing / letting go / brushing aside doubts.
+            lastAiNonceRef.current = ai.nonce;
+            lastDismissAtRef.current = now;
+            goTo("dismissing", THREE.LoopOnce, true, 0.35);
+          } else if (
+            ai &&
+            ai.nonce !== lastAiNonceRef.current &&
+            ai.name === "thoughtful" &&
+            actions.thoughtful &&
+            now - lastThoughtfulAtRef.current > 10_000
+          ) {
+            // Deep contemplation / pondering / reflective questions.
+            lastAiNonceRef.current = ai.nonce;
+            lastThoughtfulAtRef.current = now;
+            goTo("thoughtful", THREE.LoopOnce, true, 0.4);
           } else if (ai && ai.nonce !== lastAiNonceRef.current) {
             // Consume the nonce even if we couldn't play (cooldown / unknown
             // gesture name) so we don't fire it later when the cooldown ends.
@@ -913,6 +980,24 @@ function AvatarModel({
       }
     } else if (state === "yelling") {
       const action = actions.yelling;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+      }
+    } else if (state === "dismissing") {
+      const action = actions.dismissing;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
+      }
+    } else if (state === "shooting_arrow") {
+      const action = actions.shooting_arrow;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
+        goTo("idle_standing", THREE.LoopRepeat, false, 0.4);
+      }
+    } else if (state === "thoughtful") {
+      const action = actions.thoughtful;
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
         goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
@@ -1098,6 +1183,9 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
       state === "praying" ||
       state === "explaining" ||
       state === "yelling" ||
+      state === "dismissing" ||
+      state === "shooting_arrow" ||
+      state === "thoughtful" ||
       state === "stopping"
     ) {
       // Keep the camera locked on the close mark for any in-place

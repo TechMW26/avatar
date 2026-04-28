@@ -33,6 +33,9 @@ const ASSETS = [
   'animations/praying.fbx',
   'animations/explaining.fbx',
   'animations/yelling.fbx',
+  'animations/dismissing.fbx',
+  'animations/shooting-arrow.fbx',
+  'animations/thoughtful.fbx',
 ];
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
