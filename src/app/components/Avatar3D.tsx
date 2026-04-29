@@ -991,18 +991,13 @@ function AvatarModel({
         if (fa) {
           const dur = fa.getClip().duration || 1;
           const p = Math.max(0, Math.min(1, fa.time / dur));
-          // Spawn at the same lift height the climb peaked at, and ease
-          // back down to GROUND_Y over the first ~75% of the clip so the
-          // last beat is the landing crouch on the floor.
-          const ss = (a: number, b: number, x: number) => {
-            const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
-            return t * t * (3 - 2 * t);
-          };
           const FALL_FROM = 4.0;
-          // Hold at the top briefly (anticipation), then descend and
-          // finish most of the drop by ~90% so the clip's final beat is
-          // the landing settle near ground.
-          yBias = FALL_FROM * (1 - ss(0.12, 0.9, p));
+          // Short anticipation, then accelerate downward like gravity.
+          const gravityStart = 0.08;
+          const gravityEnd = 0.7;
+          const t = Math.max(0, Math.min(1, (p - gravityStart) / (gravityEnd - gravityStart)));
+          const dropProgress = t * t;
+          yBias = FALL_FROM * (1 - dropProgress);
         }
       }
       const tgtY = GROUND_Y + yBias - footFloorOffsetRef.current;
@@ -1027,7 +1022,13 @@ function AvatarModel({
          the visible vertical bob on capped-fps mobile devices. Skipped
          during walking (already time-driven), sitting (cross-leg pose
          has its own offset), and climbing/falling (synthetic Y curves). */
-      if (!isWalking && state !== "sitting" && state !== "climbing" && state !== "falling") {
+      if (
+        frameProfile.enableFootClamp &&
+        !isWalking &&
+        state !== "sitting" &&
+        state !== "climbing" &&
+        state !== "falling"
+      ) {
         const lf = footBonesRef.current.left;
         const rf = footBonesRef.current.right;
         if (lf || rf) {
@@ -1133,6 +1134,13 @@ function AvatarModel({
       animStateRef.current = next;
       notify(next);
       const playing = fadeToClip(STATE_TARGETS[next].clipKey, loop, once, fade);
+
+      if (next === "falling") {
+        const fallingAction = actions.falling;
+        if (fallingAction) {
+          fallingAction.setEffectiveTimeScale(1.35);
+        }
+      }
 
       // Time-bound the walking traversal so it ends exactly on a full
       // clip cycle (no half-step landing). The clip itself plays at its
@@ -1475,7 +1483,7 @@ function AvatarModel({
       }
     } else if (state === "falling") {
       const action = actions.falling;
-      const done = !action || action.time / Math.max(0.001, action.getClip().duration) >= 0.96;
+      const done = !action || action.time / Math.max(0.001, action.getClip().duration) >= 0.9;
       if (done) {
         if (attractModeRef.current) {
           // Continue the attract close-out (turn → walk back → sit).

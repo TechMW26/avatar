@@ -85,6 +85,24 @@ const FACE_WORKER_DISABLE_UNTIL_KEY = "rishi:vision:face-worker-disable-until";
 const FACE_WORKER_FAILS_BEFORE_DISABLE = 2;
 const FACE_WORKER_DISABLE_MS = 24 * 60 * 60 * 1000;
 
+function isMacOrWindowsDesktop(): boolean {
+  if (typeof navigator === "undefined") return false;
+
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+  const maxTouchPoints = navigator.maxTouchPoints || 0;
+
+  const isiPadOsPretendingMac = platform === "MacIntel" && maxTouchPoints > 1;
+  if (isiPadOsPretendingMac) return false;
+
+  const isWindows = /windows/i.test(ua) || /win/i.test(platform);
+  const isMac = /macintosh|mac os x/i.test(ua) || /mac/i.test(platform);
+  const isAndroid = /android/i.test(ua);
+  const isIOSMobile = /iphone|ipad|ipod/i.test(ua);
+
+  return (isWindows || isMac) && !isAndroid && !isIOSMobile;
+}
+
 function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
   const byName = new Map<string, GestureInfo>();
   gestures.forEach((gesture) => {
@@ -192,7 +210,8 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     async function init() {
       try {
         const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-        const isMobileDevice = /android|iphone|ipad|ipod/i.test(ua);
+        const isDesktopGesturePlatform = isMacOrWindowsDesktop();
+        const isMobileDevice = !isDesktopGesturePlatform;
         isMobileRef.current = isMobileDevice;
 
         // Spin up a dedicated worker for face inference. Keep a fallback
@@ -403,7 +422,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
 
           // Mobile devices skip hand-gesture model entirely to reduce
           // startup time and steady-state CPU/GPU load.
-          const gestureRecognizerTask: Promise<GestureRecognizer | null> = isMobileDevice
+          const gestureRecognizerTask: Promise<GestureRecognizer | null> = !isDesktopGesturePlatform
             ? Promise.resolve(null)
             : createWithFallback((v, d) =>
                 GestureRecognizer.createFromOptions(v, {

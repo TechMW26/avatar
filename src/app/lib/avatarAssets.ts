@@ -210,9 +210,20 @@ export interface DeviceProfile {
   maxTextureSize: number;
   /** Fragment precision to use for WebGL context creation. */
   shaderPrecision: "highp" | "mediump";
+  /** When false, skip the idle foot-clamp skeleton traversal. */
+  enableFootClamp: boolean;
 }
 
 let cachedProfile: DeviceProfile | null = null;
+
+function isHandheldDevice(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+  const maxTouchPoints = navigator.maxTouchPoints || 0;
+  const isiPadOsPretendingMac = platform === "MacIntel" && maxTouchPoints > 1;
+  return isiPadOsPretendingMac || /android|iphone|ipad|ipod|mobile|tablet/i.test(ua);
+}
 
 /**
  * Returns a single, fixed render profile used for **every** device.
@@ -239,14 +250,16 @@ let cachedProfile: DeviceProfile | null = null;
 export function getDeviceProfile(): DeviceProfile {
   if (cachedProfile) return cachedProfile;
 
+  const handheld = isHandheldDevice();
+
   const profile: DeviceProfile = {
     // Tier is pinned to "high" so the few `tier === "high"` checks
     // sprinkled in the renderer (e.g. shader precision = "highp",
     // stencil buffer enabled) preserve visual quality. The actual
     // performance levers below are what matters.
     tier: "high",
-    // Cap DPR to keep fragment workload bounded on low-end devices.
-    maxDpr: 1.3,
+    // Handhelds use true 1x DPR; desktops can afford a modest bump.
+    maxDpr: handheld ? 1 : 1.3,
     // No MSAA — biggest single mobile-GPU memory tax. We rely on
     // high DPR for edge crispness instead (1px at 2x ≈ 0.5px,
     // visually equivalent to 2x MSAA at 1x DPR).
@@ -260,7 +273,8 @@ export function getDeviceProfile(): DeviceProfile {
     // High-performance hint — picks discrete GPU on laptops, and the
     // perf-cluster on mobile SoCs.
     powerPreference: "high-performance",
-    // Always load every gesture FBX so the experience is consistent.
+    // Keep gesture clips available on handhelds; gesture detection is
+    // already disabled there, but AI-driven body animations should still run.
     loadOptionalGestures: true,
     toneMappingExposure: 1.1,
     // FrontSide only — avatar is a closed mesh, back-faces are never
@@ -284,10 +298,12 @@ export function getDeviceProfile(): DeviceProfile {
     // canvas texture upload, and the user explicitly asked to remove
     // shadowing entirely.
     enableGroundShadow: false,
-    // 1K cap substantially reduces texture memory and upload time.
-    maxTextureSize: 1024,
+    // Handhelds use a tighter texture budget to reduce upload and VRAM.
+    maxTextureSize: handheld ? 768 : 1024,
     // mediump materially reduces shader ALU pressure on budget phones.
     shaderPrecision: "mediump",
+    // Foot clamp is visually subtle but expensive on mobile skeletons.
+    enableFootClamp: !handheld,
   };
 
   cachedProfile = profile;
