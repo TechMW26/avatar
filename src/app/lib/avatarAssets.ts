@@ -233,13 +233,14 @@ export function getDeviceProfile(): DeviceProfile {
     // Probe failures are non-fatal; assume hardware GPU.
   }
 
-  // Mobile GPUs that we know are weak — Mali-G5x, Adreno 6xx, PowerVR.
-  // These devices ship in mid-range Android phones/tablets that report
-  // 4–8 GB of RAM (so the deviceMemory probe says "mid"), but their
-  // GPU/SoC ratio is closer to a low-tier iPhone. Pin them to `low`.
+  // Mobile GPUs that we know are weak — only the truly low-end families
+  // (Mali-G3x, Adreno 5xx, ancient PowerVR). The Mali-G5x family was
+  // pinned to low previously, but it ships in capable mid-range phones
+  // (Pixel 6a, Galaxy A54) and the previous downgrade made them look
+  // worse than they had to.
   const weakMobileGpu =
     isMobile &&
-    /(mali-g5|mali-g3|mali-t|adreno \(?6[0-3]|adreno \(?5|powervr|videocore)/i.test(
+    /(mali-g3|mali-t|adreno \(?5[0-2]|powervr (sgx|ge)|videocore iv)/i.test(
       gpuRendererName,
     );
 
@@ -248,51 +249,56 @@ export function getDeviceProfile(): DeviceProfile {
     softwareRasterizer ||
     deviceMemory <= 2 ||
     cores <= 2 ||
-    weakMobileGpu ||
-    // Any iOS device with ≤4 GB RAM (iPhone XR / 11 / SE3 etc.) is now
-    // pinned to low — those phones thermal-throttle within ~30 s on
-    // the previous mid profile.
-    (isIOS && deviceMemory <= 4) ||
-    // Mid-range Android tablets (4 GB / 4 cores) used to land in `mid`
-    // but the GPUs are usually Mali-G5x and the previous profile was
-    // still too rich for them.
-    (isAndroid && deviceMemory <= 4 && cores <= 6)
+    weakMobileGpu
   ) {
     tier = "low";
-  } else if (deviceMemory <= 4 || cores <= 4 || isIOS || isAndroid) {
-    // All remaining mobile devices land in `mid` regardless of the RAM
-    // probe — even a 12 GB Galaxy S24 cannot reliably hold the `high`
-    // PBR pipeline at 60 fps without overheating.
+  } else if (
+    deviceMemory <= 3 ||
+    cores <= 3 ||
+    // Older iPhones (≤3 GB — iPhone 11 / SE2) struggle on the high
+    // pipeline; everything else gets `mid`. iPad Pros and modern
+    // Androids can still hit `high` on this path.
+    (isIOS && deviceMemory <= 3)
+  ) {
     tier = "mid";
+  } else if (isMobile) {
+    // All other mobile devices: try `high` but with the per-pixel cuts
+    // (no MSAA, no env reflections, no normal map). DPR stays high so
+    // text and faces look crisp.
+    tier = "high";
   } else {
     tier = "high";
   }
 
   const profile: DeviceProfile = {
     tier,
-    // iPhone retina renders 3x logical pixels even at dpr=1.5 — cap
-    // mobile mid to 1.0 (was 1.25) and low to 0.85 so we draw far
-    // fewer fragments than before. Desktop low/mid keep the previous
-    // caps because they're not GPU-bound.
+    // DPR: mobile screens are 2-3× retina, so dropping below 1.5 makes
+    // the avatar look pixelated even on a 6" iPhone. Keep DPR HIGH and
+    // claw back the per-fragment cost from the env / normalMap / MSAA
+    // cuts below — those reduce GPU work *per pixel*, which is the
+    // right axis to optimise on retina displays. Hard cap at 2 because
+    // beyond that the framebuffer alone (3840 × 8112 on an iPhone Pro)
+    // saturates mobile GPU bandwidth.
     maxDpr:
       tier === "low"
         ? isMobile
-          ? 0.85
+          ? 1.5
           : 1
         : tier === "mid"
         ? isMobile
-          ? 1.0
+          ? 1.75
           : 1.5
         : 2,
     // MSAA is the single biggest mobile-GPU memory tax. Disable on
     // anything below high, and on every mobile device regardless of tier.
     antialias: tier === "high" && !isMobile,
     shadows: tier === "high" && !isMobile,
-    anisotropy: tier === "low" ? 1 : tier === "mid" ? (isMobile ? 1 : 2) : 8,
-    powerPreference: tier === "low" ? "low-power" : tier === "high" ? "high-performance" : "default",
+    // Anisotropy: keep moderate values on mobile so the diffuse skin
+    // map stays crisp at oblique angles. Was 1 — made the beard
+    // smudge — bumped to 4 on mid mobile, 2 on low mobile.
+    anisotropy: tier === "low" ? (isMobile ? 2 : 1) : tier === "mid" ? (isMobile ? 4 : 2) : 8,
+    powerPreference: tier === "low" ? "low-power" : "high-performance",
     loadOptionalGestures: tier !== "low",
-    // Slightly cooler exposure on mobile so the avatar reads without
-    // pumping ambient light — saves us a fragment-shader add per frag.
     toneMappingExposure: isMobile ? 1.05 : 1.15,
     // Avatar is a closed mesh — back-faces are never visible. Only keep
     // DoubleSide on high tier where the cost is irrelevant.
@@ -301,28 +307,27 @@ export function getDeviceProfile(): DeviceProfile {
     // mobile. Avatar still reads well without it because the lighting
     // is mostly diffuse + ambient.
     enableNormalMap: tier === "high",
-    // Lights: low gets a single ambient-only "no light" setup on mobile
-    // (the avatar is fully lit by the diffuse map already). Mid mobile
-    // collapses to 1 directional light + ambient.
+    // Lights: low mobile gets 1 directional + ambient. Mid mobile gets
+    // 2 directionals so the rim still pops. High desktop keeps 5.
     maxLights:
-      tier === "low" ? (isMobile ? 1 : 1) : tier === "mid" ? (isMobile ? 1 : 2) : 5,
-    // Cap frame rate. 30 fps on mid, 24 fps on low. iOS especially
-    // thermal-throttles after a few minutes at 60 fps, so even high
-    // tier is capped to 50 fps on mobile.
+      tier === "low" ? 1 : tier === "mid" ? (isMobile ? 2 : 3) : 5,
+    // Frame rate cap. Bumping mobile mid to 30 (from 26) and mobile
+    // high to 60 because the per-pixel cuts give us the headroom.
     targetFps:
-      tier === "low" ? 22 : tier === "mid" ? (isMobile ? 26 : 30) : isMobile ? 45 : 60,
-    // Reflections: completely disabled on every mobile device and on
-    // desktop low. They're a ~10–15% per-fragment cost for a visual
-    // change most users will never notice on a webcam-distance avatar.
+      tier === "low" ? 24 : tier === "mid" ? 30 : isMobile ? 60 : 60,
+    // Reflections: disabled on every mobile and desktop low. They're a
+    // ~10–15% per-fragment cost for a visual change most users will
+    // never notice on a webcam-distance avatar.
     enableEnvReflections: tier === "high" && !isMobile,
-    // Ground shadow disc: skip on low tier and on mobile mid. The disc
-    // is an extra transparent draw call + a 256² canvas texture.
-    enableGroundShadow: tier === "high" || (tier === "mid" && !isMobile),
-    // Texture upload caps — diffuse maps larger than this get blitted
-    // down to this resolution at material-setup time. iOS/Android low
-    // get 512², mid mobile 1024², desktop mid 2048².
-    maxTextureSize:
-      tier === "low" ? 512 : tier === "mid" ? (isMobile ? 1024 : 2048) : 4096,
+    // Ground shadow disc: skip only on low tier. The disc is cheap
+    // (single transparent draw) and it grounds the avatar visually —
+    // worth keeping on mobile mid.
+    enableGroundShadow: tier !== "low",
+    // Texture upload caps: do NOT downsample on any tier above low —
+    // doing so produced a visible pixelated skin/beard. The Meshy
+    // diffuse map is ~2K and that's what we want at retina DPR. Only
+    // low tier (memory-constrained) gets the 1024² ceiling.
+    maxTextureSize: tier === "low" ? 1024 : 4096,
   };
 
   cachedProfile = profile;

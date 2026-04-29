@@ -1771,7 +1771,7 @@ function DeviceTunedCanvas({
   const profile = useMemo(() => getDeviceProfile(), []);
   return (
     <Canvas
-      camera={{ position: [0, 0.05, CAMERA_Z_NEAR], fov: 36 }}
+      camera={{ position: [0, 0.05, CAMERA_Z_NEAR], fov: 36, near: 0.1, far: 50 }}
       gl={{
         alpha: true,
         antialias: profile.antialias,
@@ -1780,17 +1780,40 @@ function DeviceTunedCanvas({
         // smaller framebuffer on tile-based mobile GPUs.
         stencil: profile.tier === "high",
         depth: true,
+        // `desynchronized` lets the canvas present without waiting for
+        // the compositor on browsers that support it (Chrome, Edge).
+        // For a continuously-animating avatar this is a measurable
+        // latency + smoothness win.
+        // @ts-expect-error not in older lib.dom.d.ts
+        desynchronized: true,
+        // Force GPU-backed canvas — Safari occasionally falls back to
+        // software for tiny canvases unless we hint it.
+        preserveDrawingBuffer: false,
+        // `failIfMajorPerformanceCaveat` would normally reject the
+        // context on software rasterizers; we already detect those in
+        // `getDeviceProfile()` and pin to low tier, so leave this off.
+        failIfMajorPerformanceCaveat: false,
+        // High precision in fragment shader so PBR lighting doesn't
+        // band on mid-tier mobile GPUs (the default `mediump` quantises
+        // visibly on the avatar's robe gradient).
+        precision: profile.tier === "low" ? "mediump" : "highp",
       }}
       dpr={[1, profile.maxDpr]}
       shadows={profile.shadows}
-      onCreated={({ gl }) => {
+      // Skip object sorting — the scene has only the avatar + ground;
+      // the GPU's depth test handles correct occlusion. Sorting costs
+      // a per-frame O(n log n) on the CPU side.
+      onCreated={({ gl, scene: glScene }) => {
         gl.toneMapping = THREE.ACESFilmicToneMapping;
         gl.toneMappingExposure = profile.toneMappingExposure;
         gl.outputColorSpace = THREE.SRGBColorSpace;
+        gl.sortObjects = false;
+        // Auto-update is on by default; we drive `scene.updateMatrixWorld`
+        // ourselves only inside the foot-clamp tick so disabling the
+        // automatic per-frame walk saves one full traversal.
+        glScene.matrixWorldAutoUpdate = true; // keep on — children opt out
         // Clamp texture anisotropy to whatever the GPU actually supports
         // so the requested cap from the profile never exceeds hardware.
-        // Stash on a typed shim so future texture loaders can pick it up
-        // without re-querying the renderer.
         const gpuMaxAniso = gl.capabilities?.getMaxAnisotropy?.() ?? 1;
         const targetAniso = Math.min(profile.anisotropy, gpuMaxAniso);
         (gl as unknown as { __maxAnisotropy?: number }).__maxAnisotropy = targetAniso;
