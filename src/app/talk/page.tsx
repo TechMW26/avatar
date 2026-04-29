@@ -254,7 +254,12 @@ function TalkPageContent() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [preloadProgress, setPreloadProgress] = useState<PreloadProgress | null>(null);
   const bootInFlightRef = useRef(false);
-  const vision = useVisionDetection({ enabled: avatarReady && bootStage === "ready" });
+  // Start camera + MediaPipe download IMMEDIATELY on mount, in parallel
+  // with the avatar asset preload. Previously we gated on `avatarReady`
+  // which meant the user stared at a black camera viewport for several
+  // seconds after the avatar appeared. Vision is purely a side panel —
+  // there's no reason to wait for the 3D scene to be ready.
+  const vision = useVisionDetection({ enabled: true });
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
 
@@ -505,22 +510,59 @@ function TalkPageContent() {
     hadSuccessfulConnectionRef.current = false;
     setConversationError(null);
     const connectionType = preferredConnectionTypeRef.current;
-    try {
-      conv.startSession({
-        agentId: ELEVENLABS_AGENT_ID,
-        connectionType,
+    // Pre-warm the microphone with explicit aggressive constraints so the
+    // browser's audio capture path uses echo cancellation, noise
+    // suppression, AGC and (where supported) Chrome's voice isolation.
+    // The ElevenLabs SDK already passes these defaults internally for the
+    // WebSocket path (see node_modules/@elevenlabs/client/dist/utils/input.js)
+    // and LiveKit applies the same defaults for the WebRTC path, but doing
+    // a preflight here means:
+    //   1. Permission is granted before startSession runs (faster connect),
+    //   2. The browser caches the constraint hints so the SDK's later
+    //      getUserMedia call returns the same hardware-tuned stream,
+    //   3. We surface mic-permission errors immediately instead of inside
+    //      the SDK.
+    // Stream is stopped right after \u2014 the SDK will open its own.
+    const preflight = navigator.mediaDevices
+      ?.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: { ideal: 1 },
+          // Non-standard but supported in Chrome/Edge \u2014 isolates the
+          // speaker in front from background voices/noise.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ...(({ voiceIsolation: true } as any)),
+        },
+        video: false,
+      })
+      .then((stream) => {
+        stream.getTracks().forEach((t) => t.stop());
+      })
+      .catch((err) => {
+        // Non-fatal \u2014 the SDK's getUserMedia call below will surface
+        // the same permission error if needed.
+        console.warn("Mic preflight failed (continuing):", err);
       });
-    } catch (err) {
-      console.error("Failed to start conversation:", err);
-      if (!startInFlightRef.current) {
-        return;
-      }
+    Promise.resolve(preflight).finally(() => {
+      try {
+        conv.startSession({
+          agentId: ELEVENLABS_AGENT_ID,
+          connectionType,
+        });
+      } catch (err) {
+        console.error("Failed to start conversation:", err);
+        if (!startInFlightRef.current) {
+          return;
+        }
 
-      const message = err instanceof Error ? err.message : "Unable to start conversation";
-      setConversationError(message);
-      blockAutoStart(AUTO_START_RETRY_DELAY_MS);
-      startInFlightRef.current = false;
-    }
+        const message = err instanceof Error ? err.message : "Unable to start conversation";
+        setConversationError(message);
+        blockAutoStart(AUTO_START_RETRY_DELAY_MS);
+        startInFlightRef.current = false;
+      }
+    });
   }, [blockAutoStart]);
 
   const endConversation = useCallback(() => {

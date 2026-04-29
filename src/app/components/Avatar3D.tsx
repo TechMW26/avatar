@@ -47,6 +47,7 @@ const ANIM_CLIMBING_URL = "/animations/climbing.fbx";
 const ANIM_LEFT_TURN_URL = "/animations/left-turn.fbx";
 const ANIM_POINTING_URL = "/animations/pointing.fbx";
 const ANIM_SWORD_FIGHT_URL = "/animations/sword-fight.fbx";
+const ANIM_FALLING_URL = "/animations/falling-to-landing.fbx";
 
 const ALL_ANIM_URLS = [
   ANIM_IDLE_URL,
@@ -65,6 +66,7 @@ const ALL_ANIM_URLS = [
   ANIM_LEFT_TURN_URL,
   ANIM_POINTING_URL,
   ANIM_SWORD_FIGHT_URL,
+  ANIM_FALLING_URL,
 ] as const;
 
 type AvatarAnimState =
@@ -84,6 +86,7 @@ type AvatarAnimState =
   | "shooting_arrow"
   | "thoughtful"
   | "climbing"
+  | "falling"
   | "left_turn"
   | "pointing"
   | "sword_fight";
@@ -105,6 +108,7 @@ type ClipKey =
   | "shooting_arrow"
   | "thoughtful"
   | "climbing"
+  | "falling"
   | "left_turn"
   | "pointing"
   | "sword_fight";
@@ -162,6 +166,9 @@ const STATE_TARGETS: Record<
   shooting_arrow:{ z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "shooting_arrow" },
   thoughtful:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "thoughtful" },
   climbing:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "climbing" },
+  // `falling` reuses the climbing scale because the avatar drops back
+  // down onto the front mark to close out the attract loop.
+  falling:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "falling" },
   left_turn:     { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "left_turn" },
   pointing:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "pointing" },
   sword_fight:   { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "sword_fight" },
@@ -479,6 +486,7 @@ function AvatarModel({
   const leftTurnClips = useFbxClips(ANIM_LEFT_TURN_URL);
   const pointingClips = useFbxClips(ANIM_POINTING_URL);
   const swordFightClips = useFbxClips(ANIM_SWORD_FIGHT_URL);
+  const fallingClips = useFbxClips(ANIM_FALLING_URL);
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -500,8 +508,9 @@ function AvatarModel({
       left_turn: pickClip(leftTurnClips),
       pointing: pickClip(pointingClips),
       sword_fight: pickClip(swordFightClips),
+      falling: pickClip(fallingClips),
     }),
-    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips, climbingClips, leftTurnClips, pointingClips, swordFightClips],
+    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips, climbingClips, leftTurnClips, pointingClips, swordFightClips, fallingClips],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -522,6 +531,7 @@ function AvatarModel({
     left_turn: undefined,
     pointing: undefined,
     sword_fight: undefined,
+    falling: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("sitting");
@@ -593,6 +603,9 @@ function AvatarModel({
        The Meshy FBX ships its own embedded textures, so we leave the maps
        alone and just tighten filtering + zero out the all-white emissive
        that bakes from FBX's Phong shading model. */
+    // Resolve once per mount so material setup mirrors the renderer
+    // settings picked by `<DeviceTunedCanvas>`.
+    const matProfile = getDeviceProfile();
     const avatarBoneByStripped = new Map<string, string>();
 
     scene.traverse((obj) => {
@@ -606,7 +619,10 @@ function AvatarModel({
           const m = mat as THREE.MeshStandardMaterial;
           if (m.map) {
             m.map.colorSpace = THREE.SRGBColorSpace;
-            m.map.anisotropy = 16;
+            // Anisotropy used to be hardcoded at 16 — disastrous on mobile
+            // GPUs whose max is often 4 or 8 anyway. Source from the
+            // device profile so low/mid tiers get 1–2 instead.
+            m.map.anisotropy = matProfile.anisotropy;
             m.map.minFilter = THREE.LinearMipmapLinearFilter;
             m.map.magFilter = THREE.LinearFilter;
             m.map.needsUpdate = true;
@@ -616,14 +632,34 @@ function AvatarModel({
             m.emissiveMap = null;
           }
           m.emissive = new THREE.Color(0x000000);
+          // NormalMap fragment cost is significant on mobile. Drop it
+          // entirely on mid/low — the avatar still reads well because
+          // most surface detail comes from the diffuse map.
           if (m.normalMap) {
-            m.normalScale = new THREE.Vector2(1.2, 1.2);
-            m.normalMap.anisotropy = 16;
-            m.normalMap.needsUpdate = true;
+            if (matProfile.enableNormalMap) {
+              m.normalScale = new THREE.Vector2(1.2, 1.2);
+              m.normalMap.anisotropy = matProfile.anisotropy;
+              m.normalMap.needsUpdate = true;
+            } else {
+              m.normalMap.dispose?.();
+              m.normalMap = null;
+            }
+          }
+          // Roughness map sampling is also pricey. Lift the floor and
+          // strip the map on mid/low so the shader uses the scalar.
+          if (!matProfile.enableNormalMap && m.roughnessMap) {
+            m.roughnessMap.dispose?.();
+            m.roughnessMap = null;
+          }
+          if (!matProfile.enableNormalMap && m.metalnessMap) {
+            m.metalnessMap.dispose?.();
+            m.metalnessMap = null;
           }
           m.roughness = Math.max(m.roughness ?? 0.5, 0.45);
           m.envMapIntensity = 0.4;
-          m.side = THREE.DoubleSide;
+          // Avatar is a closed mesh — back-faces are never visible. Use
+          // FrontSide on mid/low to roughly halve fragment shader work.
+          m.side = matProfile.doubleSide ? THREE.DoubleSide : THREE.FrontSide;
           m.needsUpdate = true;
         });
         mesh.frustumCulled = false;
@@ -687,6 +723,7 @@ function AvatarModel({
       left_turn: undefined,
       pointing: undefined,
       sword_fight: undefined,
+      falling: undefined,
     };
 
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
@@ -778,6 +815,7 @@ function AvatarModel({
         left_turn: undefined,
         pointing: undefined,
         sword_fight: undefined,
+        falling: undefined,
       };
     };
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
@@ -785,7 +823,33 @@ function AvatarModel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scene, sourceClips]);
 
+  // Frame-rate cap. We accumulate `delta` and only run the heavy
+  // per-frame work (mixer.update + foot clamp + transform lerps) when
+  // we've crossed `targetFrameMs`. This roughly halves GPU + CPU load
+  // on phones (mid: 30fps, low: 24fps) without re-architecting the
+  // animation timing — the residual delta is fed into mixer.update so
+  // playback stays at the correct wall-clock speed.
+  const frameProfile = useMemo(() => getDeviceProfile(), []);
+  const targetFrameMs = useMemo(
+    () => 1000 / Math.max(15, frameProfile.targetFps),
+    [frameProfile.targetFps],
+  );
+  const frameAccumRef = useRef(0);
+  // Throttle the foot-clamp `updateMatrixWorld()` traversal — it walks
+  // the entire skeleton and is the most expensive part of the loop.
+  // Running it every other tick is imperceptible at 30fps but cuts
+  // CPU markedly on iPhones.
+  const footClampTickRef = useRef(0);
+
   useFrame((_, delta) => {
+    // Frame-rate cap (mid: 30fps, low: 24fps, high: 60fps). Skip
+    // entirely when we haven't crossed the target frame budget.
+    frameAccumRef.current += delta;
+    if (frameAccumRef.current * 1000 < targetFrameMs) return;
+    const stepDelta = frameAccumRef.current;
+    frameAccumRef.current = 0;
+    delta = stepDelta;
+
     const mixer = mixerRef.current;
     const actions = actionsRef.current;
     if (mixer) mixer.update(Math.min(delta, 0.05));
@@ -808,6 +872,8 @@ function AvatarModel({
       // Sit pose needs a small extra dip because we strip Hips translation.
       // Climbing should visibly travel upward — Mixamo's clip is in-place,
       // so we drive a synthetic lift curve based on the action's progress.
+      // Falling is the inverse: the avatar spawns above the visible
+      // viewport and descends back to ground over the clip's duration.
       let yBias = 0;
       if (state === "sitting") {
         yBias = SIT_GROUND_OFFSET_Y;
@@ -816,19 +882,45 @@ function AvatarModel({
         if (ca) {
           const dur = ca.getClip().duration || 1;
           const p = Math.max(0, Math.min(1, ca.time / dur));
-          // Ramp up over first 30%, hold, ease back down over last 25%.
+          // Smoothstep helper.
           const ss = (a: number, b: number, x: number) => {
             const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
             return t * t * (3 - 2 * t);
           };
-          const CLIMB_LIFT_MAX = 0.9;
-          yBias = CLIMB_LIFT_MAX * (ss(0, 0.30, p) - ss(0.75, 1, p));
+          // Lift HIGH enough that the avatar fully exits the top of the
+          // viewport on a portrait phone screen. With camera at z≈5.7
+          // and fov 36°, the visible vertical extent at z=0 is roughly
+          // 2 * tan(18°) * 5.7 ≈ 3.7 units. Avatar height is ~1.7u, so
+          // a 4u lift puts the toes well above the top edge. Then HOLD
+          // off-screen for the last ~25% of the clip so the climb beat
+          // lands before the falling state takes over.
+          const CLIMB_LIFT_MAX = 4.0;
+          yBias = CLIMB_LIFT_MAX * ss(0, 0.55, p);
+        }
+      } else if (state === "falling") {
+        const fa = actions.falling;
+        if (fa) {
+          const dur = fa.getClip().duration || 1;
+          const p = Math.max(0, Math.min(1, fa.time / dur));
+          // Spawn at the same lift height the climb peaked at, and ease
+          // back down to GROUND_Y over the first ~75% of the clip so the
+          // last beat is the landing crouch on the floor.
+          const ss = (a: number, b: number, x: number) => {
+            const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+            return t * t * (3 - 2 * t);
+          };
+          const FALL_FROM = 4.0;
+          yBias = FALL_FROM * (1 - ss(0, 0.75, p));
         }
       }
       const tgtY = GROUND_Y + yBias;
 
-      // Snappier follow during climb so the lift tracks the curve closely.
-      const yLerp = state === "climbing" ? Math.min(1, delta * 8) : Math.min(1, delta * 3);
+      // Snappier follow during climb / fall so the lift+drop tracks the
+      // curve closely. Climb needs to commit instantly when entering;
+      // fall needs to track gravity tightly so the landing beat reads.
+      const yLerp = (state === "climbing" || state === "falling")
+        ? Math.min(1, delta * 12)
+        : Math.min(1, delta * 3);
       grp.position.y += (tgtY - grp.position.y) * yLerp;
 
       /* ── Foot-to-floor clamp ──
@@ -838,20 +930,26 @@ function AvatarModel({
          the planted foot stays planted) and offset the group's Y by the
          shortfall. Skipped during walking (already time-driven) and
          sitting (cross-leg pose has its own offset). */
-      if (!isWalking && state !== "sitting" && state !== "climbing") {
+      if (!isWalking && state !== "sitting" && state !== "climbing" && state !== "falling") {
         const lf = footBonesRef.current.left;
         const rf = footBonesRef.current.right;
         if (lf || rf) {
-          // Make sure transforms are up to date for the new mixer pose.
-          scene.updateMatrixWorld();
-          let minFootY = Infinity;
-          const v = new THREE.Vector3();
-          if (lf) { lf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
-          if (rf) { rf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
-          if (Number.isFinite(minFootY)) {
-            const drift = minFootY - GROUND_Y;
-            // Smooth correction so we don't pop on state transitions.
-            grp.position.y -= drift * Math.min(1, delta * 8);
+          // updateMatrixWorld traverses the full skeleton — expensive on
+          // mobile. Run it every other tick (so ~15fps on mid, ~12fps on
+          // low) since the foot drift correction is sub-pixel anyway.
+          footClampTickRef.current = (footClampTickRef.current + 1) & 1;
+          if (footClampTickRef.current === 0) {
+            // Make sure transforms are up to date for the new mixer pose.
+            scene.updateMatrixWorld();
+            let minFootY = Infinity;
+            const v = new THREE.Vector3();
+            if (lf) { lf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
+            if (rf) { rf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
+            if (Number.isFinite(minFootY)) {
+              const drift = minFootY - GROUND_Y;
+              // Smooth correction so we don't pop on state transitions.
+              grp.position.y -= drift * Math.min(1, delta * 8);
+            }
           }
         }
       }
@@ -1250,9 +1348,26 @@ function AvatarModel({
       const action = actions.climbing;
       const done = !action || action.time >= action.getClip().duration - 0.1;
       if (done) {
+        // The sage finished climbing fully out of frame — drop straight
+        // into the falling-to-landing clip so he descends back onto the
+        // ground rather than just popping back into view.
+        if (actions.falling) {
+          goTo("falling", THREE.LoopOnce, true, 0.0);
+        } else if (attractModeRef.current) {
+          // Falling clip never loaded (low-tier device skipped it) —
+          // fall back to the original close-out so we don't strand him
+          // off-screen.
+          goTo("turning_away", THREE.LoopRepeat, false, 0.4);
+        } else {
+          goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
+        }
+      }
+    } else if (state === "falling") {
+      const action = actions.falling;
+      const done = !action || action.time >= action.getClip().duration - 0.1;
+      if (done) {
         if (attractModeRef.current) {
-          // Performance over — head home. The sage faces away, walks back
-          // to the bench, turns around, and sits.
+          // Continue the attract close-out (turn → walk back → sit).
           goTo("turning_away", THREE.LoopRepeat, false, 0.4);
         } else {
           goTo("idle_standing", THREE.LoopRepeat, false, 0.5);
@@ -1347,6 +1462,37 @@ function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }
     camera.position.z += (target - camera.position.z) * Math.min(1, delta * 1.5);
   });
   return null;
+}
+
+/**
+ * Light setup tuned per device tier. Each extra light adds a per-fragment
+ * lighting calculation, so on phones we collapse the 5-light cinematic
+ * setup down to 1 (low) or 2 (mid) lights and bump ambient to compensate
+ * for the lost fill. Visually almost identical for a talking-head shot,
+ * but cuts shader work substantially on tile-based mobile GPUs.
+ */
+function SceneLights() {
+  const profile = useMemo(() => getDeviceProfile(), []);
+  const max = profile.maxLights;
+  // Boost ambient when we drop the warm fills so the avatar's shadow
+  // side doesn't read as dead-black.
+  const ambient = max >= 5 ? 0.7 : max >= 2 ? 0.85 : 1.0;
+  return (
+    <>
+      <ambientLight intensity={ambient} />
+      {/* Key light — always on. */}
+      <directionalLight position={[2, 3, 3]} intensity={1.0} />
+      {max >= 2 && (
+        <directionalLight position={[-1.5, 2, 1]} intensity={0.35} color="#ffeedd" />
+      )}
+      {max >= 5 && (
+        <>
+          <directionalLight position={[-2, 1, -1]} intensity={0.15} color="#FF9933" />
+          <pointLight position={[0, 0.3, 0.9]} intensity={0.3} color="#ffe4c9" />
+        </>
+      )}
+    </>
+  );
 }
 
 /* ── Ground ──
@@ -1449,6 +1595,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
       state === "shooting_arrow" ||
       state === "thoughtful" ||
       state === "climbing" ||
+      state === "falling" ||
       state === "left_turn" ||
       state === "pointing" ||
       state === "sword_fight" ||
@@ -1477,11 +1624,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
       <Suspense fallback={<Loader />}>
         <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
           <DeviceTunedCanvas isSpeaking={isSpeaking}>
-            <ambientLight intensity={0.7} />
-            <directionalLight position={[2, 3, 3]} intensity={1.0} />
-            <directionalLight position={[-1.5, 2, 1]} intensity={0.35} color="#ffeedd" />
-            <directionalLight position={[-2, 1, -1]} intensity={0.15} color="#FF9933" />
-            <pointLight position={[0, 0.3, 0.9]} intensity={0.3} color="#ffe4c9" />
+            <SceneLights />
             <CameraAnimator targetZRef={cameraTargetRef} />
             <Ground />
             <AvatarModel

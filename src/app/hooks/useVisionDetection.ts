@@ -224,9 +224,13 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
               },
               runningMode: "VIDEO",
               numHands: 2,
-              minHandDetectionConfidence: 0.5,
-              minHandPresenceConfidence: 0.5,
-              minTrackingConfidence: 0.5,
+              // Lowered (0.5 → 0.3) so partially-occluded hands at
+              // kiosk distance still register. False positives are
+              // tolerable here because gestures are advisory, not
+              // safety-critical.
+              minHandDetectionConfidence: 0.3,
+              minHandPresenceConfidence: 0.3,
+              minTrackingConfidence: 0.3,
             }),
           ),
         ]);
@@ -463,7 +467,11 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     //   (B) Two hands tracked, fingertips clustered (palms touching) even if
     //       MediaPipe couldn't keep both wrists separated; or
     //   (C) Two hands tracked, both pointing up and roughly horizontally
-    //       aligned (similar y), even if the depth of the hands varies.
+    //       aligned (similar y), even if the depth of the hands varies; or
+    //   (D) Single-hand fallback — kiosk users often show only one hand
+    //       to the camera (the other hand is hidden behind it). Accept a
+    //       centered, upright hand with extended fingers as namaste so the
+    //       interaction never feels broken.
     let namasteDetected = false;
     if (gestureResult?.landmarks && gestureResult.landmarks.length >= 2) {
       const hand0 = gestureResult.landmarks[0];
@@ -478,13 +486,53 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       // inverted in normalized image coords).
       const fingersUp0 = mid0.y < wrist0.y;
       const fingersUp1 = mid1.y < wrist1.y;
-      const wristsAligned = Math.abs(wrist0.y - wrist1.y) < 0.20;
+      const wristsAligned = Math.abs(wrist0.y - wrist1.y) < 0.30;
 
-      const caseA = wristDist < 0.45 && fingersUp0 && fingersUp1;
-      const caseB = tipDist < 0.30 && fingersUp0 && fingersUp1;
-      const caseC = wristsAligned && fingersUp0 && fingersUp1 && wristDist < 0.55;
+      // Widened thresholds (was 0.45 / 0.30 / 0.55) — palm-together
+      // namaste is hard to land precisely from a kiosk distance.
+      const caseA = wristDist < 0.60 && fingersUp0 && fingersUp1;
+      const caseB = tipDist < 0.45 && fingersUp0 && fingersUp1;
+      const caseC = wristsAligned && fingersUp0 && fingersUp1 && wristDist < 0.75;
       if (caseA || caseB || caseC) {
         namasteDetected = true;
+      }
+    } else if (gestureResult?.landmarks && gestureResult.landmarks.length === 1) {
+      // Case D: single-hand namaste fallback. INTENTIONALLY STRICT — a
+      // permissive single-hand check would gobble every Open_Palm /
+      // Pointing_Up / ILoveYou frame because we suppress all other
+      // gestures whenever Namaste is set. Require:
+      //   * The hand to be centered horizontally,
+      //   * All four non-thumb fingertips tightly aligned vertically
+      //     (i.e. flat palm pointing straight up, not splayed),
+      //   * All those tips meaningfully above the wrist,
+      //   * The MediaPipe gesture classifier to NOT have already labelled
+      //     this hand as a different known gesture (Open_Palm, Victory,
+      //     Pointing_Up, Thumb_Up/Down, ILoveYou, Closed_Fist).
+      const topCat = gestureResult.gestures?.[0]?.[0];
+      const claimedByOther =
+        topCat &&
+        topCat.score > 0.5 &&
+        topCat.categoryName !== "None" &&
+        topCat.categoryName !== "Namaste";
+      if (!claimedByOther) {
+        const hand = gestureResult.landmarks[0];
+        const wrist = hand[0];
+        const indexTip = hand[8];
+        const midTip = hand[12];
+        const ringTip = hand[16];
+        const pinkyTip = hand[20];
+        const centered = wrist.x > 0.25 && wrist.x < 0.75;
+        const tipsXs = [indexTip.x, midTip.x, ringTip.x, pinkyTip.x];
+        const tipsXSpread = Math.max(...tipsXs) - Math.min(...tipsXs);
+        const tipsAligned = tipsXSpread < 0.06; // narrow, parallel fingers
+        const allAboveWrist =
+          wrist.y - indexTip.y > 0.18 &&
+          wrist.y - midTip.y > 0.20 &&
+          wrist.y - ringTip.y > 0.18 &&
+          wrist.y - pinkyTip.y > 0.14;
+        if (centered && tipsAligned && allAboveWrist) {
+          namasteDetected = true;
+        }
       }
     }
 
@@ -515,7 +563,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
         const gesture = gestureResult.gestures[i];
         if (gesture.length > 0) {
           const top = gesture[0];
-          if (top.categoryName !== "None" && top.score > 0.6) {
+          if (top.categoryName !== "None" && top.score > 0.4) {
             // Skip individual hand gestures if Namaste is detected (both hands together)
             if (namasteDetected) continue;
             const info: GestureInfo = {

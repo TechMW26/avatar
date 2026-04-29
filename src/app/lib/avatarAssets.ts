@@ -24,7 +24,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v4";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v5";
 
 export function assetUrl(path: string): string {
   if (!ASSET_BASE_URL) return path;
@@ -65,6 +65,7 @@ export const AVATAR_ASSETS: AvatarAssetSpec[] = [
   { path: "/animations/left-turn.fbx", estBytes: 370_000 },
   { path: "/animations/pointing.fbx", estBytes: 610_000 },
   { path: "/animations/sword-fight.fbx", estBytes: 780_000 },
+  { path: "/animations/falling-to-landing.fbx", estBytes: 380_000 },
 ];
 
 /**
@@ -90,6 +91,10 @@ const OPTIONAL_GESTURE_PATHS = new Set<string>([
   "/animations/left-turn.fbx",
   "/animations/pointing.fbx",
   "/animations/sword-fight.fbx",
+  // The falling clip is only used as the close-out for the climbing
+  // attract sequence. Low-tier devices already skip climbing, so the
+  // fall is wasted bandwidth on those phones.
+  "/animations/falling-to-landing.fbx",
 ]);
 
 export type DeviceTier = "low" | "mid" | "high";
@@ -114,6 +119,25 @@ export interface DeviceProfile {
    *  (set so future code can dim further on low-end without a magic
    *  number elsewhere). */
   toneMappingExposure: number;
+  /** When true, mesh materials keep `side: THREE.DoubleSide`. On mid/low
+   *  we flip to `FrontSide` because back-face shading roughly doubles
+   *  the per-pixel fragment cost — the avatar is solid so back-faces
+   *  are never visible anyway. */
+  doubleSide: boolean;
+  /** When true, mesh materials keep their PBR `normalMap`. Sampling +
+   *  TBN math is one of the most expensive per-fragment operations on
+   *  mobile GPUs, and the avatar still looks correct without it because
+   *  the lighting is mostly directional + ambient. */
+  enableNormalMap: boolean;
+  /** Number of directional/point lights to render. Each light adds a
+   *  uniform fetch + lighting calc per fragment, so dropping from 5 to 2
+   *  on mid and 1 on low gives a measurable mobile-GPU win. */
+  maxLights: number;
+  /** Render frame cap. 60 fps on high, 30 fps on mid, 24 fps on low.
+   *  Implemented as a frame-skip in the per-frame loop — cheaper than
+   *  throttling react-three-fiber's render scheduler and avoids tearing
+   *  apart the existing animation timing. */
+  targetFps: number;
 }
 
 let cachedProfile: DeviceProfile | null = null;
@@ -146,6 +170,10 @@ export function getDeviceProfile(): DeviceProfile {
       powerPreference: "default",
       loadOptionalGestures: true,
       toneMappingExposure: 1.15,
+      doubleSide: true,
+      enableNormalMap: true,
+      maxLights: 5,
+      targetFps: 60,
     };
   }
 
@@ -196,15 +224,33 @@ export function getDeviceProfile(): DeviceProfile {
 
   const profile: DeviceProfile = {
     tier,
-    maxDpr: tier === "low" ? 1 : tier === "mid" ? 1.5 : 2,
+    // iPhone retina renders 3x logical pixels even at dpr=1.5 — hard
+    // cap mid-tier to 1.25 so we draw ~30% fewer fragments than before
+    // without making the avatar visibly fuzzy.
+    maxDpr: tier === "low" ? 1 : tier === "mid" ? 1.25 : 2,
     // MSAA is the single biggest mobile-GPU memory tax. Disable on
     // anything below high, and on every iOS device regardless of tier.
     antialias: tier === "high" && !isIOS,
     shadows: tier === "high" && !isIOS,
-    anisotropy: tier === "low" ? 1 : tier === "mid" ? 4 : 8,
+    anisotropy: tier === "low" ? 1 : tier === "mid" ? 2 : 8,
     powerPreference: tier === "low" ? "low-power" : tier === "high" ? "high-performance" : "default",
     loadOptionalGestures: tier !== "low",
     toneMappingExposure: 1.15,
+    // Avatar is a closed mesh — back-faces are never visible. Only keep
+    // DoubleSide on high tier where the cost is irrelevant.
+    doubleSide: tier === "high",
+    // Normal-map sampling is one of the priciest per-fragment ops on
+    // mobile. Avatar still reads well without it because the lighting
+    // is mostly diffuse + ambient.
+    enableNormalMap: tier === "high",
+    // Each extra light adds a per-fragment lighting calc. 1 directional
+    // is enough to read facial volumes on low-end; 2 keeps the warm
+    // rim on mid; high gets the full 5-light cinematic setup.
+    maxLights: tier === "low" ? 1 : tier === "mid" ? 2 : 5,
+    // Cap frame rate to halve GPU load on phones. 30fps is plenty for a
+    // talking-head avatar with no fast camera motion; 24fps on low-end
+    // is film-rate and still feels responsive for lipsync.
+    targetFps: tier === "low" ? 24 : tier === "mid" ? 30 : 60,
   };
 
   cachedProfile = profile;

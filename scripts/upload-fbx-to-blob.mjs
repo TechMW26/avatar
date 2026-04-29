@@ -44,6 +44,7 @@ const ASSETS = [
   'animations/left-turn.fbx',
   'animations/pointing.fbx',
   'animations/sword-fight.fbx',
+  'animations/falling-to-landing.fbx',
 ];
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
