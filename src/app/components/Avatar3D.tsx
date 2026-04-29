@@ -21,7 +21,6 @@ import {
   getDeviceProfile,
   isAssetEnabled,
   isAssetMissing,
-  resetAppSiteData,
 } from "../lib/avatarAssets";
 
 const AVATAR_URL = "/avatar.fbx";
@@ -337,19 +336,12 @@ function remapClipToAvatarRig(
 // changing one without the other will silently re-download every asset.
 void ASSET_BASE_URL;
 void ASSET_CACHE_NAME;
-let assetSiteDataResetPromise: Promise<void> | null = null;
 
 /** Fetch through Cache Storage so the second visit is instant.
  *  Falls back to a plain fetch when Cache Storage is unavailable
  *  (SSR, private mode, etc.). Returns an ArrayBuffer ready for FBXLoader.parse. */
 async function fetchAssetCached(path: string): Promise<ArrayBuffer> {
   const url = assetUrl(path);
-  if (!assetSiteDataResetPromise) {
-    assetSiteDataResetPromise = resetAppSiteData().catch(() => {
-      // Keep fetch path resilient if storage reset fails in restricted modes.
-    });
-  }
-  await assetSiteDataResetPromise;
   if (typeof caches !== "undefined") {
     try {
       const activeCacheName = await ensureFreshAssetCache();

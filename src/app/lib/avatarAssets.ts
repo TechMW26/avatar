@@ -28,62 +28,12 @@ export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v5";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
-let appSiteResetPromise: Promise<void> | null = null;
 
-/** Best-effort reset of app-owned browser state. This cannot clear browser
- *  permission prompts / site settings, but it does remove service workers,
- *  Cache Storage, local/session storage, and IndexedDB for this origin. */
+/** Legacy hook kept for compatibility. Asset caching is now intentionally
+ *  persistent across visits, so this function is a no-op. */
 export async function resetAppSiteData(): Promise<void> {
-  if (typeof window === "undefined") return;
-  if (!appSiteResetPromise) {
-    appSiteResetPromise = (async () => {
-      try { window.localStorage.clear(); } catch {}
-      try { window.sessionStorage.clear(); } catch {}
-
-      if ("serviceWorker" in navigator) {
-        try {
-          const regs = await navigator.serviceWorker.getRegistrations();
-          await Promise.all(regs.map((r) => r.unregister()));
-        } catch {}
-      }
-
-      if (typeof caches !== "undefined") {
-        try {
-          const keys = await caches.keys();
-          await Promise.all(keys.map((k) => caches.delete(k)));
-        } catch {}
-      }
-
-      if (window.indexedDB && typeof indexedDB.databases === "function") {
-        try {
-          const dbs = await indexedDB.databases();
-          dbs.forEach((db) => {
-            if (db?.name) indexedDB.deleteDatabase(db.name);
-          });
-        } catch {}
-      }
-    })();
-  }
-  await appSiteResetPromise;
-}
-
-/** Build-scoped cache key so each Vercel deployment gets a fresh bucket.
- *  Falls back to the static cache name when build id isn't available. */
-function getRuntimeAssetCacheName(): string {
-  if (cachedRuntimeAssetCacheName) return cachedRuntimeAssetCacheName;
-  if (typeof window === "undefined") {
-    cachedRuntimeAssetCacheName = ASSET_CACHE_NAME;
-    return cachedRuntimeAssetCacheName;
-  }
-  const nextData = (window as unknown as { __NEXT_DATA__?: { buildId?: string } }).__NEXT_DATA__;
-  const rawBuildId = String(nextData?.buildId || "").trim();
-  if (!rawBuildId) {
-    cachedRuntimeAssetCacheName = ASSET_CACHE_NAME;
-    return cachedRuntimeAssetCacheName;
-  }
-  const safeBuildId = rawBuildId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  cachedRuntimeAssetCacheName = `${ASSET_CACHE_NAME}-${safeBuildId}`;
-  return cachedRuntimeAssetCacheName;
+  // Intentional no-op: we persist downloaded assets on device so repeated
+  // visits do not re-download heavy FBX files.
 }
 
 /** Ensure we only keep the active deployment's avatar cache. */
@@ -150,6 +100,30 @@ export const AVATAR_ASSETS: AvatarAssetSpec[] = [
   { path: "/animations/sword-fight.fbx", estBytes: 780_000 },
   { path: "/animations/falling-to-landing.fbx", estBytes: 380_000 },
 ];
+
+function hashString(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * Asset-manifest scoped cache key. Downloads are reused across sessions and
+ * refreshed only when the asset manifest changes (new file or changed spec).
+ */
+function getRuntimeAssetCacheName(): string {
+  if (cachedRuntimeAssetCacheName) return cachedRuntimeAssetCacheName;
+  const manifestSignature = JSON.stringify({
+    base: ASSET_BASE_URL,
+    assets: AVATAR_ASSETS.map((a) => [a.path, a.estBytes]),
+  });
+  const manifestHash = hashString(manifestSignature);
+  cachedRuntimeAssetCacheName = `${ASSET_CACHE_NAME}-${manifestHash}`;
+  return cachedRuntimeAssetCacheName;
+}
 
 /**
  * URLs that are *optional* — they only ever play when the AI agent
@@ -478,7 +452,6 @@ export async function preloadAvatarAssets(
   signal?: AbortSignal,
   profile: DeviceProfile = getDeviceProfile(),
 ): Promise<void> {
-  await resetAppSiteData();
   // Resolve the cache once. If unavailable (private mode, very old
   // browsers), we still complete the downloads — they go straight to
   // the browser HTTP cache so the runtime fetch hits warm.

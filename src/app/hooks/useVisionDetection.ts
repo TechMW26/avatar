@@ -191,6 +191,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
 
     async function init() {
       try {
+        const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+        const isMobileDevice = /android|iphone|ipad|ipod/i.test(ua);
+        isMobileRef.current = isMobileDevice;
+
         // Spin up a dedicated worker for face inference. Keep a fallback
         // detector on the main thread if worker init fails.
         const faceWorkerTask = (async (): Promise<boolean> => {
@@ -287,15 +291,12 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
         // startup doesn't pay both latencies serially on mobile.
         const streamTask = (async (): Promise<MediaStream> => {
           let stream: MediaStream | null = null;
-          const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-          const isMobile = /android|iphone|ipad|ipod/i.test(ua);
-          isMobileRef.current = isMobile;
           const constraints: MediaStreamConstraints[] = [
             {
               video: {
                 facingMode: "user",
-                width: { ideal: isMobile ? 640 : 960 },
-                height: { ideal: isMobile ? 480 : 540 },
+                width: { ideal: isMobileDevice ? 640 : 960 },
+                height: { ideal: isMobileDevice ? 480 : 540 },
                 frameRate: { ideal: 24, max: 30 },
               },
               audio: false,
@@ -400,25 +401,27 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
             }
           }
 
-          // Load gestures in the background so "vision ready" is not
-          // blocked by the larger hand model init path.
-          const gestureRecognizerTask = createWithFallback((v, d) =>
-            GestureRecognizer.createFromOptions(v, {
-              baseOptions: {
-                modelAssetPath:
-                  "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
-                delegate: d,
-              },
-              runningMode: "VIDEO",
-              numHands: 2,
-              minHandDetectionConfidence: 0.3,
-              minHandPresenceConfidence: 0.3,
-              minTrackingConfidence: 0.3,
-            }),
-          ).catch((err) => {
-            console.warn("GestureRecognizer init failed (gesture detection disabled):", err);
-            return null;
-          });
+          // Mobile devices skip hand-gesture model entirely to reduce
+          // startup time and steady-state CPU/GPU load.
+          const gestureRecognizerTask: Promise<GestureRecognizer | null> = isMobileDevice
+            ? Promise.resolve(null)
+            : createWithFallback((v, d) =>
+                GestureRecognizer.createFromOptions(v, {
+                  baseOptions: {
+                    modelAssetPath:
+                      "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+                    delegate: d,
+                  },
+                  runningMode: "VIDEO",
+                  numHands: 2,
+                  minHandDetectionConfidence: 0.3,
+                  minHandPresenceConfidence: 0.3,
+                  minTrackingConfidence: 0.3,
+                }),
+              ).catch((err) => {
+                console.warn("GestureRecognizer init failed (gesture detection disabled):", err);
+                return null;
+              });
 
           return { vision, createWithFallback, faceDetector, gestureRecognizerTask };
         })();
