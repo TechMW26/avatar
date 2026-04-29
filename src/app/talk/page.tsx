@@ -660,6 +660,13 @@ function TalkPageContent() {
       return;
     }
 
+    // Never auto-start speech before both boot prerequisites are ready:
+    //   1) avatar assets preloaded
+    //   2) vision detectors initialized
+    if (bootStage !== "ready" || !vision.isReady) {
+      return;
+    }
+
     if (Date.now() < autoStartBlockedUntilRef.current) {
       return;
     }
@@ -672,7 +679,15 @@ function TalkPageContent() {
       autoStartArmedRef.current = false;
       startConversation();
     }
-  }, [vision.faceDetected, vision.facePresenceDurationMs, conversation.status, retryWakeAt, startConversation]);
+  }, [
+    bootStage,
+    vision.isReady,
+    vision.faceDetected,
+    vision.facePresenceDurationMs,
+    conversation.status,
+    retryWakeAt,
+    startConversation,
+  ]);
 
   // Connection timeout: if stuck in "connecting" for too long, give up.
   // Uses a ref for status checks to avoid re-triggering on every render.

@@ -63,6 +63,13 @@ const VISION_CDN =
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const DETECTION_INTERVAL_MS = 100; // run detection every 100ms (~10fps detection)
+const DETECTION_INTERVAL_MOBILE_MS = 120; // lighter cadence on phones
+const FACE_UI_UPDATE_INTERVAL_MS = 120; // throttle React updates for counters
+const SMILE_UI_UPDATE_INTERVAL_MS = 160;
+const LANDMARK_INTERVAL_MS = 140;
+const LANDMARK_INTERVAL_MOBILE_MS = 220;
+const OBJECT_DETECT_INTERVAL_MS = 333;
+const OBJECT_DETECT_INTERVAL_MOBILE_MS = 900;
 const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
 const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
 const FACE_LOSS_GRACE_MS = 700; // short grace window smooths mobile jitter
@@ -101,6 +108,11 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   const faceMissStreakRef = useRef(0);
   const lastFaceSeenAtRef = useRef(0);
   const lastVideoTimestampRef = useRef(0);
+  const lastFaceUiUpdateAtRef = useRef(0);
+  const lastSmileUiUpdateAtRef = useRef(0);
+  const lastLandmarkDetectionRef = useRef(0);
+  const isMobileRef = useRef(false);
+  const lastGestureStateKeyRef = useRef("");
 
   // Smile tracking (from face landmarks)
   const [userSmile, setUserSmile] = useState(0);
@@ -136,131 +148,130 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
 
     async function init() {
       try {
-        // 1. Request camera permission early & acquire stream
-        //    Try "user" facing first, then fall back to any available camera (USB webcams on Pi)
-        let stream: MediaStream | null = null;
-        const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-        const isMobile = /android|iphone|ipad|ipod/i.test(ua);
-        const constraints: MediaStreamConstraints[] = [
-          {
-            video: {
-              facingMode: "user",
-              width: { ideal: isMobile ? 640 : 960 },
-              height: { ideal: isMobile ? 480 : 540 },
-              frameRate: { ideal: 24, max: 30 },
-            },
-            audio: false,
-          },
-          {
-            video: {
-              width: { ideal: 640 },
-              height: { ideal: 480 },
-              frameRate: { ideal: 24, max: 30 },
-            },
-            audio: false,
-          },
-          { video: true, audio: false },
-        ];
-
-        for (const c of constraints) {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia(c);
-            break;
-          } catch {
-            // try next constraint set
-          }
-        }
-
-        if (!stream) {
-          // Last resort: enumerate devices and pick the first video input
-          const devices = await navigator.mediaDevices.enumerateDevices();
-          const videoDevice = devices.find((d) => d.kind === "videoinput");
-          if (videoDevice) {
-            stream = await navigator.mediaDevices.getUserMedia({
-              video: { deviceId: { exact: videoDevice.deviceId } },
+        // 1) Warm camera and 2) load MediaPipe models concurrently so
+        // startup doesn't pay both latencies serially on mobile.
+        const streamTask = (async (): Promise<MediaStream> => {
+          let stream: MediaStream | null = null;
+          const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+          const isMobile = /android|iphone|ipad|ipod/i.test(ua);
+          isMobileRef.current = isMobile;
+          const constraints: MediaStreamConstraints[] = [
+            {
+              video: {
+                facingMode: "user",
+                width: { ideal: isMobile ? 640 : 960 },
+                height: { ideal: isMobile ? 480 : 540 },
+                frameRate: { ideal: 24, max: 30 },
+              },
               audio: false,
-            });
-          }
-        }
+            },
+            {
+              video: {
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                frameRate: { ideal: 24, max: 30 },
+              },
+              audio: false,
+            },
+            { video: true, audio: false },
+          ];
 
-        if (!stream) {
-          throw new Error("No camera found. Please connect a camera and grant permission.");
-        }
+          for (const c of constraints) {
+            try {
+              stream = await navigator.mediaDevices.getUserMedia(c);
+              break;
+            } catch {
+              // try next constraint set
+            }
+          }
+
+          if (!stream) {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const videoDevice = devices.find((d) => d.kind === "videoinput");
+            if (videoDevice) {
+              stream = await navigator.mediaDevices.getUserMedia({
+                video: { deviceId: { exact: videoDevice.deviceId } },
+                audio: false,
+              });
+            }
+          }
+
+          if (!stream) {
+            throw new Error("No camera found. Please connect a camera and grant permission.");
+          }
+
+          if (cancelled) {
+            stream.getTracks().forEach((t) => t.stop());
+            throw new Error("Vision init cancelled");
+          }
+
+          streamRef.current = stream;
+          const video = videoRef.current;
+          if (video) {
+            video.srcObject = stream;
+            video.setAttribute("playsinline", "true");
+            video.muted = true;
+            try {
+              await video.play();
+            } catch {
+              await new Promise((r) => setTimeout(r, 300));
+              await video.play().catch(() => {
+                console.warn("Video play() failed — detection may not start until user interaction.");
+              });
+            }
+          }
+          return stream;
+        })();
+
+        const modelTask = (async () => {
+          const vision = await FilesetResolver.forVisionTasks(VISION_CDN);
+          if (cancelled) throw new Error("Vision init cancelled");
+
+          async function createWithFallback<T>(
+            factory: (v: typeof vision, delegate: "GPU" | "CPU") => Promise<T>,
+          ): Promise<T> {
+            try {
+              return await factory(vision, "GPU");
+            } catch {
+              return await factory(vision, "CPU");
+            }
+          }
+
+          const [faceDetector, gestureRecognizer] = await Promise.all([
+            createWithFallback((v, d) =>
+              FaceDetector.createFromOptions(v, {
+                baseOptions: {
+                  modelAssetPath:
+                    "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+                  delegate: d,
+                },
+                runningMode: "VIDEO",
+                minDetectionConfidence: 0.5,
+              }),
+            ),
+            createWithFallback((v, d) =>
+              GestureRecognizer.createFromOptions(v, {
+                baseOptions: {
+                  modelAssetPath:
+                    "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+                  delegate: d,
+                },
+                runningMode: "VIDEO",
+                numHands: 2,
+                minHandDetectionConfidence: 0.3,
+                minHandPresenceConfidence: 0.3,
+                minTrackingConfidence: 0.3,
+              }),
+            ),
+          ]);
+          return { vision, createWithFallback, faceDetector, gestureRecognizer };
+        })();
+
+        const [stream, modelBundle] = await Promise.all([streamTask, modelTask]);
+        const { vision, createWithFallback, faceDetector, gestureRecognizer } = modelBundle;
 
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        // Attach camera to video element immediately so it's warming up while models load
-        streamRef.current = stream;
-        const video = videoRef.current;
-        if (video) {
-          video.srcObject = stream;
-          video.setAttribute("playsinline", "true");
-          video.muted = true;
-          try {
-            await video.play();
-          } catch {
-            // On Raspberry Pi / some browsers, play() can fail if element isn't fully mounted.
-            // Wait briefly and retry once.
-            await new Promise((r) => setTimeout(r, 300));
-            await video.play().catch(() => {
-              console.warn("Video play() failed — detection may not start until user interaction.");
-            });
-          }
-        }
-
-        // 2. Load MediaPipe WASM runtime
-        const vision = await FilesetResolver.forVisionTasks(VISION_CDN);
-
-        if (cancelled) return;
-
-        // 3. Helper: create detector with GPU→CPU fallback
-        async function createWithFallback<T>(
-          factory: (v: typeof vision, delegate: "GPU" | "CPU") => Promise<T>,
-        ): Promise<T> {
-          try {
-            return await factory(vision, "GPU");
-          } catch {
-            return await factory(vision, "CPU");
-          }
-        }
-
-        // 4. Load FaceDetector + GestureRecognizer in PARALLEL (both required)
-        const [faceDetector, gestureRecognizer] = await Promise.all([
-          createWithFallback((v, d) =>
-            FaceDetector.createFromOptions(v, {
-              baseOptions: {
-                modelAssetPath:
-                  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
-                delegate: d,
-              },
-              runningMode: "VIDEO",
-              minDetectionConfidence: 0.5,
-            }),
-          ),
-          createWithFallback((v, d) =>
-            GestureRecognizer.createFromOptions(v, {
-              baseOptions: {
-                modelAssetPath:
-                  "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
-                delegate: d,
-              },
-              runningMode: "VIDEO",
-              numHands: 2,
-              // Lowered (0.5 → 0.3) so partially-occluded hands at
-              // kiosk distance still register. False positives are
-              // tolerable here because gestures are advisory, not
-              // safety-critical.
-              minHandDetectionConfidence: 0.3,
-              minHandPresenceConfidence: 0.3,
-              minTrackingConfidence: 0.3,
-            }),
-          ),
-        ]);
-
-        if (cancelled) {
           faceDetector.close();
           gestureRecognizer.close();
           return;
@@ -317,6 +328,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       } catch (err) {
         if (!cancelled) {
           console.error("Vision detection init error:", err);
+          setIsReady(false);
           setError(
             err instanceof Error ? err.message : "Failed to initialize vision"
           );
@@ -335,6 +347,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       gestureRecognizerRef.current?.close();
       faceLandmarkerRef.current?.close();
       objectDetectorRef.current?.close();
+      console.error = origError;
     };
   }, [enabled]);
 
@@ -365,7 +378,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     lastVideoTimestampRef.current = safeNow;
 
     // Throttle detection to ~10fps for performance
-    if (now - lastDetectionTimeRef.current < DETECTION_INTERVAL_MS) {
+    const detectionInterval = isMobileRef.current
+      ? DETECTION_INTERVAL_MOBILE_MS
+      : DETECTION_INTERVAL_MS;
+    if (now - lastDetectionTimeRef.current < detectionInterval) {
       rafRef.current = requestAnimationFrame(detect);
       return;
     }
@@ -405,21 +421,33 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     if (hasFace !== stableFaceDetectedRef.current) {
       stableFaceDetectedRef.current = hasFace;
       setFaceDetected(hasFace);
+      lastFaceUiUpdateAtRef.current = safeNow;
     }
-    setFaceCount(hasFace ? Math.max(1, faces) : 0);
+    const nextFaceCount = hasFace ? Math.max(1, faces) : 0;
+    setFaceCount((prev) => (prev === nextFaceCount ? prev : nextFaceCount));
 
     if (hasFace) {
       if (faceStartRef.current === null) {
         faceStartRef.current = safeNow;
+        lastFaceUiUpdateAtRef.current = 0;
       }
-      setFacePresenceDurationMs(safeNow - faceStartRef.current);
+      if (safeNow - lastFaceUiUpdateAtRef.current >= FACE_UI_UPDATE_INTERVAL_MS) {
+        lastFaceUiUpdateAtRef.current = safeNow;
+        setFacePresenceDurationMs(safeNow - faceStartRef.current);
+      }
     } else {
       faceStartRef.current = null;
-      setFacePresenceDurationMs(0);
+      if (facePresenceDurationMs !== 0) {
+        setFacePresenceDurationMs(0);
+      }
     }
 
     // ── Smile Detection + Gender Detection (FaceLandmarker blendshapes + landmarks) ──
-    if (faceLandmarker && hasFace) {
+    const landmarkInterval = isMobileRef.current
+      ? LANDMARK_INTERVAL_MOBILE_MS
+      : LANDMARK_INTERVAL_MS;
+    if (faceLandmarker && hasFace && safeNow - lastLandmarkDetectionRef.current >= landmarkInterval) {
+      lastLandmarkDetectionRef.current = safeNow;
       try {
         const landmarkResult = faceLandmarker.detectForVideo(video, safeNow);
         if (landmarkResult?.faceBlendshapes?.[0]?.categories) {
@@ -430,7 +458,12 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
           const rawSmile = (smileL + smileR) / 2;
           // Smooth to avoid jitter
           smoothedSmileRef.current += (rawSmile - smoothedSmileRef.current) * 0.3;
-          setUserSmile(smoothedSmileRef.current);
+          if (
+            safeNow - lastSmileUiUpdateAtRef.current >= SMILE_UI_UPDATE_INTERVAL_MS
+          ) {
+            lastSmileUiUpdateAtRef.current = safeNow;
+            setUserSmile(smoothedSmileRef.current);
+          }
         }
 
         // ── Gender estimation from face landmark geometry ──
@@ -503,7 +536,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       }
     } else if (!hasFace) {
       smoothedSmileRef.current *= 0.85;
-      setUserSmile(smoothedSmileRef.current);
+      if (safeNow - lastSmileUiUpdateAtRef.current >= SMILE_UI_UPDATE_INTERVAL_MS) {
+        lastSmileUiUpdateAtRef.current = safeNow;
+        setUserSmile(smoothedSmileRef.current);
+      }
     }
 
     // ── Gesture Recognition ──
@@ -651,7 +687,9 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     }
 
     // ── Phone Detection (run at slower rate ~3fps to save CPU) ──
-    const HEAVY_INTERVAL = 333;
+    const HEAVY_INTERVAL = isMobileRef.current
+      ? OBJECT_DETECT_INTERVAL_MOBILE_MS
+      : OBJECT_DETECT_INTERVAL_MS;
     if (objectDetector && now - lastHeavyDetectionRef.current > HEAVY_INTERVAL) {
       lastHeavyDetectionRef.current = now;
       try {
@@ -688,7 +726,14 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       }
     }
 
-    setCurrentGestures(dedupeFrameGestures(frameGestures));
+    const nextGestures = dedupeFrameGestures(frameGestures);
+    const nextGestureKey = nextGestures
+      .map((g) => `${g.name}:${Math.round(g.confidence * 100)}`)
+      .join("|");
+    if (nextGestureKey !== lastGestureStateKeyRef.current) {
+      lastGestureStateKeyRef.current = nextGestureKey;
+      setCurrentGestures(nextGestures);
+    }
 
     rafRef.current = requestAnimationFrame(detect);
   }, []);
@@ -726,6 +771,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     faceMissStreakRef.current = 0;
     lastFaceSeenAtRef.current = 0;
     lastVideoTimestampRef.current = 0;
+    lastFaceUiUpdateAtRef.current = 0;
+    lastSmileUiUpdateAtRef.current = 0;
+    lastLandmarkDetectionRef.current = 0;
+    lastGestureStateKeyRef.current = "";
     setFacePresenceDurationMs(0);
     setFaceCount(0);
     setCurrentGestures([]);

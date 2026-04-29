@@ -904,6 +904,13 @@ function AvatarModel({
     [frameProfile.targetFps],
   );
   const frameAccumRef = useRef(0);
+  // Adaptive frame budget: start from the configured target and gently
+  // widen on sustained overload (e.g. low-end phones with active vision),
+  // then recover back when headroom returns. Keeps motion smooth by
+  // avoiding repeated over-budget spikes.
+  const adaptiveFrameMsRef = useRef(targetFrameMs);
+  const overBudgetStreakRef = useRef(0);
+  const underBudgetStreakRef = useRef(0);
   // Throttle the foot-clamp `updateMatrixWorld()` traversal — it walks
   // the entire skeleton and is the most expensive part of the loop.
   // Running it every other tick is imperceptible at 30fps but cuts
@@ -918,10 +925,29 @@ function AvatarModel({
   const footFloorOffsetRef = useRef(0);
 
   useFrame((_, delta) => {
+    const baseFrameMs = targetFrameMs;
+    const maxFrameMs = 1000 / 30; // never drop below 30fps pacing
+    const observedMs = delta * 1000;
+    if (observedMs > adaptiveFrameMsRef.current * 1.6) {
+      overBudgetStreakRef.current += 1;
+      underBudgetStreakRef.current = 0;
+      if (overBudgetStreakRef.current >= 12) {
+        adaptiveFrameMsRef.current = Math.min(maxFrameMs, adaptiveFrameMsRef.current + 2);
+        overBudgetStreakRef.current = 0;
+      }
+    } else if (observedMs < adaptiveFrameMsRef.current * 0.9) {
+      underBudgetStreakRef.current += 1;
+      overBudgetStreakRef.current = 0;
+      if (underBudgetStreakRef.current >= 60) {
+        adaptiveFrameMsRef.current = Math.max(baseFrameMs, adaptiveFrameMsRef.current - 1);
+        underBudgetStreakRef.current = 0;
+      }
+    }
+
     // Frame-rate cap (mid: 30fps, low: 24fps, high: 60fps). Skip
     // entirely when we haven't crossed the target frame budget.
     frameAccumRef.current += delta;
-    if (frameAccumRef.current * 1000 < targetFrameMs) return;
+    if (frameAccumRef.current * 1000 < adaptiveFrameMsRef.current) return;
     const stepDelta = frameAccumRef.current;
     frameAccumRef.current = 0;
     delta = stepDelta;
