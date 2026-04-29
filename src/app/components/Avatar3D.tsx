@@ -33,7 +33,7 @@ const AVATAR_URL = "/avatar.fbx";
 // `scripts/extract-clips.mjs` so mobile Safari does not have to download
 // and FBX-parse ~370 MB of dead weight before the first frame can render.
 // Smaller gesture FBX files (<1 MB) stay as-is — converting them is churn.
-const ANIM_IDLE_URL = "/animations/idle.fbx";
+const ANIM_IDLE_URL = "/animations/neutral-idle.fbx";
 const ANIM_SITTING_URL = "/animations/sitting-idle.clip.json";
 const ANIM_STANDING_URL = "/animations/standing.clip.json";
 const ANIM_STOPPING_URL = "/animations/stop-walking.clip.json";

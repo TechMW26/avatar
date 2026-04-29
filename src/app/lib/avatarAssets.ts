@@ -132,7 +132,7 @@ export interface AvatarAssetSpec {
 
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
   { path: "/avatar.fbx", estBytes: 74 * 1024 * 1024 },
-  { path: "/animations/idle.fbx", estBytes: 780_000 },
+  { path: "/animations/neutral-idle.fbx", estBytes: 870_000 },
   { path: "/animations/sitting-idle.clip.json", estBytes: 720_000 },
   { path: "/animations/standing.clip.json", estBytes: 360_000 },
   { path: "/animations/stop-walking.clip.json", estBytes: 390_000 },
