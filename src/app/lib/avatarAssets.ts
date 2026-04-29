@@ -26,6 +26,51 @@ const RAW_ASSET_BASE_URL =
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
 export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v5";
 
+let cachedRuntimeAssetCacheName: string | null = null;
+let cachePrunePromise: Promise<void> | null = null;
+
+/** Build-scoped cache key so each Vercel deployment gets a fresh bucket.
+ *  Falls back to the static cache name when build id isn't available. */
+function getRuntimeAssetCacheName(): string {
+  if (cachedRuntimeAssetCacheName) return cachedRuntimeAssetCacheName;
+  if (typeof window === "undefined") {
+    cachedRuntimeAssetCacheName = ASSET_CACHE_NAME;
+    return cachedRuntimeAssetCacheName;
+  }
+  const nextData = (window as unknown as { __NEXT_DATA__?: { buildId?: string } }).__NEXT_DATA__;
+  const rawBuildId = String(nextData?.buildId || "").trim();
+  if (!rawBuildId) {
+    cachedRuntimeAssetCacheName = ASSET_CACHE_NAME;
+    return cachedRuntimeAssetCacheName;
+  }
+  const safeBuildId = rawBuildId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  cachedRuntimeAssetCacheName = `${ASSET_CACHE_NAME}-${safeBuildId}`;
+  return cachedRuntimeAssetCacheName;
+}
+
+/** Ensure we only keep the active deployment's avatar cache. */
+export async function ensureFreshAssetCache(): Promise<string> {
+  const activeName = getRuntimeAssetCacheName();
+  if (typeof caches === "undefined") return activeName;
+  if (!cachePrunePromise) {
+    cachePrunePromise = (async () => {
+      try {
+        const keys = await caches.keys();
+        const stale = keys.filter(
+          (k) => k === ASSET_CACHE_NAME || (k.startsWith(`${ASSET_CACHE_NAME}-`) && k !== activeName),
+        );
+        if (stale.length) {
+          await Promise.all(stale.map((k) => caches.delete(k)));
+        }
+      } catch (err) {
+        console.warn("[avatarAssets] stale-cache prune failed (non-fatal):", err);
+      }
+    })();
+  }
+  await cachePrunePromise;
+  return activeName;
+}
+
 export function assetUrl(path: string): string {
   if (!ASSET_BASE_URL) return path;
   return `${ASSET_BASE_URL}/${path.replace(/^\//, "")}`;
@@ -401,7 +446,8 @@ export async function preloadAvatarAssets(
   let cache: Cache | null = null;
   if (typeof caches !== "undefined") {
     try {
-      cache = await caches.open(ASSET_CACHE_NAME);
+      const activeCacheName = await ensureFreshAssetCache();
+      cache = await caches.open(activeCacheName);
     } catch (err) {
       console.warn("[avatarAssets] caches.open failed (non-fatal):", err);
     }

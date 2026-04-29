@@ -1,4 +1,6 @@
-const CACHE_NAME = "rishi-sandipani-v1";
+const SW_BUILD = new URL(self.location.href).searchParams.get("b") || "dev";
+const CACHE_PREFIX = "rishi-sandipani-";
+const CACHE_NAME = `${CACHE_PREFIX}${SW_BUILD}`;
 const PRECACHE_URLS = ["/", "/talk"];
 
 const NO_CACHE_PATTERNS = [/\.glb/, /\.gltf/, /avatar/];
@@ -13,7 +15,11 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      Promise.all(
+        keys
+          .filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_NAME)
+          .map((k) => caches.delete(k)),
+      )
     )
   );
   self.clients.claim();

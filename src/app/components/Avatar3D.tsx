@@ -17,6 +17,7 @@ import {
   ASSET_BASE_URL,
   ASSET_CACHE_NAME,
   assetUrl,
+  ensureFreshAssetCache,
   getDeviceProfile,
   isAssetEnabled,
   isAssetMissing,
@@ -341,7 +342,8 @@ async function fetchAssetCached(path: string): Promise<ArrayBuffer> {
   const url = assetUrl(path);
   if (typeof caches !== "undefined") {
     try {
-      const cache = await caches.open(ASSET_CACHE_NAME);
+      const activeCacheName = await ensureFreshAssetCache();
+      const cache = await caches.open(activeCacheName);
       const hit = await cache.match(url);
       if (hit) return await hit.arrayBuffer();
       const resp = await fetch(url, { credentials: "omit" });

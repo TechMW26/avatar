@@ -50,7 +50,7 @@ export default function RootLayout({
         {children}
         <script
           dangerouslySetInnerHTML={{
-            __html: `if("serviceWorker" in navigator){window.addEventListener("load",()=>{navigator.serviceWorker.register("/sw.js")})}`,
+            __html: `if("serviceWorker"in navigator){window.addEventListener("load",()=>{const d=window.__NEXT_DATA__;const b=(d&&d.buildId)?String(d.buildId):"dev";navigator.serviceWorker.register('/sw.js?b='+encodeURIComponent(b))})}`,
           }}
         />
       </body>
