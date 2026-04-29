@@ -245,8 +245,8 @@ export function getDeviceProfile(): DeviceProfile {
     // stencil buffer enabled) preserve visual quality. The actual
     // performance levers below are what matters.
     tier: "high",
-    // Cap DPR at 1.5 so fragment workload stays bounded on mobile GPUs.
-    maxDpr: 1.5,
+    // Cap DPR to keep fragment workload bounded on low-end devices.
+    maxDpr: 1.3,
     // No MSAA — biggest single mobile-GPU memory tax. We rely on
     // high DPR for edge crispness instead (1px at 2x ≈ 0.5px,
     // visually equivalent to 2x MSAA at 1x DPR).
@@ -255,9 +255,8 @@ export function getDeviceProfile(): DeviceProfile {
     // texture upload, and per-fragment shadow sample. Avatar reads
     // fine with the soft ground disc removed.
     shadows: false,
-    // Anisotropy 4 keeps the beard/skin diffuse map crisp at
-    // oblique angles. Clamped to GPU max in onCreated.
-    anisotropy: 2,
+    // Lowest anisotropy keeps texture sampling cost minimal.
+    anisotropy: 1,
     // High-performance hint — picks discrete GPU on laptops, and the
     // perf-cluster on mobile SoCs.
     powerPreference: "high-performance",
@@ -275,9 +274,8 @@ export function getDeviceProfile(): DeviceProfile {
     // Single directional + ambient keeps skin readable while minimizing
     // per-fragment lighting cost.
     maxLights: 1,
-    // 45 fps target gives smoother perception than hard-30 while reducing
-    // sustained thermal pressure vs 60.
-    targetFps: 45,
+    // Force 30 fps pacing for stable thermals and lower battery drain.
+    targetFps: 30,
     // No environment reflections — PBR cubemap sampling is expensive
     // and the avatar's robe/skin are matte enough that reflections
     // add nothing visible.
@@ -286,8 +284,8 @@ export function getDeviceProfile(): DeviceProfile {
     // canvas texture upload, and the user explicitly asked to remove
     // shadowing entirely.
     enableGroundShadow: false,
-    // 2K cap avoids uploading oversized maps and keeps memory pressure low.
-    maxTextureSize: 2048,
+    // 1K cap substantially reduces texture memory and upload time.
+    maxTextureSize: 1024,
     // mediump materially reduces shader ALU pressure on budget phones.
     shaderPrecision: "mediump",
   };

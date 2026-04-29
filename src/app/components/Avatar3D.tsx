@@ -692,7 +692,8 @@ function AvatarModel({
             // GPUs whose max is often 4 or 8 anyway. Source from the
             // device profile so low/mid tiers get 1–2 instead.
             m.map.anisotropy = matProfile.anisotropy;
-            m.map.minFilter = THREE.LinearMipmapLinearFilter;
+            m.map.generateMipmaps = false;
+            m.map.minFilter = THREE.LinearFilter;
             m.map.magFilter = THREE.LinearFilter;
             // Downsample oversized diffuse textures on mobile. The
             // Meshy-baked skin maps ship as 2048² or 4096² which is
@@ -1608,6 +1609,63 @@ function SceneLights() {
   );
 }
 
+function DynamicDprController({ maxDpr }: { maxDpr: number }) {
+  const { setDpr } = useThree();
+  const emaFrameMsRef = useRef(16.7);
+  const overMsRef = useRef(0);
+  const underMsRef = useRef(0);
+  const lowQualityRef = useRef(false);
+
+  useEffect(() => {
+    const deviceDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const initial = Math.max(1, Math.min(maxDpr, deviceDpr));
+    setDpr(initial);
+  }, [maxDpr, setDpr]);
+
+  useFrame((_, delta) => {
+    const frameMs = Math.max(1, Math.min(200, delta * 1000));
+    // EMA smooths spike noise so quality changes only on sustained load.
+    emaFrameMsRef.current += (frameMs - emaFrameMsRef.current) * 0.12;
+    const ema = emaFrameMsRef.current;
+
+    const OVERLOAD_MS_THRESHOLD = 40; // roughly worse than 25fps
+    const RECOVERY_MS_THRESHOLD = 30; // at/above ~33fps sustained
+    const OVERLOAD_HOLD_MS = 2200;
+    const RECOVERY_HOLD_MS = 7000;
+
+    if (!lowQualityRef.current) {
+      if (ema > OVERLOAD_MS_THRESHOLD) {
+        overMsRef.current += frameMs;
+      } else {
+        overMsRef.current = Math.max(0, overMsRef.current - frameMs * 0.5);
+      }
+      if (overMsRef.current >= OVERLOAD_HOLD_MS) {
+        lowQualityRef.current = true;
+        overMsRef.current = 0;
+        underMsRef.current = 0;
+        setDpr(1);
+      }
+      return;
+    }
+
+    if (ema < RECOVERY_MS_THRESHOLD) {
+      underMsRef.current += frameMs;
+    } else {
+      underMsRef.current = Math.max(0, underMsRef.current - frameMs * 0.5);
+    }
+    if (underMsRef.current >= RECOVERY_HOLD_MS) {
+      const deviceDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+      const restored = Math.max(1, Math.min(maxDpr, deviceDpr));
+      lowQualityRef.current = false;
+      overMsRef.current = 0;
+      underMsRef.current = 0;
+      setDpr(restored);
+    }
+  });
+
+  return null;
+}
+
 /* ── Ground ──
    A soft circular shadow disc beneath the avatar so the feet have something
    to stand on visually. Rendered with a procedural radial-fade canvas so it
@@ -1841,6 +1899,7 @@ function DeviceTunedCanvas({
       }}
       style={{ background: "transparent", width: "100%", height: "100%" }}
     >
+      <DynamicDprController maxDpr={profile.maxDpr} />
       {children}
     </Canvas>
   );
