@@ -21,6 +21,7 @@ import {
   getDeviceProfile,
   isAssetEnabled,
   isAssetMissing,
+  resetAppSiteData,
 } from "../lib/avatarAssets";
 
 const AVATAR_URL = "/avatar.fbx";
@@ -32,7 +33,7 @@ const AVATAR_URL = "/avatar.fbx";
 // `scripts/extract-clips.mjs` so mobile Safari does not have to download
 // and FBX-parse ~370 MB of dead weight before the first frame can render.
 // Smaller gesture FBX files (<1 MB) stay as-is — converting them is churn.
-const ANIM_IDLE_URL = "/animations/breathing-idle.clip.json";
+const ANIM_IDLE_URL = "/animations/idle.fbx";
 const ANIM_SITTING_URL = "/animations/sitting-idle.clip.json";
 const ANIM_STANDING_URL = "/animations/standing.clip.json";
 const ANIM_STOPPING_URL = "/animations/stop-walking.clip.json";
@@ -134,6 +135,9 @@ const CAMERA_Z_NEAR = 5.7;
 const RETURN_TO_SIT_DELAY_MS = 3_000;
 // Required ms of consistent face presence/absence before changing pose.
 const FACE_DEBOUNCE_MS = 350;
+// Never replay the same gesture too quickly, even if a narrower trigger
+// cooldown would otherwise allow it.
+const SAME_GESTURE_COOLDOWN_MS = 4_500;
 
 /* ── Stage geometry ──
    The avatar's feet are anchored at y = 0 inside the local scene, so the
@@ -246,9 +250,7 @@ function remapClipToAvatarRig(
    *  prefix so the AnimationMixer can find the bone by name). */
   avatarBoneByStripped: Map<string, string>,
   /** When true, drop all tracks targeting the lower body (UpLeg/Leg/Foot/Toe).
-   *  Used for the breathing-idle clip so the legs stay planted in bind pose
-   *  while the upper body still breathes — fixes the visible left/right foot
-   *  sway that comes from Mixamo's hip-shifted breathing animation. */
+   *  Keep available for future upper-body-only idles. */
   lockLegs = false,
 ): THREE.AnimationClip | null {
   const tracks: THREE.KeyframeTrack[] = [];
@@ -334,12 +336,19 @@ function remapClipToAvatarRig(
 // changing one without the other will silently re-download every asset.
 void ASSET_BASE_URL;
 void ASSET_CACHE_NAME;
+let assetSiteDataResetPromise: Promise<void> | null = null;
 
 /** Fetch through Cache Storage so the second visit is instant.
  *  Falls back to a plain fetch when Cache Storage is unavailable
  *  (SSR, private mode, etc.). Returns an ArrayBuffer ready for FBXLoader.parse. */
 async function fetchAssetCached(path: string): Promise<ArrayBuffer> {
   const url = assetUrl(path);
+  if (!assetSiteDataResetPromise) {
+    assetSiteDataResetPromise = resetAppSiteData().catch(() => {
+      // Keep fetch path resilient if storage reset fails in restricted modes.
+    });
+  }
+  await assetSiteDataResetPromise;
   if (typeof caches !== "undefined") {
     try {
       const activeCacheName = await ensureFreshAssetCache();
@@ -656,9 +665,34 @@ function AvatarModel({
         if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) {
           (mesh as THREE.SkinnedMesh).normalizeSkinWeights();
         }
-        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-        mats.forEach((mat) => {
-          const m = mat as THREE.MeshStandardMaterial;
+        const mats = Array.isArray(mesh.material) ? [...mesh.material] : [mesh.material];
+        mats.forEach((mat, materialIndex) => {
+          const source = mat as THREE.MeshStandardMaterial;
+          const hasMorphTargets = Boolean((mesh as THREE.Mesh).morphTargetInfluences?.length);
+          const m = new THREE.MeshLambertMaterial({
+            name: source.name,
+            color: source.color?.clone?.() ?? new THREE.Color(0xffffff),
+            map: source.map ?? null,
+            emissive: new THREE.Color(0x000000),
+            transparent: source.transparent ?? false,
+            opacity: source.opacity ?? 1,
+            alphaTest: source.alphaTest ?? 0,
+            side: source.side ?? THREE.FrontSide,
+            fog: source.fog ?? true,
+          });
+          const fastMaterial = m as THREE.MeshLambertMaterial & {
+            skinning: boolean;
+            morphTargets?: boolean;
+          };
+          fastMaterial.skinning = (mesh as THREE.SkinnedMesh).isSkinnedMesh;
+          fastMaterial.morphTargets = hasMorphTargets;
+          m.depthWrite = source.depthWrite;
+          m.depthTest = source.depthTest;
+          m.vertexColors = source.vertexColors;
+          m.toneMapped = source.toneMapped;
+          mats[materialIndex] = m;
+          source.dispose?.();
+
           if (m.map) {
             m.map.colorSpace = THREE.SRGBColorSpace;
             // Anisotropy used to be hardcoded at 16 — disastrous on mobile
@@ -684,53 +718,12 @@ function AvatarModel({
             m.emissiveMap = null;
           }
           m.emissive = new THREE.Color(0x000000);
-          // NormalMap fragment cost is significant on mobile. Drop it
-          // entirely on mid/low — the avatar still reads well because
-          // most surface detail comes from the diffuse map.
-          if (m.normalMap) {
-            if (matProfile.enableNormalMap) {
-              m.normalScale = new THREE.Vector2(1.2, 1.2);
-              m.normalMap.anisotropy = matProfile.anisotropy;
-              m.normalMap.needsUpdate = true;
-            } else {
-              m.normalMap.dispose?.();
-              m.normalMap = null;
-            }
-          }
-          // Roughness map sampling is also pricey. Lift the floor and
-          // strip the map on mid/low so the shader uses the scalar.
-          if (!matProfile.enableNormalMap && m.roughnessMap) {
-            m.roughnessMap.dispose?.();
-            m.roughnessMap = null;
-          }
-          if (!matProfile.enableNormalMap && m.metalnessMap) {
-            m.metalnessMap.dispose?.();
-            m.metalnessMap = null;
-          }
-          // AO map is yet another texture sample per fragment we can
-          // skip on mobile — the avatar is rim-lit, not crevice-lit.
-          if (!matProfile.enableNormalMap && m.aoMap) {
-            m.aoMap.dispose?.();
-            m.aoMap = null;
-          }
-          m.roughness = Math.max(m.roughness ?? 0.5, 0.45);
-          // Force-disable env reflections on mobile / low tier. When
-          // envMapIntensity is 0 three.js still does the reflection
-          // sample if envMap is set, so null the map too.
-          if (matProfile.enableEnvReflections) {
-            m.envMapIntensity = 0.4;
-          } else {
-            m.envMapIntensity = 0;
-            m.envMap = null;
-            // Force metalness to zero so the lit shader path skips the
-            // Fresnel + reflection terms entirely.
-            m.metalness = 0;
-          }
           // Avatar is a closed mesh — back-faces are never visible. Use
           // FrontSide on mid/low to roughly halve fragment shader work.
           m.side = matProfile.doubleSide ? THREE.DoubleSide : THREE.FrontSide;
           m.needsUpdate = true;
         });
+        mesh.material = Array.isArray(mesh.material) ? mats : mats[0];
         mesh.frustumCulled = false;
       }
       if ((obj as THREE.Bone).isBone) {
@@ -798,10 +791,8 @@ function AvatarModel({
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
       const clip = sourceClips[key];
       if (!clip) return;
-      // Only the breathing-idle clip locks legs — every other clip needs
-      // its full lower-body motion (walking, sitting cross-leg, gestures
-      // that shift weight, etc.).
-      const lockLegs = key === "idle_standing";
+      // The custom standing idle should play as-authored.
+      const lockLegs = false;
       const mapped = remapClipToAvatarRig(clip, avatarBoneByStripped, lockLegs);
       if (!mapped) return;
       const action = mixer.clipAction(mapped, scene);
@@ -997,7 +988,9 @@ function AvatarModel({
           // off-screen for the last ~25% of the clip so the climb beat
           // lands before the falling state takes over.
           const CLIMB_LIFT_MAX = 4.0;
-          yBias = CLIMB_LIFT_MAX * ss(0, 0.55, p);
+          // Reach the off-screen top slightly earlier and hold a bit
+          // longer so the climb beat is readable before the fall starts.
+          yBias = CLIMB_LIFT_MAX * ss(0, 0.5, p);
         }
       } else if (state === "falling") {
         const fa = actions.falling;
@@ -1012,7 +1005,10 @@ function AvatarModel({
             return t * t * (3 - 2 * t);
           };
           const FALL_FROM = 4.0;
-          yBias = FALL_FROM * (1 - ss(0, 0.75, p));
+          // Hold at the top briefly (anticipation), then descend and
+          // finish most of the drop by ~90% so the clip's final beat is
+          // the landing settle near ground.
+          yBias = FALL_FROM * (1 - ss(0.12, 0.9, p));
         }
       }
       const tgtY = GROUND_Y + yBias - footFloorOffsetRef.current;
@@ -1186,9 +1182,11 @@ function AvatarModel({
       if (faceNow) {
         noFaceSinceRef.current = null;
         const wantsPray =
-          gestureRef.current === "Namaste" && now - lastPrayAtRef.current > 1200;
+          gestureRef.current === "Namaste" &&
+          now - lastPrayAtRef.current > Math.max(1200, SAME_GESTURE_COOLDOWN_MS);
         const wantsWave =
-          gestureRef.current === "Open_Palm" && now - lastWaveAtRef.current > 2500;
+          gestureRef.current === "Open_Palm" &&
+          now - lastWaveAtRef.current > Math.max(2500, SAME_GESTURE_COOLDOWN_MS);
         if (wantsPray && actions.praying) {
           lastPrayAtRef.current = now;
           goTo("praying", THREE.LoopOnce, true, 0.4);
@@ -1205,7 +1203,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "explaining" &&
             actions.explaining &&
-            now - lastExplainAtRef.current > 3_500
+            now - lastExplainAtRef.current > Math.max(3_500, SAME_GESTURE_COOLDOWN_MS)
           ) {
             lastAiNonceRef.current = ai.nonce;
             lastExplainAtRef.current = now;
@@ -1215,7 +1213,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "yelling" &&
             actions.yelling &&
-            now - lastYellAtRef.current > 20_000
+            now - lastYellAtRef.current > Math.max(20_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Rare "shoo them away" gesture. Snap-in (short fade) so the
             // motion lands aggressively, then return to idle.
@@ -1227,7 +1225,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "shooting_arrow" &&
             actions.shooting_arrow &&
-            now - lastShootAtRef.current > 6_000
+            now - lastShootAtRef.current > Math.max(6_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Bow-and-arrow / Dhanurveda / Arjuna references.
             lastAiNonceRef.current = ai.nonce;
@@ -1238,7 +1236,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "dismissing" &&
             actions.dismissing &&
-            now - lastDismissAtRef.current > 5_000
+            now - lastDismissAtRef.current > Math.max(5_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Refusing / letting go / brushing aside doubts.
             lastAiNonceRef.current = ai.nonce;
@@ -1249,7 +1247,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "thoughtful" &&
             actions.thoughtful &&
-            now - lastThoughtfulAtRef.current > 5_000
+            now - lastThoughtfulAtRef.current > Math.max(5_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Deep contemplation / pondering / reflective questions.
             lastAiNonceRef.current = ai.nonce;
@@ -1260,7 +1258,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "pointing" &&
             actions.pointing &&
-            now - lastPointAtRef.current > 4_000
+            now - lastPointAtRef.current > Math.max(4_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Calling out / directing attention / "look there".
             lastAiNonceRef.current = ai.nonce;
@@ -1271,7 +1269,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "sword_fight" &&
             actions.sword_fight &&
-            now - lastSwordAtRef.current > 8_000
+            now - lastSwordAtRef.current > Math.max(8_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Mahabharata war / Kshatriya valor / sword imagery.
             lastAiNonceRef.current = ai.nonce;
@@ -1282,7 +1280,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "climbing" &&
             actions.climbing &&
-            now - lastClimbAtRef.current > 8_000
+            now - lastClimbAtRef.current > Math.max(8_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Effort / striving / ascending toward higher knowledge.
             lastAiNonceRef.current = ai.nonce;
@@ -1293,7 +1291,7 @@ function AvatarModel({
             ai.nonce !== lastAiNonceRef.current &&
             ai.name === "left_turn" &&
             actions.left_turn &&
-            now - lastLeftTurnAtRef.current > 6_000
+            now - lastLeftTurnAtRef.current > Math.max(6_000, SAME_GESTURE_COOLDOWN_MS)
           ) {
             // Looking aside / changing topic / glancing toward an idea.
             lastAiNonceRef.current = ai.nonce;
@@ -1463,13 +1461,15 @@ function AvatarModel({
       }
     } else if (state === "climbing") {
       const action = actions.climbing;
-      const done = !action || action.time >= action.getClip().duration - 0.1;
+      const done = !action || action.time / Math.max(0.001, action.getClip().duration) >= 0.98;
       if (done) {
         // The sage finished climbing fully out of frame — drop straight
         // into the falling-to-landing clip so he descends back onto the
         // ground rather than just popping back into view.
         if (actions.falling) {
-          goTo("falling", THREE.LoopOnce, true, 0.0);
+          // Small non-zero cross-fade aligns the visual handoff better
+          // than a hard 0s cut on variable frame-time devices.
+          goTo("falling", THREE.LoopOnce, true, 0.12);
         } else if (attractModeRef.current) {
           // Falling clip never loaded (low-tier device skipped it) —
           // fall back to the original close-out so we don't strand him
@@ -1481,7 +1481,7 @@ function AvatarModel({
       }
     } else if (state === "falling") {
       const action = actions.falling;
-      const done = !action || action.time >= action.getClip().duration - 0.1;
+      const done = !action || action.time / Math.max(0.001, action.getClip().duration) >= 0.96;
       if (done) {
         if (attractModeRef.current) {
           // Continue the attract close-out (turn → walk back → sit).

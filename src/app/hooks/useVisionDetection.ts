@@ -59,7 +59,7 @@ export interface VisionState {
 }
 
 const VISION_CDN =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm";
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/wasm";
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const DETECTION_INTERVAL_MS = 100; // run detection every 100ms (~10fps detection)
@@ -73,6 +73,15 @@ const OBJECT_DETECT_INTERVAL_MOBILE_MS = 900;
 const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
 const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
 const FACE_LOSS_GRACE_MS = 700; // short grace window smooths mobile jitter
+const FACE_WORKER_STALE_MS = 1200;
+const NAMASTE_ACQUIRE_FRAMES = 3;
+const NAMASTE_HOLD_MS = 900;
+const NAMASTE_RETRIGGER_MS = 6500;
+const FACE_WORKER_MODE_KEY = "rishi:vision:face-worker-mode";
+const FACE_WORKER_FAIL_COUNT_KEY = "rishi:vision:face-worker-fail-count";
+const FACE_WORKER_DISABLE_UNTIL_KEY = "rishi:vision:face-worker-disable-until";
+const FACE_WORKER_FAILS_BEFORE_DISABLE = 2;
+const FACE_WORKER_DISABLE_MS = 24 * 60 * 60 * 1000;
 
 function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
   const byName = new Map<string, GestureInfo>();
@@ -89,6 +98,12 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   const enabled = options?.enabled ?? true;
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
+  const faceWorkerRef = useRef<Worker | null>(null);
+  const faceWorkerReadyRef = useRef(false);
+  const faceWorkerInFlightRef = useRef(false);
+  const faceWorkerCountRef = useRef(0);
+  const faceWorkerLastTsRef = useRef(0);
+  const faceWorkerEnabledRef = useRef(false);
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
   const gestureRecognizerRef = useRef<GestureRecognizer | null>(null);
   const objectDetectorRef = useRef<ObjectDetector | null>(null);
@@ -130,6 +145,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   const [currentGestures, setCurrentGestures] = useState<GestureInfo[]>([]);
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   const [gestureHistory, setGestureHistory] = useState<GestureInfo[]>([]);
+  const namasteSeenStreakRef = useRef(0);
+  const namasteMissStreakRef = useRef(0);
+  const namasteHoldUntilRef = useRef(0);
+  const lastNamasteEmitAtRef = useRef(0);
 
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -138,6 +157,26 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
+
+    const readStoredNumber = (key: string): number => {
+      if (typeof window === "undefined") return 0;
+      const raw = window.localStorage.getItem(key);
+      const parsed = Number(raw || 0);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const writeStoredNumber = (key: string, value: number) => {
+      if (typeof window === "undefined") return;
+      window.localStorage.setItem(key, String(value));
+    };
+    const setWorkerMode = (mode: "auto" | "fallback") => {
+      if (typeof window === "undefined") return;
+      window.localStorage.setItem(FACE_WORKER_MODE_KEY, mode);
+    };
+    const getWorkerMode = (): "auto" | "fallback" => {
+      if (typeof window === "undefined") return "auto";
+      const raw = window.localStorage.getItem(FACE_WORKER_MODE_KEY);
+      return raw === "fallback" ? "fallback" : "auto";
+    };
 
     // Suppress noisy TensorFlow Lite INFO messages that MediaPipe logs via console.error
     const origError = console.error;
@@ -148,6 +187,98 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
 
     async function init() {
       try {
+        // Spin up a dedicated worker for face inference. Keep a fallback
+        // detector on the main thread if worker init fails.
+        const faceWorkerTask = (async (): Promise<boolean> => {
+          const disableUntil = readStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY);
+          const mode = getWorkerMode();
+          if (mode === "fallback" || Date.now() < disableUntil) {
+            return false;
+          }
+          if (typeof Worker === "undefined" || typeof createImageBitmap === "undefined") {
+            return false;
+          }
+          try {
+            const worker = new Worker("/face-detector-worker.js", { type: "module" });
+            faceWorkerRef.current = worker;
+            const ready = await new Promise<boolean>((resolve) => {
+              let settled = false;
+              const finish = (value: boolean) => {
+                if (settled) return;
+                settled = true;
+                window.clearTimeout(timeout);
+                resolve(value);
+              };
+              const timeout = window.setTimeout(() => finish(false), 4_000);
+              worker.onmessage = (event: MessageEvent<{ type: string; stage?: string; count?: number; ts?: number }>) => {
+                const msg = event.data;
+                if (!msg || typeof msg !== "object") return;
+                if (msg.type === "ready") {
+                  faceWorkerReadyRef.current = true;
+                  faceWorkerEnabledRef.current = true;
+                  writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, 0);
+                  writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, 0);
+                  setWorkerMode("auto");
+                  finish(true);
+                  return;
+                }
+                if (msg.type === "result") {
+                  faceWorkerInFlightRef.current = false;
+                  faceWorkerCountRef.current = Number(msg.count ?? 0);
+                  faceWorkerLastTsRef.current = Number(msg.ts ?? performance.now());
+                  return;
+                }
+                if (msg.type === "error") {
+                  faceWorkerInFlightRef.current = false;
+                  // Init failure should not sit until timeout; fail fast so
+                  // main-thread fallback starts immediately.
+                  if (msg.stage === "init") {
+                    faceWorkerReadyRef.current = false;
+                    faceWorkerEnabledRef.current = false;
+                    finish(false);
+                  }
+                }
+              };
+              worker.onerror = () => {
+                faceWorkerReadyRef.current = false;
+                faceWorkerEnabledRef.current = false;
+                finish(false);
+              };
+              worker.postMessage({
+                type: "init",
+                wasmRoot: VISION_CDN,
+                modelAssetPath:
+                  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+                minDetectionConfidence: 0.5,
+              });
+            });
+            if (!ready) {
+              const failCount = readStoredNumber(FACE_WORKER_FAIL_COUNT_KEY) + 1;
+              writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, failCount);
+              if (failCount >= FACE_WORKER_FAILS_BEFORE_DISABLE) {
+                writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, Date.now() + FACE_WORKER_DISABLE_MS);
+                setWorkerMode("fallback");
+              }
+              try { worker.terminate(); } catch {}
+              faceWorkerRef.current = null;
+              faceWorkerReadyRef.current = false;
+              faceWorkerEnabledRef.current = false;
+            }
+            return ready;
+          } catch {
+            const failCount = readStoredNumber(FACE_WORKER_FAIL_COUNT_KEY) + 1;
+            writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, failCount);
+            if (failCount >= FACE_WORKER_FAILS_BEFORE_DISABLE) {
+              writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, Date.now() + FACE_WORKER_DISABLE_MS);
+              setWorkerMode("fallback");
+            }
+            faceWorkerRef.current = null;
+            faceWorkerReadyRef.current = false;
+            faceWorkerEnabledRef.current = false;
+            return false;
+          }
+        })();
+
         // 1) Warm camera and 2) load MediaPipe models concurrently so
         // startup doesn't pay both latencies serially on mobile.
         const streamTask = (async (): Promise<MediaStream> => {
@@ -237,8 +368,15 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
             }
           }
 
-          const [faceDetector, gestureRecognizer] = await Promise.all([
-            createWithFallback((v, d) =>
+          const workerReadyFast = await Promise.race<boolean>([
+            faceWorkerTask,
+            new Promise<boolean>((resolve) => {
+              window.setTimeout(() => resolve(false), 1_250);
+            }),
+          ]);
+          let faceDetector: FaceDetector | null = null;
+          if (!workerReadyFast) {
+            faceDetector = await createWithFallback((v, d) =>
               FaceDetector.createFromOptions(v, {
                 baseOptions: {
                   modelAssetPath:
@@ -248,40 +386,61 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
                 runningMode: "VIDEO",
                 minDetectionConfidence: 0.5,
               }),
-            ),
-            createWithFallback((v, d) =>
-              GestureRecognizer.createFromOptions(v, {
-                baseOptions: {
-                  modelAssetPath:
-                    "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
-                  delegate: d,
-                },
-                runningMode: "VIDEO",
-                numHands: 2,
-                minHandDetectionConfidence: 0.3,
-                minHandPresenceConfidence: 0.3,
-                minTrackingConfidence: 0.3,
-              }),
-            ),
-          ]);
-          return { vision, createWithFallback, faceDetector, gestureRecognizer };
+            );
+            if (typeof window !== "undefined") {
+              // Fallback proved healthy; keep it as primary to avoid repeated
+              // worker startup churn on devices where worker init is flaky.
+              window.localStorage.setItem(FACE_WORKER_MODE_KEY, "fallback");
+              window.localStorage.setItem(FACE_WORKER_FAIL_COUNT_KEY, "0");
+              window.localStorage.setItem(FACE_WORKER_DISABLE_UNTIL_KEY, "0");
+            }
+          }
+
+          // Load gestures in the background so "vision ready" is not
+          // blocked by the larger hand model init path.
+          const gestureRecognizerTask = createWithFallback((v, d) =>
+            GestureRecognizer.createFromOptions(v, {
+              baseOptions: {
+                modelAssetPath:
+                  "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+                delegate: d,
+              },
+              runningMode: "VIDEO",
+              numHands: 2,
+              minHandDetectionConfidence: 0.3,
+              minHandPresenceConfidence: 0.3,
+              minTrackingConfidence: 0.3,
+            }),
+          ).catch((err) => {
+            console.warn("GestureRecognizer init failed (gesture detection disabled):", err);
+            return null;
+          });
+
+          return { vision, createWithFallback, faceDetector, gestureRecognizerTask };
         })();
 
         const [stream, modelBundle] = await Promise.all([streamTask, modelTask]);
-        const { vision, createWithFallback, faceDetector, gestureRecognizer } = modelBundle;
+        const { vision, createWithFallback, faceDetector, gestureRecognizerTask } = modelBundle;
 
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
-          faceDetector.close();
-          gestureRecognizer.close();
+          faceDetector?.close();
+          void gestureRecognizerTask.then((g) => g?.close?.()).catch(() => {});
           return;
         }
 
         faceDetectorRef.current = faceDetector;
-        gestureRecognizerRef.current = gestureRecognizer;
-
-        // ── Mark ready NOW so camera + face/gesture detection starts immediately ──
+        // ── Mark ready as soon as camera + face detector are available. ──
         setIsReady(true);
+
+        void gestureRecognizerTask.then((gestureRecognizer) => {
+          if (!gestureRecognizer) return;
+          if (cancelled) {
+            gestureRecognizer.close();
+            return;
+          }
+          gestureRecognizerRef.current = gestureRecognizer;
+        });
 
         // 5. Load FaceLandmarker + ObjectDetector lazily in background (optional, non-blocking)
         Promise.all([
@@ -344,6 +503,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       streamRef.current?.getTracks().forEach((t) => t.stop());
       faceDetectorRef.current?.close();
+      try { faceWorkerRef.current?.terminate(); } catch {}
+      faceWorkerRef.current = null;
+      faceWorkerReadyRef.current = false;
+      faceWorkerEnabledRef.current = false;
       gestureRecognizerRef.current?.close();
       faceLandmarkerRef.current?.close();
       objectDetectorRef.current?.close();
@@ -355,14 +518,14 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   const detect = useCallback(() => {
     const video = videoRef.current;
     const faceDetector = faceDetectorRef.current;
+    const faceWorker = faceWorkerRef.current;
     const gestureRecognizer = gestureRecognizerRef.current;
     const faceLandmarker = faceLandmarkerRef.current;
     const objectDetector = objectDetectorRef.current;
 
     if (
       !video ||
-      !faceDetector ||
-      !gestureRecognizer ||
+      (!faceWorkerReadyRef.current && !faceDetector) ||
       video.readyState < 2
     ) {
       rafRef.current = requestAnimationFrame(detect);
@@ -388,14 +551,32 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     lastDetectionTimeRef.current = now;
 
     // ── Face Detection ──
-    let faceResult: FaceDetectorResult | null = null;
-    try {
-      faceResult = faceDetector.detectForVideo(video, safeNow);
-    } catch {
-      // MediaPipe can throw on timestamp issues; skip frame
+    let faces = 0;
+    if (faceWorkerReadyRef.current && faceWorker) {
+      // Keep exactly one worker inference in flight to avoid queue buildup.
+      if (!faceWorkerInFlightRef.current) {
+        faceWorkerInFlightRef.current = true;
+        createImageBitmap(video)
+          .then((bitmap) => {
+            faceWorker.postMessage({ type: "detect", imageBitmap: bitmap, ts: safeNow }, [bitmap]);
+          })
+          .catch(() => {
+            faceWorkerInFlightRef.current = false;
+          });
+      }
+      if (safeNow - faceWorkerLastTsRef.current <= FACE_WORKER_STALE_MS) {
+        faces = faceWorkerCountRef.current;
+      }
+    } else if (faceDetector) {
+      let faceResult: FaceDetectorResult | null = null;
+      try {
+        faceResult = faceDetector.detectForVideo(video, safeNow);
+      } catch {
+        // MediaPipe can throw on timestamp issues; skip frame
+      }
+      faces = faceResult?.detections?.length ?? 0;
     }
 
-    const faces = faceResult?.detections?.length ?? 0;
     const hasFaceRaw = faces > 0;
     if (hasFaceRaw) {
       faceSeenStreakRef.current += 1;
@@ -544,10 +725,12 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
 
     // ── Gesture Recognition ──
     let gestureResult: GestureRecognizerResult | null = null;
-    try {
-      gestureResult = gestureRecognizer.recognizeForVideo(video, safeNow);
-    } catch {
-      // skip frame
+    if (gestureRecognizer) {
+      try {
+        gestureResult = gestureRecognizer.recognizeForVideo(video, safeNow);
+      } catch {
+        // skip frame
+      }
     }
 
     // ── Namaste Detection from hand landmarks ──
@@ -562,7 +745,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     //       to the camera (the other hand is hidden behind it). Accept a
     //       centered, upright hand with extended fingers as namaste so the
     //       interaction never feels broken.
-    let namasteDetected = false;
+    let namasteDetectedRaw = false;
     if (gestureResult?.landmarks && gestureResult.landmarks.length >= 2) {
       const hand0 = gestureResult.landmarks[0];
       const hand1 = gestureResult.landmarks[1];
@@ -574,57 +757,45 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       const tipDist = Math.sqrt((mid0.x - mid1.x) ** 2 + (mid0.y - mid1.y) ** 2);
       // Pointing up = middle fingertip y noticeably above wrist (y axis is
       // inverted in normalized image coords).
-      const fingersUp0 = mid0.y < wrist0.y;
-      const fingersUp1 = mid1.y < wrist1.y;
-      const wristsAligned = Math.abs(wrist0.y - wrist1.y) < 0.30;
+      const fingersUp0 = mid0.y < wrist0.y - 0.05;
+      const fingersUp1 = mid1.y < wrist1.y - 0.05;
+      const wristsAligned = Math.abs(wrist0.y - wrist1.y) < 0.14;
+      const palmsCentered = (wrist0.x + wrist1.x) / 2 > 0.22 && (wrist0.x + wrist1.x) / 2 < 0.78;
 
-      // Widened thresholds (was 0.45 / 0.30 / 0.55) — palm-together
-      // namaste is hard to land precisely from a kiosk distance.
-      const caseA = wristDist < 0.60 && fingersUp0 && fingersUp1;
-      const caseB = tipDist < 0.45 && fingersUp0 && fingersUp1;
-      const caseC = wristsAligned && fingersUp0 && fingersUp1 && wristDist < 0.75;
-      if (caseA || caseB || caseC) {
-        namasteDetected = true;
+      // Prefer opposite hands for true palm-join posture when handedness
+      // metadata is available.
+      let oppositeHands = true;
+      const handedness = (gestureResult as { handedness?: Array<Array<{ categoryName?: string; score?: number }>> }).handedness;
+      if (Array.isArray(handedness) && handedness.length >= 2) {
+        const h0 = handedness[0]?.[0];
+        const h1 = handedness[1]?.[0];
+        const n0 = h0?.categoryName ?? "";
+        const n1 = h1?.categoryName ?? "";
+        const s0 = h0?.score ?? 0;
+        const s1 = h1?.score ?? 0;
+        oppositeHands = n0 !== "" && n1 !== "" && n0 !== n1 && s0 > 0.45 && s1 > 0.45;
       }
-    } else if (gestureResult?.landmarks && gestureResult.landmarks.length === 1) {
-      // Case D: single-hand namaste fallback. INTENTIONALLY STRICT — a
-      // permissive single-hand check would gobble every Open_Palm /
-      // Pointing_Up / ILoveYou frame because we suppress all other
-      // gestures whenever Namaste is set. Require:
-      //   * The hand to be centered horizontally,
-      //   * All four non-thumb fingertips tightly aligned vertically
-      //     (i.e. flat palm pointing straight up, not splayed),
-      //   * All those tips meaningfully above the wrist,
-      //   * The MediaPipe gesture classifier to NOT have already labelled
-      //     this hand as a different known gesture (Open_Palm, Victory,
-      //     Pointing_Up, Thumb_Up/Down, ILoveYou, Closed_Fist).
-      const topCat = gestureResult.gestures?.[0]?.[0];
-      const claimedByOther =
-        topCat &&
-        topCat.score > 0.5 &&
-        topCat.categoryName !== "None" &&
-        topCat.categoryName !== "Namaste";
-      if (!claimedByOther) {
-        const hand = gestureResult.landmarks[0];
-        const wrist = hand[0];
-        const indexTip = hand[8];
-        const midTip = hand[12];
-        const ringTip = hand[16];
-        const pinkyTip = hand[20];
-        const centered = wrist.x > 0.25 && wrist.x < 0.75;
-        const tipsXs = [indexTip.x, midTip.x, ringTip.x, pinkyTip.x];
-        const tipsXSpread = Math.max(...tipsXs) - Math.min(...tipsXs);
-        const tipsAligned = tipsXSpread < 0.06; // narrow, parallel fingers
-        const allAboveWrist =
-          wrist.y - indexTip.y > 0.18 &&
-          wrist.y - midTip.y > 0.20 &&
-          wrist.y - ringTip.y > 0.18 &&
-          wrist.y - pinkyTip.y > 0.14;
-        if (centered && tipsAligned && allAboveWrist) {
-          namasteDetected = true;
-        }
+
+      // Tight thresholds reduce accidental Namaste from generic open-palms.
+      const caseA = wristDist < 0.42 && tipDist < 0.26 && fingersUp0 && fingersUp1;
+      const caseB = wristsAligned && wristDist < 0.46 && tipDist < 0.32 && fingersUp0 && fingersUp1;
+      const caseC = wristDist < 0.36 && fingersUp0 && fingersUp1;
+      if (caseA || caseB || caseC) {
+        namasteDetectedRaw = palmsCentered && oppositeHands;
       }
     }
+
+    if (namasteDetectedRaw) {
+      namasteSeenStreakRef.current += 1;
+      namasteMissStreakRef.current = 0;
+      if (namasteSeenStreakRef.current >= NAMASTE_ACQUIRE_FRAMES) {
+        namasteHoldUntilRef.current = safeNow + NAMASTE_HOLD_MS;
+      }
+    } else {
+      namasteSeenStreakRef.current = 0;
+      namasteMissStreakRef.current += 1;
+    }
+    const namasteDetected = safeNow <= namasteHoldUntilRef.current;
 
     const frameGestures: GestureInfo[] = [];
 
@@ -633,18 +804,22 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       const namasteInfo: GestureInfo = {
         name: "Namaste",
         label: GESTURE_LABELS["Namaste"],
-        confidence: 0.9,
+        confidence: 0.95,
         timestamp: Date.now(),
       };
       frameGestures.push(namasteInfo);
       const history = gestureHistoryRef.current;
-      const isDup = history.some(g => g.name === "Namaste" && Date.now() - g.timestamp < GESTURE_DEDUP_MS);
+      const nowMs = Date.now();
+      const isDup = history.some(g => g.name === "Namaste" && nowMs - g.timestamp < GESTURE_DEDUP_MS);
       if (!isDup) {
-        gestureHistoryRef.current = [
-          ...history.filter(g => Date.now() - g.timestamp < GESTURE_HISTORY_TTL),
-          namasteInfo,
-        ];
-        setGestureHistory([...gestureHistoryRef.current]);
+        if (nowMs - lastNamasteEmitAtRef.current >= NAMASTE_RETRIGGER_MS) {
+          lastNamasteEmitAtRef.current = nowMs;
+          gestureHistoryRef.current = [
+            ...history.filter(g => nowMs - g.timestamp < GESTURE_HISTORY_TTL),
+            namasteInfo,
+          ];
+          setGestureHistory([...gestureHistoryRef.current]);
+        }
       }
     }
 
@@ -755,6 +930,13 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     streamRef.current = null;
     faceDetectorRef.current?.close();
     faceDetectorRef.current = null;
+    try { faceWorkerRef.current?.terminate(); } catch {}
+    faceWorkerRef.current = null;
+    faceWorkerReadyRef.current = false;
+    faceWorkerEnabledRef.current = false;
+    faceWorkerInFlightRef.current = false;
+    faceWorkerCountRef.current = 0;
+    faceWorkerLastTsRef.current = 0;
     gestureRecognizerRef.current?.close();
     gestureRecognizerRef.current = null;
     faceLandmarkerRef.current?.close();
@@ -775,6 +957,10 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     lastSmileUiUpdateAtRef.current = 0;
     lastLandmarkDetectionRef.current = 0;
     lastGestureStateKeyRef.current = "";
+    namasteSeenStreakRef.current = 0;
+    namasteMissStreakRef.current = 0;
+    namasteHoldUntilRef.current = 0;
+    lastNamasteEmitAtRef.current = 0;
     setFacePresenceDurationMs(0);
     setFaceCount(0);
     setCurrentGestures([]);

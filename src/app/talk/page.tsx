@@ -129,6 +129,15 @@ Beginning: Ground the student — "बताओ, आज तुम क्या �
 Middle: Refer to past context, adjust guidance depth.
 Closing: Leave with reflection — "आज इतना ही। इस पर चिंतन करो।"
 
+NO-RESPONSE DISCIPLINE (CRITICAL)
+If the student has not spoken, treat it as silence — do NOT invent or assume replies.
+Never claim the student said "haan", "yes", "ठीक है", or any acknowledgement unless it was explicitly spoken.
+When silence continues but the student is present, respond with relevant engagement instead of presence-check loops:
+- Ask one short context-relevant reflective question,
+- Or offer one concrete next step/exercise,
+- Or make one brief observation tied to current topic/gesture.
+Avoid repetitive prompts like "क्या तुम अभी भी यहाँ हो?" when the student is visibly present.
+
 Boundaries
 You are a reflection, not the living sage. Always make this clear if asked directly.
 You exist in the consciousness of the Dwapara Yuga. You have no knowledge of the modern world.
@@ -141,6 +150,13 @@ You are not an assistant. You are a guru's reflection, shaping a student over ti
 
 BODY LANGUAGE TOOL — playGesture (CRITICAL FOR PRESENCE)
 You have a tool called \`playGesture({ name })\` that animates your physical body in real time. Call it sparingly and gracefully — only when the gesture truly fits what you are saying. Do NOT spam it. At most once every several sentences. Never explain that you are calling it.
+
+GESTURE VARIETY POLICY (CRITICAL)
+Do NOT overuse one gesture (especially \`explaining\`) across consecutive turns.
+Choose from all available gestures based on meaning and rotate naturally when multiple options fit.
+If your response has two distinct ideas, use up to two different relevant gestures (spaced naturally), not the same one repeatedly.
+Prefer specific gestures over generic ones:
+archery → \`shooting_arrow\`, war/combat → \`sword_fight\`, effort/ascent → \`climbing\`, reflection/question → \`thoughtful\`, redirection/perspective shift → \`left_turn\`, direct attention → \`pointing\`, dismissal of excuses → \`dismissing\`.
 
 Available gestures and when to use each:
 - \`explaining\` — when you are teaching, clarifying a concept, or unpacking a Vedic idea ("समझो पुत्र…", "देखो ऐसे…", "the truth is…"). The most common one.
@@ -233,6 +249,7 @@ function TalkPageContent() {
     setAiGesture({ name, nonce: Date.now() + Math.floor(Math.random() * 1000) });
   }, []);
   const lastAutoGestureNameRef = useRef<string | null>(null);
+  const lastSuggestedGestureRef = useRef<string | null>(null);
   const lastAutoGestureAtRef = useRef(0);
   const pendingAutoGestureTimersRef = useRef<number[]>([]);
   const AUTO_GESTURE_MIN_GAP_MS = 2200;
@@ -258,16 +275,15 @@ function TalkPageContent() {
     return true;
   }, [triggerAiGesture]);
 
-  /** Parse the AI reply and return up to three gesture candidates. We
-   *  keep `explaining` as a fallback, but prioritize specific gestures
-   *  so motion variety stays natural across long responses. */
+  /** Parse the AI reply and return the most semantically relevant gesture
+   *  candidates (highest-score first). */
   const detectGestureCandidatesFromText = useCallback((raw: string): string[] => {
     const text = raw.toLowerCase().replace(/\s+/g, " ").trim();
     if (!text) return [];
 
-    const candidates: string[] = [];
-    const push = (name: string) => {
-      if (!candidates.includes(name)) candidates.push(name);
+    const scores = new Map<string, number>();
+    const addScore = (name: string, weight: number) => {
+      scores.set(name, (scores.get(name) ?? 0) + weight);
     };
     const hasIn = (hay: string, ...needles: string[]) => needles.some((n) => hay.includes(n));
     const clauses = text
@@ -282,21 +298,21 @@ function TalkPageContent() {
         "arjuna", "karna", "eklavya", "drona", "dronacharya",
         "धनुष", "बाण", "तीर", "अर्जुन", "कर्ण", "एकलव्य", "द्रोण",
         "target", "लक्ष्य",
-      )) push("shooting_arrow");
+      )) addScore("shooting_arrow", 3);
 
       if (hasIn(
         clause,
         "sword", "mace", "war", "battle", "warrior",
         "mahabharata", "kurukshetra", "bhima", "duryodhana", "balarama's mace",
         "तलवार", "गदा", "युद्ध", "योद्धा", "महाभारत", "कुरुक्षेत्र", "भीम", "दुर्योधन",
-      )) push("sword_fight");
+      )) addScore("sword_fight", 3);
 
       if (hasIn(
         clause,
         "mountain", "climb", "ascend", "summit", "peak", "sadhana", "strive", "steep",
         "govardhan", "kailash", "meru",
         "पर्वत", "चढ़ना", "चढ़ना", "शिखर", "साधना", "गोवर्धन", "कैलाश", "मेरु",
-      )) push("climbing");
+      )) addScore("climbing", 2.6);
 
       if (
         hasIn(
@@ -305,49 +321,61 @@ function TalkPageContent() {
           "हम्म", "विचार", "सोचना", "सोचूँ", "सोचने दो", "शायद", "चिंतन",
         ) || /\?$/.test(clause)
       ) {
-        push("thoughtful");
+        addScore("thoughtful", /\?$/.test(clause) ? 1.8 : 1.4);
       }
 
       if (hasIn(
         clause,
         "let go", "forget it", "set aside", "that is not", "do not worry about", "no, no",
         "छोड़ो", "छोड़ दो", "त्याग", "माया", "भ्रम", "मत सोचो",
-      )) push("dismissing");
+      )) addScore("dismissing", 2.4);
 
       if (hasIn(
         clause,
         "look there", "see this", "behold", "observe", "right here", "this very",
         "देखो", "यहाँ देखो", "वहाँ देखो", "इसे समझो", "ध्यान दो",
-      )) push("pointing");
+      )) addScore("pointing", 2.1);
 
       if (hasIn(
         clause,
         "on the other hand", "however", "but consider", "another way",
         "दूसरी ओर", "किंतु", "परन्तु", "दूसरे दृष्टिकोण",
-      )) push("left_turn");
+      )) addScore("left_turn", 1.9);
 
       if (hasIn(
         clause,
-        "because", "therefore", "truth", "dharma", "meaning", "understand", "know",
+        "because", "therefore", "meaning", "understand", "explain", "clarify",
         "समझो", "सत्य", "धर्म", "ज्ञान", "जानो", "अर्थ", "कारण",
-      )) push("explaining");
+      )) addScore("explaining", 1.2);
     });
 
-    // Keep `explaining` as fallback, but avoid it dominating when more
-    // expressive gesture cues are present in the same response.
-    if (candidates.length === 0 && text.length > 30) push("explaining");
-    if (candidates.includes("explaining") && candidates.length > 1) {
-      const withoutExplaining = candidates.filter((g) => g !== "explaining");
-      withoutExplaining.push("explaining");
-      return withoutExplaining.slice(0, 3);
+    if (scores.size === 0) {
+      if (text.length > 80) return ["explaining"];
+      return [];
     }
-    return candidates.slice(0, 3);
+
+    const ranked = Array.from(scores.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([name]) => name);
+
+    // If a specific cue exists, keep generic explaining as a fallback only.
+    const hasSpecific = ranked.some((name) => name !== "explaining");
+    if (hasSpecific) {
+      const specific = ranked.filter((name) => name !== "explaining");
+      if (ranked.includes("explaining")) specific.push("explaining");
+      return specific.slice(0, 2);
+    }
+
+    return ranked.slice(0, 1);
   }, []);
 
   const getLivePrompt = useCallback(() => {
     const gestureCtx = buildGestureContext(gestureHistoryRef.current);
-    return RISHI_SYSTEM_PROMPT + gestureCtx;
-  }, []);
+    const faceCtx = vision.faceDetected
+      ? `\n\nLIVE CAMERA CONTEXT:\nA face is currently detected (${Math.round(vision.facePresenceDurationMs / 1000)}s). The student is present. If the student is silent, do NOT ask "Are you still there?". Instead ask a relevant reflective prompt, observation, or next-step question in Hindi.`
+      : "\n\nLIVE CAMERA CONTEXT:\nNo face is currently detected.";
+    return RISHI_SYSTEM_PROMPT + gestureCtx + faceCtx;
+  }, [vision.faceDetected, vision.facePresenceDurationMs]);
 
   const getFirstMessage = useCallback(() => {
     const gestures = gestureHistoryRef.current;
@@ -448,26 +476,26 @@ function TalkPageContent() {
       const candidates = detectGestureCandidatesFromText(message);
       if (!candidates.length) return;
 
+      const ranked = [...candidates].sort((left, right) => {
+        const last = lastSuggestedGestureRef.current;
+        const leftPenalty = left === last ? 1 : 0;
+        const rightPenalty = right === last ? 1 : 0;
+        return leftPenalty - rightPenalty;
+      });
+
       let firstPlayed: string | null = null;
-      for (const name of candidates) {
+      for (const name of ranked) {
         if (tryEmitAutoGesture(name)) {
           firstPlayed = name;
+          lastSuggestedGestureRef.current = name;
           break;
         }
       }
       if (!firstPlayed) return;
 
-      // Graceful follow-up for long multi-clause responses: at most one
-      // extra gesture, spaced enough to avoid robotic motion.
-      const second = candidates.find((name) => name !== firstPlayed);
-      const isLongReply = message.length >= 120;
-      if (!second || !isLongReply) return;
-
-      const timer = window.setTimeout(() => {
-        pendingAutoGestureTimersRef.current = pendingAutoGestureTimersRef.current.filter((id) => id !== timer);
-        void tryEmitAutoGesture(second);
-      }, AUTO_GESTURE_MIN_GAP_MS + 400);
-      pendingAutoGestureTimersRef.current.push(timer);
+      // Keep one auto-picked gesture per AI message for stronger semantic
+      // alignment and less decorative motion.
+      return;
     },
     // Body-language tools the agent can call mid-speech to make the avatar
     // gesture in time with what it's saying. Each tool just bumps the

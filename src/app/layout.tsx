@@ -44,15 +44,19 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <head>
+        <link rel="preconnect" href="https://cdn.jsdelivr.net" crossOrigin="anonymous" />
+        <link rel="preconnect" href="https://storage.googleapis.com" crossOrigin="anonymous" />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{if(typeof window==='undefined')return;try{window.localStorage.clear()}catch{}try{window.sessionStorage.clear()}catch{}if('serviceWorker'in navigator){navigator.serviceWorker.getRegistrations().then((regs)=>Promise.all(regs.map((r)=>r.unregister()))).catch(()=>{})}if('caches'in window){caches.keys().then((keys)=>Promise.all(keys.map((k)=>caches.delete(k)))).catch(()=>{})}if(window.indexedDB&&indexedDB.databases){indexedDB.databases().then((dbs)=>dbs.forEach((db)=>{if(db&&db.name)indexedDB.deleteDatabase(db.name)})).catch(()=>{})}}catch{}})();`,
+          }}
+        />
+      </head>
       <body
         className={`${inter.variable} antialiased`}
       >
         {children}
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `if("serviceWorker"in navigator){window.addEventListener("load",()=>{const d=window.__NEXT_DATA__;const b=(d&&d.buildId)?String(d.buildId):"dev";navigator.serviceWorker.register('/sw.js?b='+encodeURIComponent(b))})}`,
-          }}
-        />
       </body>
     </html>
   );

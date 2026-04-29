@@ -28,6 +28,44 @@ export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v5";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
+let appSiteResetPromise: Promise<void> | null = null;
+
+/** Best-effort reset of app-owned browser state. This cannot clear browser
+ *  permission prompts / site settings, but it does remove service workers,
+ *  Cache Storage, local/session storage, and IndexedDB for this origin. */
+export async function resetAppSiteData(): Promise<void> {
+  if (typeof window === "undefined") return;
+  if (!appSiteResetPromise) {
+    appSiteResetPromise = (async () => {
+      try { window.localStorage.clear(); } catch {}
+      try { window.sessionStorage.clear(); } catch {}
+
+      if ("serviceWorker" in navigator) {
+        try {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        } catch {}
+      }
+
+      if (typeof caches !== "undefined") {
+        try {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        } catch {}
+      }
+
+      if (window.indexedDB && typeof indexedDB.databases === "function") {
+        try {
+          const dbs = await indexedDB.databases();
+          dbs.forEach((db) => {
+            if (db?.name) indexedDB.deleteDatabase(db.name);
+          });
+        } catch {}
+      }
+    })();
+  }
+  await appSiteResetPromise;
+}
 
 /** Build-scoped cache key so each Vercel deployment gets a fresh bucket.
  *  Falls back to the static cache name when build id isn't available. */
@@ -94,7 +132,7 @@ export interface AvatarAssetSpec {
 
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
   { path: "/avatar.fbx", estBytes: 74 * 1024 * 1024 },
-  { path: "/animations/breathing-idle.clip.json", estBytes: 1_900_000 },
+  { path: "/animations/idle.fbx", estBytes: 780_000 },
   { path: "/animations/sitting-idle.clip.json", estBytes: 720_000 },
   { path: "/animations/standing.clip.json", estBytes: 360_000 },
   { path: "/animations/stop-walking.clip.json", estBytes: 390_000 },
@@ -120,7 +158,7 @@ export const AVATAR_ASSETS: AvatarAssetSpec[] = [
  * AvatarModel `pickClip` chain returns null and the gesture system
  * silently ignores the request, leaving the avatar in `idle_standing`).
  *
- * Keep `breathing-idle`, `sitting-idle`, `standing`, `stop-walking`,
+ * Keep `idle`, `sitting-idle`, `standing`, `stop-walking`,
  * `walking`, and `waving` mandatory — those drive the core
  * sit→stand→walk→wave kiosk loop and the avatar would T-pose without
  * them.
@@ -440,6 +478,7 @@ export async function preloadAvatarAssets(
   signal?: AbortSignal,
   profile: DeviceProfile = getDeviceProfile(),
 ): Promise<void> {
+  await resetAppSiteData();
   // Resolve the cache once. If unavailable (private mode, very old
   // browsers), we still complete the downloads — they go straight to
   // the browser HTTP cache so the runtime fetch hits warm.
