@@ -199,6 +199,46 @@ function pickClip(
   return nonZero ?? animations[0] ?? null;
 }
 
+/**
+ * If a texture's source bitmap is larger than `maxSize`, blit it down to
+ * a maxSize-clamped canvas in place. Saves GPU memory and per-frag
+ * sampling cost on mobile devices that load high-res Meshy skin maps.
+ *
+ * Mutates the texture's `image` property and uses `needsUpdate = true`
+ * so three.js re-uploads it on next render. Skipped silently for
+ * cross-origin images (canvas tainting) or for textures whose source
+ * isn't a CanvasImageSource.
+ */
+function maybeDownsampleTexture(tex: THREE.Texture, maxSize: number): void {
+  if (!tex || maxSize <= 0) return;
+  // `image` can be HTMLImageElement, ImageBitmap, HTMLCanvasElement, or
+  // a video — only the first three are safe to draw to a 2D canvas.
+  const img = tex.image as
+    | (HTMLImageElement & { width: number; height: number })
+    | (ImageBitmap & { width: number; height: number })
+    | (HTMLCanvasElement & { width: number; height: number })
+    | undefined;
+  if (!img || typeof img.width !== "number" || typeof img.height !== "number") return;
+  const w = img.width;
+  const h = img.height;
+  const longest = Math.max(w, h);
+  if (longest <= maxSize) return;
+  const scale = maxSize / longest;
+  const tw = Math.max(1, Math.round(w * scale));
+  const th = Math.max(1, Math.round(h * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = tw;
+  canvas.height = th;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // High-quality scaling so the downsampled skin doesn't look chunky.
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img as CanvasImageSource, 0, 0, tw, th);
+  tex.image = canvas;
+  tex.needsUpdate = true;
+}
+
 function remapClipToAvatarRig(
   clip: THREE.AnimationClip,
   /** Map of `strippedBoneName` → actual rig bone name (preserving the rig's
@@ -625,6 +665,16 @@ function AvatarModel({
             m.map.anisotropy = matProfile.anisotropy;
             m.map.minFilter = THREE.LinearMipmapLinearFilter;
             m.map.magFilter = THREE.LinearFilter;
+            // Downsample oversized diffuse textures on mobile. The
+            // Meshy-baked skin maps ship as 2048² or 4096² which is
+            // wasted on a webcam-distance avatar and is the #1 cause
+            // of GPU memory pressure on Android tablets / older iOS.
+            try {
+              maybeDownsampleTexture(m.map, matProfile.maxTextureSize);
+            } catch {
+              // Cross-origin image data can throw on .getImageData; the
+              // texture stays at its native size in that case.
+            }
             m.map.needsUpdate = true;
           }
           if (m.emissiveMap) {
@@ -655,8 +705,25 @@ function AvatarModel({
             m.metalnessMap.dispose?.();
             m.metalnessMap = null;
           }
+          // AO map is yet another texture sample per fragment we can
+          // skip on mobile — the avatar is rim-lit, not crevice-lit.
+          if (!matProfile.enableNormalMap && m.aoMap) {
+            m.aoMap.dispose?.();
+            m.aoMap = null;
+          }
           m.roughness = Math.max(m.roughness ?? 0.5, 0.45);
-          m.envMapIntensity = 0.4;
+          // Force-disable env reflections on mobile / low tier. When
+          // envMapIntensity is 0 three.js still does the reflection
+          // sample if envMap is set, so null the map too.
+          if (matProfile.enableEnvReflections) {
+            m.envMapIntensity = 0.4;
+          } else {
+            m.envMapIntensity = 0;
+            m.envMap = null;
+            // Force metalness to zero so the lit shader path skips the
+            // Fresnel + reflection terms entirely.
+            m.metalness = 0;
+          }
           // Avatar is a closed mesh — back-faces are never visible. Use
           // FrontSide on mid/low to roughly halve fragment shader work.
           m.side = matProfile.doubleSide ? THREE.DoubleSide : THREE.FrontSide;
@@ -840,6 +907,13 @@ function AvatarModel({
   // Running it every other tick is imperceptible at 30fps but cuts
   // CPU markedly on iPhones.
   const footClampTickRef = useRef(0);
+  // Persistent low-pass-filtered floor offset. Holds the slow-moving
+  // "how high above the ground does the breathing-idle clip park the
+  // hips" correction so we don't fight the per-frame yLerp. Without
+  // this, modifying grp.position.y from the foot clamp every frame
+  // produces visible vertical bob on lower-fps Android tablets where
+  // the breathing oscillation aliases against the lerp.
+  const footFloorOffsetRef = useRef(0);
 
   useFrame((_, delta) => {
     // Frame-rate cap (mid: 30fps, low: 24fps, high: 60fps). Skip
@@ -913,7 +987,7 @@ function AvatarModel({
           yBias = FALL_FROM * (1 - ss(0, 0.75, p));
         }
       }
-      const tgtY = GROUND_Y + yBias;
+      const tgtY = GROUND_Y + yBias - footFloorOffsetRef.current;
 
       // Snappier follow during climb / fall so the lift+drop tracks the
       // curve closely. Climb needs to commit instantly when entering;
@@ -923,21 +997,26 @@ function AvatarModel({
         : Math.min(1, delta * 3);
       grp.position.y += (tgtY - grp.position.y) * yLerp;
 
-      /* ── Foot-to-floor clamp ──
+      /* ── Foot-to-floor clamp (low-pass filtered) ──
          Mixamo's breathing-idle clip lifts the Hips a few cm above the
          bind pose. Without correction the toes float above GROUND_Y. We
-         sample whichever toe is currently lower (so during a step-shift
-         the planted foot stays planted) and offset the group's Y by the
-         shortfall. Skipped during walking (already time-driven) and
-         sitting (cross-leg pose has its own offset). */
+         sample whichever toe is currently lower and update a persistent
+         `footFloorOffsetRef` with a SLOW exponential filter (~3 s time
+         constant) so we capture the long-term hip-lift offset without
+         tracking the breathing oscillation itself. The offset is then
+         applied to `tgtY` above on the NEXT frame, which means the
+         correction never fights the yLerp on the same frame — eliminating
+         the visible vertical bob on capped-fps mobile devices. Skipped
+         during walking (already time-driven), sitting (cross-leg pose
+         has its own offset), and climbing/falling (synthetic Y curves). */
       if (!isWalking && state !== "sitting" && state !== "climbing" && state !== "falling") {
         const lf = footBonesRef.current.left;
         const rf = footBonesRef.current.right;
         if (lf || rf) {
           // updateMatrixWorld traverses the full skeleton — expensive on
-          // mobile. Run it every other tick (so ~15fps on mid, ~12fps on
-          // low) since the foot drift correction is sub-pixel anyway.
-          footClampTickRef.current = (footClampTickRef.current + 1) & 1;
+          // mobile. Run it every 4th tick (~7 fps on mid, ~6 fps on low)
+          // since the floor offset is sub-pixel anyway.
+          footClampTickRef.current = (footClampTickRef.current + 1) & 3;
           if (footClampTickRef.current === 0) {
             // Make sure transforms are up to date for the new mixer pose.
             scene.updateMatrixWorld();
@@ -946,12 +1025,22 @@ function AvatarModel({
             if (lf) { lf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
             if (rf) { rf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
             if (Number.isFinite(minFootY)) {
-              const drift = minFootY - GROUND_Y;
-              // Smooth correction so we don't pop on state transitions.
-              grp.position.y -= drift * Math.min(1, delta * 8);
+              // Drift from the desired floor line at this exact frame —
+              // includes both the long-term hip lift AND the instantaneous
+              // breathing oscillation. We only want the long-term part.
+              const measuredOffset = minFootY - GROUND_Y;
+              // ~3 s time constant (assuming clamp ticks at ~7 Hz this is
+              // alpha ≈ 0.045 per sample). Slow enough to ignore the 0.5
+              // Hz breathing wobble entirely.
+              footFloorOffsetRef.current +=
+                (measuredOffset - footFloorOffsetRef.current) * 0.05;
             }
           }
         }
+      } else {
+        // Decay the offset back to zero whenever we're in a state that
+        // doesn't use the clamp, so re-entering idle doesn't snap.
+        footFloorOffsetRef.current *= 0.92;
       }
 
       if (isWalking) {
@@ -1619,6 +1708,14 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
     onReadyRef.current = onReady;
   }, [onReady]);
 
+  // Skip the soft shadow disc on phones / low-tier — it's a transparent
+  // draw call + a 256² canvas texture upload that those devices don't
+  // need under the avatar (the user can't see the floor anyway).
+  const showGroundShadow = useMemo(
+    () => getDeviceProfile().enableGroundShadow,
+    [],
+  );
+
   return (
     <AvatarErrorBoundary fallback={(err) => <FallbackOrb isSpeaking={isSpeaking} error={err} />}>
       <Suspense fallback={<Loader />}>
@@ -1626,7 +1723,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
           <DeviceTunedCanvas isSpeaking={isSpeaking}>
             <SceneLights />
             <CameraAnimator targetZRef={cameraTargetRef} />
-            <Ground />
+            {showGroundShadow && <Ground />}
             <AvatarModel
               gestureRef={gestureRef}
               faceDetectedRef={faceDetectedRef}

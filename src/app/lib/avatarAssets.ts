@@ -138,6 +138,19 @@ export interface DeviceProfile {
    *  throttling react-three-fiber's render scheduler and avoids tearing
    *  apart the existing animation timing. */
   targetFps: number;
+  /** When false, `envMapIntensity` is forced to 0 on every material so
+   *  the renderer skips the environment-reflection sample entirely.
+   *  PBR reflections are one of the costlier per-fragment ops on mobile
+   *  GPUs and the avatar reads fine without them. */
+  enableEnvReflections: boolean;
+  /** When false, the soft circular shadow disc beneath the avatar is
+   *  not rendered. Saves a transparent draw call + 256² canvas texture
+   *  upload on memory-tight phones. */
+  enableGroundShadow: boolean;
+  /** Hard cap on diffuse texture max(width,height). Anything larger is
+   *  downsampled at material-setup time with a 2D canvas blit so the
+   *  GPU never uploads a 4K skin texture on a 2 GB Android tablet. */
+  maxTextureSize: number;
 }
 
 let cachedProfile: DeviceProfile | null = null;
@@ -174,6 +187,9 @@ export function getDeviceProfile(): DeviceProfile {
       enableNormalMap: true,
       maxLights: 5,
       targetFps: 60,
+      enableEnvReflections: true,
+      enableGroundShadow: true,
+      maxTextureSize: 2048,
     };
   }
 
@@ -184,10 +200,13 @@ export function getDeviceProfile(): DeviceProfile {
   const deviceMemory = typeof nav.deviceMemory === "number" ? nav.deviceMemory : 4;
   const cores = typeof nav.hardwareConcurrency === "number" ? nav.hardwareConcurrency : 4;
   const isIOS = isIOSLikeBrowser();
+  const isAndroid = isAndroidBrowser();
+  const isMobile = isMobileBrowser();
 
   // Probe the GPU for software rasterizers — those cannot run the
   // shadow + MSAA path at any tier.
   let softwareRasterizer = false;
+  let gpuRendererName = "";
   try {
     const canvas = document.createElement("canvas");
     const gl =
@@ -197,6 +216,7 @@ export function getDeviceProfile(): DeviceProfile {
       const ext = gl.getExtension("WEBGL_debug_renderer_info");
       if (ext) {
         const renderer = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "").toLowerCase();
+        gpuRendererName = renderer;
         if (
           renderer.includes("swiftshader") ||
           renderer.includes("software") ||
@@ -213,10 +233,36 @@ export function getDeviceProfile(): DeviceProfile {
     // Probe failures are non-fatal; assume hardware GPU.
   }
 
+  // Mobile GPUs that we know are weak — Mali-G5x, Adreno 6xx, PowerVR.
+  // These devices ship in mid-range Android phones/tablets that report
+  // 4–8 GB of RAM (so the deviceMemory probe says "mid"), but their
+  // GPU/SoC ratio is closer to a low-tier iPhone. Pin them to `low`.
+  const weakMobileGpu =
+    isMobile &&
+    /(mali-g5|mali-g3|mali-t|adreno \(?6[0-3]|adreno \(?5|powervr|videocore)/i.test(
+      gpuRendererName,
+    );
+
   let tier: DeviceTier;
-  if (softwareRasterizer || deviceMemory <= 2 || cores <= 2) {
+  if (
+    softwareRasterizer ||
+    deviceMemory <= 2 ||
+    cores <= 2 ||
+    weakMobileGpu ||
+    // Any iOS device with ≤4 GB RAM (iPhone XR / 11 / SE3 etc.) is now
+    // pinned to low — those phones thermal-throttle within ~30 s on
+    // the previous mid profile.
+    (isIOS && deviceMemory <= 4) ||
+    // Mid-range Android tablets (4 GB / 4 cores) used to land in `mid`
+    // but the GPUs are usually Mali-G5x and the previous profile was
+    // still too rich for them.
+    (isAndroid && deviceMemory <= 4 && cores <= 6)
+  ) {
     tier = "low";
-  } else if (deviceMemory <= 4 || cores <= 4 || isIOS) {
+  } else if (deviceMemory <= 4 || cores <= 4 || isIOS || isAndroid) {
+    // All remaining mobile devices land in `mid` regardless of the RAM
+    // probe — even a 12 GB Galaxy S24 cannot reliably hold the `high`
+    // PBR pipeline at 60 fps without overheating.
     tier = "mid";
   } else {
     tier = "high";
@@ -224,18 +270,30 @@ export function getDeviceProfile(): DeviceProfile {
 
   const profile: DeviceProfile = {
     tier,
-    // iPhone retina renders 3x logical pixels even at dpr=1.5 — hard
-    // cap mid-tier to 1.25 so we draw ~30% fewer fragments than before
-    // without making the avatar visibly fuzzy.
-    maxDpr: tier === "low" ? 1 : tier === "mid" ? 1.25 : 2,
+    // iPhone retina renders 3x logical pixels even at dpr=1.5 — cap
+    // mobile mid to 1.0 (was 1.25) and low to 0.85 so we draw far
+    // fewer fragments than before. Desktop low/mid keep the previous
+    // caps because they're not GPU-bound.
+    maxDpr:
+      tier === "low"
+        ? isMobile
+          ? 0.85
+          : 1
+        : tier === "mid"
+        ? isMobile
+          ? 1.0
+          : 1.5
+        : 2,
     // MSAA is the single biggest mobile-GPU memory tax. Disable on
-    // anything below high, and on every iOS device regardless of tier.
-    antialias: tier === "high" && !isIOS,
-    shadows: tier === "high" && !isIOS,
-    anisotropy: tier === "low" ? 1 : tier === "mid" ? 2 : 8,
+    // anything below high, and on every mobile device regardless of tier.
+    antialias: tier === "high" && !isMobile,
+    shadows: tier === "high" && !isMobile,
+    anisotropy: tier === "low" ? 1 : tier === "mid" ? (isMobile ? 1 : 2) : 8,
     powerPreference: tier === "low" ? "low-power" : tier === "high" ? "high-performance" : "default",
     loadOptionalGestures: tier !== "low",
-    toneMappingExposure: 1.15,
+    // Slightly cooler exposure on mobile so the avatar reads without
+    // pumping ambient light — saves us a fragment-shader add per frag.
+    toneMappingExposure: isMobile ? 1.05 : 1.15,
     // Avatar is a closed mesh — back-faces are never visible. Only keep
     // DoubleSide on high tier where the cost is irrelevant.
     doubleSide: tier === "high",
@@ -243,18 +301,43 @@ export function getDeviceProfile(): DeviceProfile {
     // mobile. Avatar still reads well without it because the lighting
     // is mostly diffuse + ambient.
     enableNormalMap: tier === "high",
-    // Each extra light adds a per-fragment lighting calc. 1 directional
-    // is enough to read facial volumes on low-end; 2 keeps the warm
-    // rim on mid; high gets the full 5-light cinematic setup.
-    maxLights: tier === "low" ? 1 : tier === "mid" ? 2 : 5,
-    // Cap frame rate to halve GPU load on phones. 30fps is plenty for a
-    // talking-head avatar with no fast camera motion; 24fps on low-end
-    // is film-rate and still feels responsive for lipsync.
-    targetFps: tier === "low" ? 24 : tier === "mid" ? 30 : 60,
+    // Lights: low gets a single ambient-only "no light" setup on mobile
+    // (the avatar is fully lit by the diffuse map already). Mid mobile
+    // collapses to 1 directional light + ambient.
+    maxLights:
+      tier === "low" ? (isMobile ? 1 : 1) : tier === "mid" ? (isMobile ? 1 : 2) : 5,
+    // Cap frame rate. 30 fps on mid, 24 fps on low. iOS especially
+    // thermal-throttles after a few minutes at 60 fps, so even high
+    // tier is capped to 50 fps on mobile.
+    targetFps:
+      tier === "low" ? 22 : tier === "mid" ? (isMobile ? 26 : 30) : isMobile ? 45 : 60,
+    // Reflections: completely disabled on every mobile device and on
+    // desktop low. They're a ~10–15% per-fragment cost for a visual
+    // change most users will never notice on a webcam-distance avatar.
+    enableEnvReflections: tier === "high" && !isMobile,
+    // Ground shadow disc: skip on low tier and on mobile mid. The disc
+    // is an extra transparent draw call + a 256² canvas texture.
+    enableGroundShadow: tier === "high" || (tier === "mid" && !isMobile),
+    // Texture upload caps — diffuse maps larger than this get blitted
+    // down to this resolution at material-setup time. iOS/Android low
+    // get 512², mid mobile 1024², desktop mid 2048².
+    maxTextureSize:
+      tier === "low" ? 512 : tier === "mid" ? (isMobile ? 1024 : 2048) : 4096,
   };
 
   cachedProfile = profile;
-  console.log("[avatarAssets] device profile:", { tier, deviceMemory, cores, isIOS, softwareRasterizer, profile });
+  console.log("[avatarAssets] device profile:", {
+    tier,
+    deviceMemory,
+    cores,
+    isIOS,
+    isAndroid,
+    isMobile,
+    softwareRasterizer,
+    gpuRendererName,
+    weakMobileGpu,
+    profile,
+  });
   return profile;
 }
 
@@ -537,4 +620,26 @@ export function isIOSLikeBrowser(): boolean {
   const isMacWebKit = /Macintosh/.test(ua) && /AppleWebKit/.test(ua) && !/Chrome|CriOS|FxiOS/.test(ua);
   const hasTouch = (navigator.maxTouchPoints || 0) > 1;
   return isMacWebKit && hasTouch;
+}
+
+/** Any phone- or tablet-class browser (iOS, Android, mobile Firefox, etc.).
+ *  Used to apply mobile-specific GPU/asset cuts that desktop browsers do
+ *  not need even on low-end hardware. */
+export function isMobileBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile Safari/i.test(ua)) {
+    return true;
+  }
+  // iPadOS-as-macOS fallback.
+  const isMacWebKit = /Macintosh/.test(ua) && /AppleWebKit/.test(ua) && !/Chrome|CriOS|FxiOS/.test(ua);
+  const hasTouch = (navigator.maxTouchPoints || 0) > 1;
+  return isMacWebKit && hasTouch;
+}
+
+/** Android-only detection, mainly to clip mid-tier Android tablets where
+ *  the GPU/SoC ratio is much weaker than an iPad of similar memory. */
+export function isAndroidBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Android/i.test(navigator.userAgent || "");
 }
