@@ -234,6 +234,8 @@ export interface DeviceProfile {
    *  downsampled at material-setup time with a 2D canvas blit so the
    *  GPU never uploads a 4K skin texture on a 2 GB Android tablet. */
   maxTextureSize: number;
+  /** Fragment precision to use for WebGL context creation. */
+  shaderPrecision: "highp" | "mediump";
 }
 
 let cachedProfile: DeviceProfile | null = null;
@@ -269,9 +271,8 @@ export function getDeviceProfile(): DeviceProfile {
     // stencil buffer enabled) preserve visual quality. The actual
     // performance levers below are what matters.
     tier: "high",
-    // DPR cap of 2 keeps text and faces crisp on retina screens
-    // without crossing the bandwidth cliff that hits at 3x.
-    maxDpr: 2,
+    // Cap DPR at 1.5 so fragment workload stays bounded on mobile GPUs.
+    maxDpr: 1.5,
     // No MSAA — biggest single mobile-GPU memory tax. We rely on
     // high DPR for edge crispness instead (1px at 2x ≈ 0.5px,
     // visually equivalent to 2x MSAA at 1x DPR).
@@ -282,7 +283,7 @@ export function getDeviceProfile(): DeviceProfile {
     shadows: false,
     // Anisotropy 4 keeps the beard/skin diffuse map crisp at
     // oblique angles. Clamped to GPU max in onCreated.
-    anisotropy: 4,
+    anisotropy: 2,
     // High-performance hint — picks discrete GPU on laptops, and the
     // perf-cluster on mobile SoCs.
     powerPreference: "high-performance",
@@ -297,13 +298,12 @@ export function getDeviceProfile(): DeviceProfile {
     // priciest per-fragment ops. Lighting still reads correctly with
     // diffuse + ambient + a single directional.
     enableNormalMap: false,
-    // 2 directional lights + ambient — enough for a soft front-fill
-    // and a rim, no more.
-    maxLights: 2,
-    // 60 fps target. The frame-skip accumulator in Avatar3D drops
-    // frames automatically if any device can't keep up, so a single
-    // high target works for everyone.
-    targetFps: 60,
+    // Single directional + ambient keeps skin readable while minimizing
+    // per-fragment lighting cost.
+    maxLights: 1,
+    // 45 fps target gives smoother perception than hard-30 while reducing
+    // sustained thermal pressure vs 60.
+    targetFps: 45,
     // No environment reflections — PBR cubemap sampling is expensive
     // and the avatar's robe/skin are matte enough that reflections
     // add nothing visible.
@@ -312,10 +312,10 @@ export function getDeviceProfile(): DeviceProfile {
     // canvas texture upload, and the user explicitly asked to remove
     // shadowing entirely.
     enableGroundShadow: false,
-    // Keep diffuse textures at native resolution (the Meshy skin map
-    // is ~2K). Downsampling via canvas blit produces visible blur
-    // on the beard and was the root cause of the pixelation reports.
-    maxTextureSize: 4096,
+    // 2K cap avoids uploading oversized maps and keeps memory pressure low.
+    maxTextureSize: 2048,
+    // mediump materially reduces shader ALU pressure on budget phones.
+    shaderPrecision: "mediump",
   };
 
   cachedProfile = profile;

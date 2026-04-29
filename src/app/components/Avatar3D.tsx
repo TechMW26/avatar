@@ -150,10 +150,11 @@ const GROUND_Y = -1.3;
 const SIT_GROUND_OFFSET_Y = -0.55;
 const BACK_Z = -2.0;
 const FRONT_Z = 0;
-const BACK_SCALE = 0.65;
-// Reduced from 1.0 → 0.95 (5% smaller close-up scale) so the avatar
-// doesn't feel oversized when on the front mark.
-const FRONT_SCALE = 0.95;
+const DYNAMIC_SCALE_MULT = 1.15;
+const BACK_SCALE = 0.65 * DYNAMIC_SCALE_MULT;
+// Keep the close mark visually present but avoid edge clipping on
+// narrow portrait screens.
+const FRONT_SCALE = 0.9 * DYNAMIC_SCALE_MULT;
 
 const STATE_TARGETS: Record<
   AvatarAnimState,
@@ -752,7 +753,7 @@ function AvatarModel({
     scene.updateMatrixWorld(true);
     const rawBox = new THREE.Box3().setFromObject(scene);
     const modelHeight = rawBox.max.y - rawBox.min.y;
-    const desiredHeight = 2.6;
+    const desiredHeight = 2.45;
     if (modelHeight > 0.001) {
       const s = desiredHeight / modelHeight;
       scene.scale.setScalar(s);
@@ -1572,9 +1573,12 @@ function FallbackOrb({ isSpeaking, error }: { isSpeaking: boolean; error?: Error
 }
 
 function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }) {
-  const { camera } = useThree();
+  const { camera, size } = useThree();
   useFrame((_, delta) => {
-    const target = targetZRef.current;
+    const aspect = size.width > 0 && size.height > 0 ? size.width / size.height : 1;
+    // Portrait screens need extra camera distance to keep the full body in-frame.
+    const portraitBoost = aspect < 0.62 ? Math.min(1.2, ((0.62 - aspect) / 0.62) * 1.2) : 0;
+    const target = targetZRef.current + portraitBoost;
     // eslint-disable-next-line react-hooks/immutability
     camera.position.z += (target - camera.position.z) * Math.min(1, delta * 1.5);
   });
@@ -1806,7 +1810,7 @@ function DeviceTunedCanvas({
         powerPreference: profile.powerPreference,
         // Stencil + depth flags help the WebGL implementation pick a
         // smaller framebuffer on tile-based mobile GPUs.
-        stencil: profile.tier === "high",
+        stencil: false,
         depth: true,
         // `desynchronized` lets the canvas present without waiting for
         // the compositor on browsers that support it (Chrome, Edge).
@@ -1821,10 +1825,7 @@ function DeviceTunedCanvas({
         // context on software rasterizers; we already detect those in
         // `getDeviceProfile()` and pin to low tier, so leave this off.
         failIfMajorPerformanceCaveat: false,
-        // High precision in fragment shader so PBR lighting doesn't
-        // band on mid-tier mobile GPUs (the default `mediump` quantises
-        // visibly on the avatar's robe gradient).
-        precision: profile.tier === "low" ? "mediump" : "highp",
+        precision: profile.shaderPrecision,
       }}
       dpr={[1, profile.maxDpr]}
       shadows={profile.shadows}

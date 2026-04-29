@@ -137,6 +137,7 @@ When silence continues but the student is present, respond with relevant engagem
 - Or offer one concrete next step/exercise,
 - Or make one brief observation tied to current topic/gesture.
 Avoid repetitive prompts like "क्या तुम अभी भी यहाँ हो?" when the student is visibly present.
+Never say lines such as "पुत्र तुम अभी भी यहाँ हो?", "क्या आप अभी भी यहाँ हैं?", or any equivalent presence-check phrasing.
 
 Boundaries
 You are a reflection, not the living sage. Always make this clear if asked directly.
@@ -258,6 +259,27 @@ function TalkPageContent() {
   const clearPendingAutoGestureTimers = useCallback(() => {
     pendingAutoGestureTimersRef.current.forEach((id) => window.clearTimeout(id));
     pendingAutoGestureTimersRef.current = [];
+  }, []);
+
+  const sanitizeAiSpeech = useCallback((raw: string): string => {
+    if (!raw) return raw;
+    let text = raw;
+    const blockedPatterns: RegExp[] = [
+      /पुत्र\s*(?:तुम|आप)\s*अभी\s*भी\s*यहाँ\s*हो\??/gi,
+      /क्या\s*(?:तुम|आप)\s*अभी\s*भी\s*यहाँ\s*हो\??/gi,
+      /are\s+you\s+still\s+there\??/gi,
+      /still\s+there\??/gi,
+    ];
+    const hasBlocked = blockedPatterns.some((re) => re.test(text));
+    if (!hasBlocked) return text;
+    blockedPatterns.forEach((re) => {
+      text = text.replace(re, "");
+    });
+    text = text.replace(/\s{2,}/g, " ").trim();
+    if (!text) {
+      return "पुत्र, अपनी वर्तमान समस्या का एक छोटा-सा उदाहरण बताओ, ताकि मैं ठीक मार्गदर्शन कर सकूँ।";
+    }
+    return text;
   }, []);
 
   const tryEmitAutoGesture = useCallback((name: string): boolean => {
@@ -473,8 +495,25 @@ function TalkPageContent() {
     // `playGesture` clientTool is registered in the ElevenLabs dashboard.
     onMessage: ({ message, source }: { message: string; source: "user" | "ai" }) => {
       if (source !== "ai" || !message) return;
-      const candidates = detectGestureCandidatesFromText(message);
+      const safeMessage = sanitizeAiSpeech(message);
+
+      // If the model slipped into forbidden no-response prompt phrasing,
+      // replace it before audio is spoken.
+      if (safeMessage !== message) {
+        try {
+          conversationRef.current.sendContextualUpdate(safeMessage);
+        } catch {
+          // Non-fatal: even if contextual update fails we still avoid
+          // decorating the bad line with gestures.
+        }
+      }
+
+      const candidates = detectGestureCandidatesFromText(safeMessage);
       if (!candidates.length) return;
+
+      // Guardrail: for short/generic lines, skip auto-gestures entirely.
+      const compact = safeMessage.trim();
+      if (compact.length < 45) return;
 
       const ranked = [...candidates].sort((left, right) => {
         const last = lastSuggestedGestureRef.current;

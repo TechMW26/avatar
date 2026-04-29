@@ -62,12 +62,14 @@ const VISION_CDN =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/wasm";
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
-const DETECTION_INTERVAL_MS = 100; // run detection every 100ms (~10fps detection)
-const DETECTION_INTERVAL_MOBILE_MS = 120; // lighter cadence on phones
+const GESTURE_MIN_CONFIDENCE = 0.65;
+const GESTURE_STABLE_FRAMES = 2;
+const DETECTION_INTERVAL_MS = 130; // ~7.7fps face/gesture loop
+const DETECTION_INTERVAL_MOBILE_MS = 170; // lighter cadence on phones
 const FACE_UI_UPDATE_INTERVAL_MS = 120; // throttle React updates for counters
 const SMILE_UI_UPDATE_INTERVAL_MS = 160;
-const LANDMARK_INTERVAL_MS = 140;
-const LANDMARK_INTERVAL_MOBILE_MS = 220;
+const LANDMARK_INTERVAL_MS = 200;
+const LANDMARK_INTERVAL_MOBILE_MS = 320;
 const OBJECT_DETECT_INTERVAL_MS = 333;
 const OBJECT_DETECT_INTERVAL_MOBILE_MS = 900;
 const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
@@ -145,6 +147,8 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   const [currentGestures, setCurrentGestures] = useState<GestureInfo[]>([]);
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   const [gestureHistory, setGestureHistory] = useState<GestureInfo[]>([]);
+  const gestureStreakRef = useRef<Record<string, number>>({});
+  const gestureLastSeenTsRef = useRef<Record<string, number>>({});
   const namasteSeenStreakRef = useRef(0);
   const namasteMissStreakRef = useRef(0);
   const namasteHoldUntilRef = useRef(0);
@@ -828,15 +832,29 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
         const gesture = gestureResult.gestures[i];
         if (gesture.length > 0) {
           const top = gesture[0];
-          if (top.categoryName !== "None" && top.score > 0.4) {
+          if (top.categoryName !== "None" && top.score >= GESTURE_MIN_CONFIDENCE) {
             // Skip individual hand gestures if Namaste is detected (both hands together)
             if (namasteDetected) continue;
+
+            const gestureName = top.categoryName;
+            const nowTs = Date.now();
+            const lastSeen = gestureLastSeenTsRef.current[gestureName] ?? 0;
+            const isContinuous = nowTs - lastSeen <= 350;
+            const nextStreak = isContinuous
+              ? (gestureStreakRef.current[gestureName] ?? 0) + 1
+              : 1;
+            gestureLastSeenTsRef.current[gestureName] = nowTs;
+            gestureStreakRef.current[gestureName] = nextStreak;
+            if (nextStreak < GESTURE_STABLE_FRAMES) {
+              continue;
+            }
+
             const info: GestureInfo = {
-              name: top.categoryName,
+              name: gestureName,
               label:
-                GESTURE_LABELS[top.categoryName] || top.categoryName,
+                GESTURE_LABELS[gestureName] || gestureName,
               confidence: top.score,
-              timestamp: Date.now(),
+              timestamp: nowTs,
             };
             frameGestures.push(info);
 
@@ -957,6 +975,8 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     lastSmileUiUpdateAtRef.current = 0;
     lastLandmarkDetectionRef.current = 0;
     lastGestureStateKeyRef.current = "";
+    gestureStreakRef.current = {};
+    gestureLastSeenTsRef.current = {};
     namasteSeenStreakRef.current = 0;
     namasteMissStreakRef.current = 0;
     namasteHoldUntilRef.current = 0;
