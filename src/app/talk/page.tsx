@@ -854,8 +854,7 @@ function TalkPageContent() {
           Suspense and the tab gets killed for memory ("A problem
           repeatedly occurred"). */}
       <div
-        onClick={conversationStarted ? undefined : startConversation}
-        className={`talk-avatar-container ${conversationStarted ? "" : "cursor-pointer"}`}
+        className="talk-avatar-container"
         style={{ position: "absolute", inset: 0, zIndex: 1 }}
       >
         {bootStage === "ready" ? (
@@ -979,7 +978,9 @@ function TalkPageContent() {
                       {conversationError
                         ? conversationError
                         : vision.isReady
-                          ? "Step in front of the camera or tap to begin"
+                          ? vision.faceDetected
+                            ? "\u0917\u0941\u0930\u0941\u091C\u0940 \u0938\u0947 \u0938\u0902\u092A\u0930\u094D\u0915 \u0939\u094B \u0930\u0939\u093E \u0939\u0948..."
+                            : "Step in front of the camera to begin"
                           : "Setting up face detection"}
                     </p>
                   </>
@@ -992,24 +993,21 @@ function TalkPageContent() {
               </div>
 
               {agentState === "off" ? (
-                <motion.button
-                  onClick={startConversation}
-                  className="flex items-center cursor-pointer font-semibold text-white"
+                <motion.div
+                  className="flex items-center font-semibold"
                   style={{
                     gap: 8, padding: "clamp(10px, 1.1vh, 14px) clamp(16px, 2vw, 24px)", borderRadius: 999,
-                    background: "linear-gradient(135deg, #E65100, #FF9933)",
-                    boxShadow: "0 6px 18px rgba(255,153,51,0.26)",
-                    border: "none", fontSize: "clamp(12px, 1vw, 14px)",
+                    background: "rgba(255,153,51,0.08)", color: "#FFB366",
+                    border: "1px solid rgba(255,153,51,0.2)", fontSize: "clamp(12px, 1vw, 14px)",
                   }}
-                  whileHover={{ scale: 1.05 }}
-                  whileTap={{ scale: 0.95 }}
+                  animate={{ opacity: vision.faceDetected ? [0.6, 1, 0.6] : 1 }}
+                  transition={{ duration: 1.5, repeat: vision.faceDetected ? Infinity : 0 }}
                 >
-                  <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
                   </svg>
-                  Start Conversation
-                </motion.button>
+                  {vision.faceDetected ? "Detected \u2014 starting..." : "Waiting for you..."}
+                </motion.div>
               ) : (
                 <motion.div
                   className="flex items-center font-semibold"

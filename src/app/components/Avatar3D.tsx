@@ -19,6 +19,7 @@ import {
   assetUrl,
   getDeviceProfile,
   isAssetEnabled,
+  isAssetMissing,
 } from "../lib/avatarAssets";
 
 const AVATAR_URL = "/avatar.fbx";
@@ -405,6 +406,12 @@ function useFbxClips(url: string): THREE.AnimationClip[] {
   // from spending RAM/CPU on animations they will never play.
   const profile = getDeviceProfile();
   if (!isAssetEnabled(url, profile)) return EMPTY_CLIPS;
+  // If the preloader 404'd this asset (stale blob bucket, typo in path,
+  // etc.) treat it as unavailable rather than throwing a Suspense fetch
+  // that would loop forever. Same downstream contract as the low-tier
+  // skip path above.
+  const pathOnly = url.replace(ASSET_BASE_URL, "") || url;
+  if (isAssetMissing(pathOnly)) return EMPTY_CLIPS;
   const cached = fbxClipCache.get(url);
   if (cached) return cached;
   throw loadFbxClips(url);

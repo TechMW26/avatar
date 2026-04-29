@@ -227,6 +227,23 @@ export function isAssetEnabled(path: string, profile: DeviceProfile): boolean {
   return !OPTIONAL_GESTURE_PATHS.has(path);
 }
 
+/**
+ * Paths that returned a 4xx during preload. The runtime FBX/clip loader
+ * checks this set and short-circuits to an empty clip array so a stale
+ * deployment (e.g. blob bucket missing one file) never blocks the boot
+ * gate or T-poses the avatar — the gesture system already tolerates
+ * missing optional clips, and the mandatory idle clips degrade to
+ * "avatar holds last pose" rather than infinite spinner.
+ *
+ * Populated by `preloadAvatarAssets`. Use `isAssetMissing(path)` from
+ * runtime code; never mutate this set directly.
+ */
+const MISSING_ASSETS = new Set<string>();
+
+export function isAssetMissing(path: string): boolean {
+  return MISSING_ASSETS.has(path);
+}
+
 export interface PreloadProgress {
   /** 0..1 ratio of total bytes downloaded across all assets. */
   ratio: number;
@@ -262,6 +279,18 @@ async function streamIntoCache(
 
   const resp = await fetch(url, { credentials: "omit" });
   if (!resp.ok) {
+    // 4xx → asset is genuinely absent (typo in path, blob bucket out
+    // of sync with the deployed code, etc). Mark it missing so the
+    // runtime loader can short-circuit, advance the byte counter by
+    // the estimated size so the progress bar still completes, and
+    // continue with the next asset instead of blocking boot.
+    if (resp.status >= 400 && resp.status < 500) {
+      console.warn(`[avatarAssets] skipping missing asset ${spec.path}: ${resp.status}`);
+      MISSING_ASSETS.add(spec.path);
+      onChunk(spec.estBytes, spec.estBytes);
+      return;
+    }
+    // 5xx / network → genuine failure, surface it so the user sees Retry.
     throw new Error(`Failed to load ${spec.path}: ${resp.status} ${resp.statusText}`);
   }
 
