@@ -6,6 +6,10 @@ import { motion, AnimatePresence } from "framer-motion";
 import { ConversationProvider, useConversation } from "@elevenlabs/react";
 import { useVisionDetection, buildGestureContext } from "../hooks/useVisionDetection";
 import type { GestureInfo } from "../hooks/useVisionDetection";
+import {
+  preloadAvatarAssets,
+  type PreloadProgress,
+} from "../lib/avatarAssets";
 
 const Avatar3D = dynamic(() => import("../components/Avatar3D"), { ssr: false });
 const AUTO_START_RETRY_DELAY_MS = 4000;
@@ -240,7 +244,17 @@ function TalkPageContent() {
   // mounted so the heavy MediaPipe pipeline doesn't compete with the FBX
   // load on first paint.
   const [avatarReady, setAvatarReady] = useState(false);
-  const vision = useVisionDetection({ enabled: avatarReady });
+  // Asset preload state. We kick this off automatically on mount (no
+  // "Tap to Begin" button) so the experience feels instant. Camera +
+  // microphone permission prompts are handled organically by the
+  // MediaPipe vision hook and the ElevenLabs SDK respectively — the
+  // browser will queue them after the user's first interaction with the
+  // page (or, on most platforms, immediately).
+  const [bootStage, setBootStage] = useState<"loading" | "ready">("loading");
+  const [bootError, setBootError] = useState<string | null>(null);
+  const [preloadProgress, setPreloadProgress] = useState<PreloadProgress | null>(null);
+  const bootInFlightRef = useRef(false);
+  const vision = useVisionDetection({ enabled: avatarReady && bootStage === "ready" });
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
 
@@ -656,6 +670,51 @@ function TalkPageContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Sequentially streams every avatar/animation asset (filtered by the
+   *  device's tier) into Cache Storage with byte-level progress. Once
+   *  this resolves, `<Avatar3D>` is mounted with a fully-warmed cache so
+   *  every Suspense fetch returns instantly — keeping iOS Safari well
+   *  below its tab memory ceiling.
+   *
+   *  Camera + microphone permissions are intentionally NOT requested
+   *  here: the vision hook and the ElevenLabs SDK each request the
+   *  permission they actually need at the moment they need it, which is
+   *  the most familiar pattern for users on every platform.
+   */
+  const runPreload = useCallback(async () => {
+    if (bootInFlightRef.current) return;
+    bootInFlightRef.current = true;
+    setBootError(null);
+    setBootStage("loading");
+    setPreloadProgress({
+      ratio: 0,
+      currentIndex: 0,
+      totalAssets: 1,
+      currentPath: "",
+      loadedBytes: 0,
+      totalBytes: 1,
+    });
+
+    try {
+      await preloadAvatarAssets((p) => setPreloadProgress(p));
+      setBootStage("ready");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to load avatar assets";
+      console.error("[Boot] preload failed:", err);
+      setBootError(msg);
+    } finally {
+      bootInFlightRef.current = false;
+    }
+  }, []);
+
+  // Kick off the preload as soon as the page mounts. No "Tap to Begin"
+  // gate — the preloader streams sequentially so it doesn't OOM mobile
+  // Safari, and the camera/mic prompts fire naturally when the vision
+  // hook and ElevenLabs SDK start.
+  useEffect(() => {
+    void runPreload();
+  }, [runPreload]);
+
   return (
     <div className="h-screen flex flex-col" style={{ background: "var(--bg)", position: "relative", overflow: "hidden" }}>
       {/* Hidden video element for face/gesture detection */}
@@ -789,13 +848,19 @@ function TalkPageContent() {
         )}
       </div>
 
-      {/* Full-screen avatar canvas */}
+      {/* Full-screen avatar canvas. Only mount once the boot preloader
+          has warmed Cache Storage with every asset; otherwise iOS Safari
+          tries to download + parse 17 FBX/JSON files in parallel via
+          Suspense and the tab gets killed for memory ("A problem
+          repeatedly occurred"). */}
       <div
         onClick={conversationStarted ? undefined : startConversation}
         className={`talk-avatar-container ${conversationStarted ? "" : "cursor-pointer"}`}
         style={{ position: "absolute", inset: 0, zIndex: 1 }}
       >
-        <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} aiGesture={aiGesture} onReady={() => setAvatarReady(true)} />
+        {bootStage === "ready" ? (
+          <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} aiGesture={aiGesture} onReady={() => setAvatarReady(true)} />
+        ) : null}
       </div>
 
       {/* Dark gradient at bottom */}
@@ -967,6 +1032,130 @@ function TalkPageContent() {
           </AnimatePresence>
         </div>
       )}
+
+      {/* Boot overlay: covers the whole viewport while we sequentially
+          preload the avatar/animation assets into Cache Storage. Without
+          this gate, mobile Safari would parallel-fetch all 17 files via
+          Suspense and the tab gets killed for memory ("A problem
+          repeatedly occurred"). The preload starts automatically on
+          mount; on retry after an error the same button kicks it off. */}
+      <AnimatePresence>
+        {bootStage !== "ready" && (
+          <motion.div
+            key="boot-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.25 }}
+            style={{
+              position: "fixed",
+              inset: 0,
+              zIndex: 50,
+              background: "radial-gradient(circle at 50% 30%, #1a120a 0%, #0a0705 70%)",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 24,
+            }}
+          >
+            <div
+              style={{
+                width: "min(92vw, 460px)",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                gap: 22,
+                padding: "32px 26px",
+                borderRadius: 20,
+                background: "rgba(20,14,8,0.78)",
+                border: "1px solid rgba(255,153,51,0.22)",
+                boxShadow: "0 18px 48px rgba(0,0,0,0.5)",
+                backdropFilter: "blur(18px)",
+                WebkitBackdropFilter: "blur(18px)",
+                textAlign: "center",
+              }}
+            >
+              <div style={{ fontSize: 48, lineHeight: 1 }}>🙏</div>
+              <div>
+                <p style={{ fontSize: 18, fontWeight: 700, color: "var(--text-1, #f5e9d8)", margin: 0 }}>
+                  गुरुकुल में आपका स्वागत है
+                </p>
+                <p style={{ fontSize: 13, color: "var(--text-3, #b8a890)", marginTop: 6 }}>
+                  Welcome to the Gurukul of Rishi Sandipani
+                </p>
+              </div>
+
+              <div style={{ width: "100%" }}>
+                <div
+                  style={{
+                    width: "100%",
+                    height: 8,
+                    borderRadius: 999,
+                    background: "rgba(255,255,255,0.08)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <motion.div
+                    animate={{ width: `${Math.round((preloadProgress?.ratio ?? 0) * 100)}%` }}
+                    transition={{ ease: "easeOut", duration: 0.25 }}
+                    style={{
+                      height: "100%",
+                      background: "linear-gradient(90deg, #E65100, #FF9933, #FFB366)",
+                      borderRadius: 999,
+                    }}
+                  />
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    marginTop: 10,
+                    fontSize: 11,
+                    color: "var(--text-3, #b8a890)",
+                  }}
+                >
+                  <span>{Math.round((preloadProgress?.ratio ?? 0) * 100)}%</span>
+                  <span>
+                    {preloadProgress
+                      ? `${(preloadProgress.loadedBytes / 1024 / 1024).toFixed(1)} / ${(preloadProgress.totalBytes / 1024 / 1024).toFixed(1)} MB`
+                      : "0 MB"}
+                  </span>
+                </div>
+              </div>
+              <p style={{ fontSize: 11, color: "var(--text-3, #b8a890)", margin: 0, minHeight: 16 }}>
+                {preloadProgress?.currentPath
+                  ? `Loading ${preloadProgress.currentPath.replace(/^\//, "")}…`
+                  : "Preparing…"}
+              </p>
+              {bootError && (
+                <>
+                  <p style={{ fontSize: 11, color: "#ff8a8a", margin: 0, lineHeight: 1.5 }}>
+                    {bootError}
+                  </p>
+                  <motion.button
+                    onClick={runPreload}
+                    className="font-semibold text-white"
+                    style={{
+                      padding: "10px 24px",
+                      borderRadius: 999,
+                      background: "linear-gradient(135deg, #E65100, #FF9933)",
+                      boxShadow: "0 6px 18px rgba(255,153,51,0.28)",
+                      border: "none",
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                    whileHover={{ scale: 1.04 }}
+                    whileTap={{ scale: 0.96 }}
+                  >
+                    Retry
+                  </motion.button>
+                </>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

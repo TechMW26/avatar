@@ -13,16 +13,29 @@ import {
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { SkeletonUtils, FBXLoader } from "three-stdlib";
+import {
+  ASSET_BASE_URL,
+  ASSET_CACHE_NAME,
+  assetUrl,
+  getDeviceProfile,
+  isAssetEnabled,
+} from "../lib/avatarAssets";
 
 const AVATAR_URL = "/avatar.fbx";
 
 // User-provided FBX animation files (Mixamo rigs).
-const ANIM_IDLE_URL = "/animations/breathing-idle.fbx";
-const ANIM_SITTING_URL = "/animations/sitting-idle.fbx";
-const ANIM_STANDING_URL = "/animations/standing.fbx";
-const ANIM_STOPPING_URL = "/animations/stop-walking.fbx";
+// The five "full body" idle/walking/waving Mixamo exports were ~74 MB each
+// because they re-embedded the skinned mesh + 6 MB texture. We pre-extract
+// just their AnimationClips into compact JSON via
+// `scripts/extract-clips.mjs` so mobile Safari does not have to download
+// and FBX-parse ~370 MB of dead weight before the first frame can render.
+// Smaller gesture FBX files (<1 MB) stay as-is — converting them is churn.
+const ANIM_IDLE_URL = "/animations/breathing-idle.clip.json";
+const ANIM_SITTING_URL = "/animations/sitting-idle.clip.json";
+const ANIM_STANDING_URL = "/animations/standing.clip.json";
+const ANIM_STOPPING_URL = "/animations/stop-walking.clip.json";
 const ANIM_WALKING_URL = "/animations/walking.fbx";
-const ANIM_WAVING_URL = "/animations/waving.fbx";
+const ANIM_WAVING_URL = "/animations/waving.clip.json";
 const ANIM_PRAYING_URL = "/animations/praying.fbx";
 const ANIM_EXPLAINING_URL = "/animations/explaining.fbx";
 const ANIM_YELLING_URL = "/animations/yelling.fbx";
@@ -262,16 +275,16 @@ function remapClipToAvatarRig(
      loads come from local disk \u2014 the kiosk is responsive even on flaky
      connections.
 
-   Set the cache name + bump the version when shipping new asset bundles. */
-const ASSET_BASE_URL =
-  (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
-const ASSET_CACHE_NAME = "rishi-avatar-fbx-v3";
+   Set the cache name + bump the version when shipping new asset bundles.
 
-function assetUrl(path: string): string {
-  if (!ASSET_BASE_URL) return path;
-  // Strip leading slash so we don't end up with `https://host//animations/...`.
-  return `${ASSET_BASE_URL.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
-}
+   Both `ASSET_BASE_URL` and `ASSET_CACHE_NAME` are now defined in
+   `src/app/lib/avatarAssets.ts` so the pre-mount preloader and the
+   runtime loader read from the exact same Cache Storage bucket. */
+// Re-export aliases so the rest of this file can keep its existing
+// references untouched. These are the same constants the preloader uses;
+// changing one without the other will silently re-download every asset.
+void ASSET_BASE_URL;
+void ASSET_CACHE_NAME;
 
 /** Fetch through Cache Storage so the second visit is instant.
  *  Falls back to a plain fetch when Cache Storage is unavailable
@@ -333,6 +346,30 @@ function useFbxScene(url: string): THREE.Group {
 function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
   let p = fbxClipPromises.get(url);
   if (!p) {
+    // `.clip.json` payloads are pre-extracted AnimationClip JSON written by
+    // `scripts/extract-clips.mjs`. They skip the entire FBX download/parse
+    // path (which is what was killing the kiosk on mobile Safari).
+    if (/\.clip\.json($|\?)/i.test(url)) {
+      p = fetchAssetCached(url)
+        .then((buf) => {
+          const text = new TextDecoder().decode(buf);
+          const raw = JSON.parse(text) as unknown;
+          const arr = Array.isArray(raw) ? raw : [raw];
+          const clips = arr.map((j) =>
+            THREE.AnimationClip.parse(j as Parameters<typeof THREE.AnimationClip.parse>[0]),
+          );
+          fbxClipCache.set(url, clips);
+          return clips;
+        })
+        .catch((err) => {
+          console.error("[Avatar] clip JSON load failed:", url, err);
+          fbxClipPromises.delete(url);
+          throw err;
+        });
+      fbxClipPromises.set(url, p);
+      return p;
+    }
+
     const loader = new FBXLoader();
     p = fetchAssetCached(url)
       .then((buf) => loader.parse(buf, ""))
@@ -361,10 +398,21 @@ function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
 }
 
 function useFbxClips(url: string): THREE.AnimationClip[] {
+  // Low-tier devices skip optional gesture animations entirely. Returning
+  // an empty clip array makes `pickClip()` resolve to `null`, which
+  // downstream code already treats as "this gesture is unavailable" and
+  // simply leaves the avatar in `idle_standing`. Keeps low-end phones
+  // from spending RAM/CPU on animations they will never play.
+  const profile = getDeviceProfile();
+  if (!isAssetEnabled(url, profile)) return EMPTY_CLIPS;
   const cached = fbxClipCache.get(url);
   if (cached) return cached;
   throw loadFbxClips(url);
 }
+
+// Shared empty-array sentinel so React's `useMemo` dependency comparison
+// stays stable across renders for skipped optional clips.
+const EMPTY_CLIPS: THREE.AnimationClip[] = [];
 
 /* ── Error boundary ── */
 class AvatarErrorBoundary extends Component<
@@ -1421,18 +1469,7 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
     <AvatarErrorBoundary fallback={(err) => <FallbackOrb isSpeaking={isSpeaking} error={err} />}>
       <Suspense fallback={<Loader />}>
         <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
-          <Canvas
-            camera={{ position: [0, 0.05, CAMERA_Z_NEAR], fov: 36 }}
-            gl={{ alpha: true, antialias: true }}
-            dpr={[1, 2]}
-            shadows
-            onCreated={({ gl }) => {
-              gl.toneMapping = THREE.ACESFilmicToneMapping;
-              gl.toneMappingExposure = 1.15;
-              gl.outputColorSpace = THREE.SRGBColorSpace;
-            }}
-            style={{ background: "transparent", width: "100%", height: "100%" }}
-          >
+          <DeviceTunedCanvas isSpeaking={isSpeaking}>
             <ambientLight intensity={0.7} />
             <directionalLight position={[2, 3, 3]} intensity={1.0} />
             <directionalLight position={[-1.5, 2, 1]} intensity={0.35} color="#ffeedd" />
@@ -1448,18 +1485,85 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
               onAnimStateChangeRef={onAnimStateChangeRef}
               onReadyRef={onReadyRef}
             />
-          </Canvas>
+          </DeviceTunedCanvas>
         </div>
       </Suspense>
     </AvatarErrorBoundary>
   );
 }
 
+/**
+ * Resolve the device profile once at mount and feed its caps into
+ * `<Canvas>`. Splitting this out keeps the Canvas children stable
+ * (lights / camera / model) while letting us swap renderer settings
+ * per-tier without re-creating the GL context on every parent render.
+ *
+ * Profile dimensions used here:
+ *   - `maxDpr` → `dpr={[1, profile.maxDpr]}` so retina displays still
+ *     get an upgrade where the GPU can afford it.
+ *   - `antialias` → only enabled on `high` tier non-iOS devices; MSAA
+ *     is the single biggest cause of mobile-Safari OOM.
+ *   - `shadows` → likewise off everywhere except `high`. We have no
+ *     `castShadow` props in the scene so this only affects the
+ *     internal shadow-map allocation — still worth saving on low-end.
+ *   - `powerPreference` → hint to the browser for GPU selection on
+ *     dual-GPU machines and battery-friendly schedulers on mobile.
+ *   - `anisotropy` → clamped to GPU max and applied to all textures
+ *     after the renderer is created.
+ */
+function DeviceTunedCanvas({
+  isSpeaking: _isSpeaking,
+  children,
+}: {
+  isSpeaking: boolean;
+  children: ReactNode;
+}) {
+  void _isSpeaking;
+  // Resolved once — the inputs (UA / GPU / RAM) cannot change without a
+  // page reload, so re-evaluating per render would just churn caches.
+  const profile = useMemo(() => getDeviceProfile(), []);
+  return (
+    <Canvas
+      camera={{ position: [0, 0.05, CAMERA_Z_NEAR], fov: 36 }}
+      gl={{
+        alpha: true,
+        antialias: profile.antialias,
+        powerPreference: profile.powerPreference,
+        // Stencil + depth flags help the WebGL implementation pick a
+        // smaller framebuffer on tile-based mobile GPUs.
+        stencil: profile.tier === "high",
+        depth: true,
+      }}
+      dpr={[1, profile.maxDpr]}
+      shadows={profile.shadows}
+      onCreated={({ gl }) => {
+        gl.toneMapping = THREE.ACESFilmicToneMapping;
+        gl.toneMappingExposure = profile.toneMappingExposure;
+        gl.outputColorSpace = THREE.SRGBColorSpace;
+        // Clamp texture anisotropy to whatever the GPU actually supports
+        // so the requested cap from the profile never exceeds hardware.
+        // Stash on a typed shim so future texture loaders can pick it up
+        // without re-querying the renderer.
+        const gpuMaxAniso = gl.capabilities?.getMaxAnisotropy?.() ?? 1;
+        const targetAniso = Math.min(profile.anisotropy, gpuMaxAniso);
+        (gl as unknown as { __maxAnisotropy?: number }).__maxAnisotropy = targetAniso;
+      }}
+      style={{ background: "transparent", width: "100%", height: "100%" }}
+    >
+      {children}
+    </Canvas>
+  );
+}
+
 // Warm the FBX caches so the avatar + animations are ready by the time the
 // component mounts (avoids a Suspense fallback flicker after first paint).
+// On low-tier devices we skip the optional gesture FBXs so we don't burn
+// memory + bandwidth on animations that will never play.
 if (typeof window !== "undefined") {
   void loadFbxScene(AVATAR_URL);
+  const profile = getDeviceProfile();
   ALL_ANIM_URLS.forEach((url) => {
+    if (!isAssetEnabled(url, profile)) return;
     void loadFbxClips(url);
   });
 }

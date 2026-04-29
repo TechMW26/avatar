@@ -24,12 +24,16 @@ import { put } from '@vercel/blob';
 const ROOT = path.resolve(process.cwd(), 'public');
 const ASSETS = [
   'avatar.fbx',
-  'animations/breathing-idle.fbx',
-  'animations/sitting-idle.fbx',
-  'animations/standing.fbx',
-  'animations/stop-walking.fbx',
+  // Heavy idle/walking/waving Mixamo exports are pre-extracted to compact
+  // AnimationClip JSON via `scripts/extract-clips.mjs`. Avatar3D.tsx reads
+  // these `.clip.json` URLs directly; the source 74 MB `.fbx` files no
+  // longer need to be uploaded.
+  'animations/breathing-idle.clip.json',
+  'animations/sitting-idle.clip.json',
+  'animations/standing.clip.json',
+  'animations/stop-walking.clip.json',
   'animations/walking.fbx',
-  'animations/waving.fbx',
+  'animations/waving.clip.json',
   'animations/praying.fbx',
   'animations/explaining.fbx',
   'animations/yelling.fbx',
