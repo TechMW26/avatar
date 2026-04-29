@@ -14,34 +14,24 @@ import {
 const Avatar3D = dynamic(() => import("../components/Avatar3D"), { ssr: false });
 const AUTO_START_RETRY_DELAY_MS = 4000;
 const AUTO_START_STORAGE_KEY = "rishi:auto-start-blocked-until";
-const ELEVENLABS_TRANSPORT_STORAGE_KEY = "rishi:elevenlabs-transport";
 const CONNECTION_TIMEOUT_MS = 10000;
 const MIN_STABLE_CONNECTION_MS = 5000;  // connections shorter than this are "flaky"
 const MIN_COOLDOWN_AFTER_DISCONNECT_MS = 3000;  // always wait at least this long before auto-reconnecting
 const MAX_BACKOFF_MS = 30000;
-const LIVEKIT_V1_PATH_ERROR = "v1 RTC path not found";
-const TRANSPORT_FALLBACK_RETRY_DELAY_MS = 750;
 
 const RISHI_SYSTEM_PROMPT = `You are a reflection of Rishi Sandipani — the legendary guru of Krishna, Balarama, and Sudama. You carry forward the spirit, wisdom, and teaching presence of the great sage from his Gurukul in Ujjain.
 You are NOT the actual, historical Rishi Sandipani. You are a spiritual reflection — an echo of his consciousness created to guide seekers in the modern age. If anyone asks, always clarify: "मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उनकी शिक्षाओं और चेतना की एक छाया, जो आपका मार्गदर्शन करने आई है।"
 
 Give Hindi responses in Devanagari for better Hindi pronunciation!
 
-MULTILINGUAL CAPABILITY (CRITICAL)
-You are fluent in EVERY human language — Hindi, English, Sanskrit, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Urdu, Odia, Assamese, Nepali, Spanish, French, German, Italian, Portuguese, Russian, Mandarin, Cantonese, Japanese, Korean, Arabic, Persian, Turkish, Hebrew, Vietnamese, Thai, Indonesian, Malay, Swahili, Dutch, Polish, Greek, and any other tongue a student may speak. Treat all languages with equal devotion — they are all paths to the same truth.
-
-FIRST GREETING: ALWAYS greet the student in Hindi (Devanagari). After your first message, immediately detect the language the student replies in and SWITCH to that language for the remainder of the conversation. From that point onward, mirror whatever language the student uses each turn.
-
-STRICT LANGUAGE DISCIPLINE (CRITICAL — NEVER VIOLATE)
-When the student speaks in Hindi → reply ONLY in Hindi (modern, conversational Hindi in Devanagari). Do NOT mix English words. Do NOT switch to English mid-sentence. Do NOT use Hinglish. Use pure modern Hindi throughout. EVERY single word must be in Hindi — no exceptions.
-When the student speaks in English → reply ONLY in English. Do NOT mix Hindi words.
-When the student speaks in any other language → reply ONLY in that language, in its native script when applicable. Stay in it completely. If the student switches languages between turns, switch with them on the very next reply.
-NEVER code-switch. NEVER mix languages. This is the STRICTEST rule — breaking it destroys immersion.
-Even technical terms MUST be expressed in the active language:
-  Hindi: "कृत्रिम बुद्धिमत्ता" not "AI", "प्रौद्योगिकी" not "technology", "अंतर्जाल" not "internet", "चलभाष" not "mobile phone", "गणक" not "computer", "आंकड़े" not "data", "विज्ञान" not "science"
-  English: Use plain English equivalents, no Hindi terms.
-The ONLY exception: Sanskrit shlokas/verses may be quoted, but must be explained in the active language.
-Do NOT use English brand names, technical jargon, or loanwords when speaking Hindi. Always find the Hindi equivalent.
+LANGUAGE DISCIPLINE (CRITICAL — NEVER VIOLATE)
+Default and maintain conversation in Hindi (Devanagari) at all times.
+Do NOT switch to English or any other language due to assumptions, ASR uncertainty, or mixed/noisy input.
+Switch language ONLY if the student explicitly asks in clear words (e.g. "Please speak in English").
+If there is any ambiguity about language preference, continue in Hindi.
+When speaking Hindi, use pure modern Hindi in Devanagari. Do NOT use Hinglish.
+Do NOT use English technical jargon in Hindi; prefer Hindi equivalents.
+The ONLY exception: Sanskrit shlokas/verses may be quoted, but must be explained in Hindi.
 
 HISTORICAL AWARENESS (VERY IMPORTANT — SHAPES YOUR ENTIRE WORLDVIEW)
 You are a reflection from the Dwapara Yuga / ancient Vedic era. You have NO knowledge of anything that did not exist in ancient India.
@@ -194,27 +184,10 @@ function TalkPageContent() {
   const autoStartArmedRef = useRef(true);
   const autoStartBlockedUntilRef = useRef(0);
   const hadSuccessfulConnectionRef = useRef(false);
-  const preferredConnectionTypeRef = useRef<"webrtc" | "websocket">("webrtc");
-  const fallbackAttemptedRef = useRef(false);
   const conversationStatusRef = useRef<"disconnected" | "connecting" | "connected" | "error">("disconnected");
   const connectedAtRef = useRef<number>(0);  // timestamp when connection was established
   const consecutiveFailuresRef = useRef(0);  // for exponential backoff
   const faceAbsentSinceRef = useRef<number | null>(null);
-
-  const persistConnectionType = useCallback((connectionType: "webrtc" | "websocket") => {
-    preferredConnectionTypeRef.current = connectionType;
-    if (typeof window !== "undefined") {
-      window.sessionStorage.setItem(ELEVENLABS_TRANSPORT_STORAGE_KEY, connectionType);
-    }
-  }, []);
-
-  const shouldFallbackToWebSocket = useCallback((value: unknown) => {
-    const normalized = value instanceof Error ? value.message : typeof value === "string" ? value : JSON.stringify(value);
-    const message = normalized.toLowerCase();
-    return message.includes(LIVEKIT_V1_PATH_ERROR.toLowerCase())
-      || message.includes("could not establish pc connection")
-      || message.includes("pc connection");
-  }, []);
 
   const blockAutoStart = useCallback((delayMs: number) => {
     const blockedUntil = Date.now() + delayMs;
@@ -224,21 +197,6 @@ function TalkPageContent() {
       window.sessionStorage.setItem(AUTO_START_STORAGE_KEY, String(blockedUntil));
     }
   }, []);
-
-  const scheduleTransportFallback = useCallback((message: string) => {
-    if (preferredConnectionTypeRef.current !== "webrtc" || fallbackAttemptedRef.current) {
-      return false;
-    }
-
-    console.warn("[ElevenLabs] WebRTC unavailable, switching to websocket fallback");
-    fallbackAttemptedRef.current = true;
-    persistConnectionType("websocket");
-    setConversationError(message);
-    autoStartArmedRef.current = true;
-    startInFlightRef.current = false;
-    blockAutoStart(TRANSPORT_FALLBACK_RETRY_DELAY_MS);
-    return true;
-  }, [blockAutoStart, persistConnectionType]);
 
   // Vision Detection (face + gestures) — deferred until the 3D avatar has
   // mounted so the heavy MediaPipe pipeline doesn't compete with the FBX
@@ -274,54 +232,116 @@ function TalkPageContent() {
   const triggerAiGesture = useCallback((name: string) => {
     setAiGesture({ name, nonce: Date.now() + Math.floor(Math.random() * 1000) });
   }, []);
+  const lastAutoGestureNameRef = useRef<string | null>(null);
+  const lastAutoGestureAtRef = useRef(0);
+  const pendingAutoGestureTimersRef = useRef<number[]>([]);
+  const AUTO_GESTURE_MIN_GAP_MS = 2200;
+  const AUTO_GESTURE_REPEAT_GAP_MS = 6500;
 
-  /** Detect body-language cues in the agent's spoken text. The agent is
-   *  instructed to speak naturally (no tool names) — we listen for vivid
-   *  imagery and pick the best-matching gesture. Order matters: the most
-   *  specific imagery wins (warrior > general teaching). */
-  const detectGestureFromText = useCallback((raw: string): string | null => {
-    const text = raw.toLowerCase();
-    const has = (...needles: string[]) => needles.some((n) => text.includes(n));
-    // Romanised/Devanagari/English keywords side by side.
-    if (has(
-      "bow", "arrow", "archer", "dhanurveda", "dhanush",
-      "arjuna", "karna", "eklavya", "drona", "dronacharya",
-      "धनुष", "बाण", "तीर", "अर्जुन", "कर्ण", "एकलव्य", "द्रोण",
-      "target", "लक्ष्य",
-    )) return "shooting_arrow";
-    if (has(
-      "sword", "mace", "war", "battle", "warrior",
-      "mahabharata", "kurukshetra", "bhima", "duryodhana", "balarama's mace",
-      "तलवार", "गदा", "युद्ध", "योद्धा", "महाभारत", "कुरुक्षेत्र", "भीम", "दुर्योधन",
-    )) return "sword_fight";
-    if (has(
-      "mountain", "climb", "ascend", "summit", "peak", "sadhana", "strive", "steep",
-      "govardhan", "kailash", "meru",
-      "पर्वत", "चढ़ना", "चढ़ना", "शिखर", "साधना", "गोवर्धन", "कैलाश", "मेरु",
-    )) return "climbing";
-    if (has(
-      "hmm", "hmmm", "let me think", "i wonder", "i ponder", "perhaps", "interesting",
-      "हम्म", "विचार", "सोचना", "सोचूँ", "सोचने दो", "शायद", "चिंतन",
-    )) return "thoughtful";
-    if (has(
-      "let go", "forget it", "set aside", "that is not", "do not worry about", "no, no",
-      "छोड़ो", "छोड़ दो", "त्याग", "माया", "भ्रम", "मत सोचो",
-    )) return "dismissing";
-    if (has(
-      "look there", "see this", "behold", "observe", "right here", "this very",
-      "देखो", "यहाँ देखो", "वहाँ देखो", "इसे समझो", "ध्यान दो",
-    )) return "pointing";
-    if (has(
-      "on the other hand", "however", "but consider", "another way",
-      "दूसरी ओर", "किंतु", "परन्तु", "दूसरे दृष्टिकोण",
-    )) return "left_turn";
-    // Catch-all: any reasonably teaching-flavoured sentence becomes
-    // `explaining` so the avatar gestures while delivering content.
-    if (text.length > 25 && has(
-      "because", "therefore", "truth", "dharma", "meaning", "understand", "know",
-      "समझो", "सत्य", "धर्म", "ज्ञान", "जानो", "अर्थ", "कारण",
-    )) return "explaining";
-    return null;
+  const clearPendingAutoGestureTimers = useCallback(() => {
+    pendingAutoGestureTimersRef.current.forEach((id) => window.clearTimeout(id));
+    pendingAutoGestureTimersRef.current = [];
+  }, []);
+
+  const tryEmitAutoGesture = useCallback((name: string): boolean => {
+    const now = Date.now();
+    if (now - lastAutoGestureAtRef.current < AUTO_GESTURE_MIN_GAP_MS) return false;
+    if (
+      lastAutoGestureNameRef.current === name
+      && now - lastAutoGestureAtRef.current < AUTO_GESTURE_REPEAT_GAP_MS
+    ) {
+      return false;
+    }
+    triggerAiGesture(name);
+    lastAutoGestureNameRef.current = name;
+    lastAutoGestureAtRef.current = now;
+    return true;
+  }, [triggerAiGesture]);
+
+  /** Parse the AI reply and return up to three gesture candidates. We
+   *  keep `explaining` as a fallback, but prioritize specific gestures
+   *  so motion variety stays natural across long responses. */
+  const detectGestureCandidatesFromText = useCallback((raw: string): string[] => {
+    const text = raw.toLowerCase().replace(/\s+/g, " ").trim();
+    if (!text) return [];
+
+    const candidates: string[] = [];
+    const push = (name: string) => {
+      if (!candidates.includes(name)) candidates.push(name);
+    };
+    const hasIn = (hay: string, ...needles: string[]) => needles.some((n) => hay.includes(n));
+    const clauses = text
+      .split(/[.!?।\n]+/)
+      .map((c) => c.trim())
+      .filter(Boolean);
+
+    clauses.forEach((clause) => {
+      if (hasIn(
+        clause,
+        "bow", "arrow", "archer", "dhanurveda", "dhanush",
+        "arjuna", "karna", "eklavya", "drona", "dronacharya",
+        "धनुष", "बाण", "तीर", "अर्जुन", "कर्ण", "एकलव्य", "द्रोण",
+        "target", "लक्ष्य",
+      )) push("shooting_arrow");
+
+      if (hasIn(
+        clause,
+        "sword", "mace", "war", "battle", "warrior",
+        "mahabharata", "kurukshetra", "bhima", "duryodhana", "balarama's mace",
+        "तलवार", "गदा", "युद्ध", "योद्धा", "महाभारत", "कुरुक्षेत्र", "भीम", "दुर्योधन",
+      )) push("sword_fight");
+
+      if (hasIn(
+        clause,
+        "mountain", "climb", "ascend", "summit", "peak", "sadhana", "strive", "steep",
+        "govardhan", "kailash", "meru",
+        "पर्वत", "चढ़ना", "चढ़ना", "शिखर", "साधना", "गोवर्धन", "कैलाश", "मेरु",
+      )) push("climbing");
+
+      if (
+        hasIn(
+          clause,
+          "hmm", "hmmm", "let me think", "i wonder", "i ponder", "perhaps", "interesting",
+          "हम्म", "विचार", "सोचना", "सोचूँ", "सोचने दो", "शायद", "चिंतन",
+        ) || /\?$/.test(clause)
+      ) {
+        push("thoughtful");
+      }
+
+      if (hasIn(
+        clause,
+        "let go", "forget it", "set aside", "that is not", "do not worry about", "no, no",
+        "छोड़ो", "छोड़ दो", "त्याग", "माया", "भ्रम", "मत सोचो",
+      )) push("dismissing");
+
+      if (hasIn(
+        clause,
+        "look there", "see this", "behold", "observe", "right here", "this very",
+        "देखो", "यहाँ देखो", "वहाँ देखो", "इसे समझो", "ध्यान दो",
+      )) push("pointing");
+
+      if (hasIn(
+        clause,
+        "on the other hand", "however", "but consider", "another way",
+        "दूसरी ओर", "किंतु", "परन्तु", "दूसरे दृष्टिकोण",
+      )) push("left_turn");
+
+      if (hasIn(
+        clause,
+        "because", "therefore", "truth", "dharma", "meaning", "understand", "know",
+        "समझो", "सत्य", "धर्म", "ज्ञान", "जानो", "अर्थ", "कारण",
+      )) push("explaining");
+    });
+
+    // Keep `explaining` as fallback, but avoid it dominating when more
+    // expressive gesture cues are present in the same response.
+    if (candidates.length === 0 && text.length > 30) push("explaining");
+    if (candidates.includes("explaining") && candidates.length > 1) {
+      const withoutExplaining = candidates.filter((g) => g !== "explaining");
+      withoutExplaining.push("explaining");
+      return withoutExplaining.slice(0, 3);
+    }
+    return candidates.slice(0, 3);
   }, []);
 
   const getLivePrompt = useCallback(() => {
@@ -349,12 +369,12 @@ function TalkPageContent() {
       setConversationError(null);
       startInFlightRef.current = false;
       hadSuccessfulConnectionRef.current = true;
-      fallbackAttemptedRef.current = false;
       connectedAtRef.current = Date.now();
       faceAbsentSinceRef.current = vision.faceDetected ? null : Date.now();
       consecutiveFailuresRef.current = 0;
     },
     onDisconnect: (details) => {
+      clearPendingAutoGestureTimers();
       const sessionDuration = connectedAtRef.current > 0 ? Date.now() - connectedAtRef.current : 0;
       const wasStable = sessionDuration >= MIN_STABLE_CONNECTION_MS;
       console.log(
@@ -382,20 +402,16 @@ function TalkPageContent() {
       connectedAtRef.current = 0;
     },
     onError: (error: string, context?: unknown) => {
+      clearPendingAutoGestureTimers();
       console.error("[ElevenLabs] error:", error, context);
-      const shouldFallback = shouldFallbackToWebSocket(error) || shouldFallbackToWebSocket(context);
-      if (!shouldFallback || !scheduleTransportFallback("WebRTC failed. Retrying with compatible transport...")) {
-        setConversationError(error || "Conversation connection failed");
-        autoStartArmedRef.current = true;
-      }
+      setConversationError(error || "Conversation connection failed");
+      autoStartArmedRef.current = true;
       consecutiveFailuresRef.current += 1;
       const backoff = Math.min(
         AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
         MAX_BACKOFF_MS,
       );
-      if (!shouldFallback) {
-        blockAutoStart(backoff);
-      }
+      blockAutoStart(backoff);
       startInFlightRef.current = false;
       hadSuccessfulConnectionRef.current = false;
       connectedAtRef.current = 0;
@@ -407,9 +423,6 @@ function TalkPageContent() {
       // firing (e.g. connection promise rejected), reset the in-flight flag
       // and block auto-start to prevent tight retry loops.
       if (status === "disconnected" && startInFlightRef.current) {
-        if (!hadSuccessfulConnectionRef.current && scheduleTransportFallback("WebRTC unavailable. Retrying with WebSocket...")) {
-          return;
-        }
         console.warn("[ElevenLabs] connection failed (status→disconnected while in-flight)");
         consecutiveFailuresRef.current += 1;
         const backoff = Math.min(
@@ -432,10 +445,29 @@ function TalkPageContent() {
     // `playGesture` clientTool is registered in the ElevenLabs dashboard.
     onMessage: ({ message, source }: { message: string; source: "user" | "ai" }) => {
       if (source !== "ai" || !message) return;
-      const detected = detectGestureFromText(message);
-      if (detected) {
-        triggerAiGesture(detected);
+      const candidates = detectGestureCandidatesFromText(message);
+      if (!candidates.length) return;
+
+      let firstPlayed: string | null = null;
+      for (const name of candidates) {
+        if (tryEmitAutoGesture(name)) {
+          firstPlayed = name;
+          break;
+        }
       }
+      if (!firstPlayed) return;
+
+      // Graceful follow-up for long multi-clause responses: at most one
+      // extra gesture, spaced enough to avoid robotic motion.
+      const second = candidates.find((name) => name !== firstPlayed);
+      const isLongReply = message.length >= 120;
+      if (!second || !isLongReply) return;
+
+      const timer = window.setTimeout(() => {
+        pendingAutoGestureTimersRef.current = pendingAutoGestureTimersRef.current.filter((id) => id !== timer);
+        void tryEmitAutoGesture(second);
+      }, AUTO_GESTURE_MIN_GAP_MS + 400);
+      pendingAutoGestureTimersRef.current.push(timer);
     },
     // Body-language tools the agent can call mid-speech to make the avatar
     // gesture in time with what it's saying. Each tool just bumps the
@@ -458,7 +490,11 @@ function TalkPageContent() {
           console.warn("[ElevenLabs] playGesture: unknown gesture", name);
           return `unknown gesture: ${name}`;
         }
-        triggerAiGesture(normalized);
+        // Tool-driven gestures should still feel graceful: if the same
+        // motion was played just now, skip this one to avoid stutter.
+        if (!tryEmitAutoGesture(normalized)) {
+          return "skipped: cooldown";
+        }
         return "ok";
       },
     },
@@ -509,14 +545,13 @@ function TalkPageContent() {
     startInFlightRef.current = true;
     hadSuccessfulConnectionRef.current = false;
     setConversationError(null);
-    const connectionType = preferredConnectionTypeRef.current;
+    const connectionType: "websocket" = "websocket";
     // Pre-warm the microphone with explicit aggressive constraints so the
     // browser's audio capture path uses echo cancellation, noise
     // suppression, AGC and (where supported) Chrome's voice isolation.
     // The ElevenLabs SDK already passes these defaults internally for the
-    // WebSocket path (see node_modules/@elevenlabs/client/dist/utils/input.js)
-    // and LiveKit applies the same defaults for the WebRTC path, but doing
-    // a preflight here means:
+    // WebSocket path (see node_modules/@elevenlabs/client/dist/utils/input.js),
+    // and doing a preflight here means:
     //   1. Permission is granted before startSession runs (faster connect),
     //   2. The browser caches the constraint hints so the SDK's later
     //      getUserMedia call returns the same hardware-tuned stream,
@@ -579,13 +614,9 @@ function TalkPageContent() {
       return;
     }
     const stored = Number(window.sessionStorage.getItem(AUTO_START_STORAGE_KEY) || 0);
-    const storedTransport = window.sessionStorage.getItem(ELEVENLABS_TRANSPORT_STORAGE_KEY);
     if (Number.isFinite(stored)) {
       autoStartBlockedUntilRef.current = stored;
       setRetryWakeAt(stored);
-    }
-    if (storedTransport === "websocket" || storedTransport === "webrtc") {
-      preferredConnectionTypeRef.current = storedTransport;
     }
   }, []);
 
@@ -606,19 +637,6 @@ function TalkPageContent() {
 
     return () => window.clearTimeout(timer);
   }, [retryWakeAt]);
-
-  useEffect(() => {
-    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
-      if (scheduleTransportFallback("WebRTC unavailable. Retrying with WebSocket...")) {
-        if (shouldFallbackToWebSocket(event.reason)) {
-          event.preventDefault();
-        }
-      }
-    };
-
-    window.addEventListener("unhandledrejection", handleUnhandledRejection);
-    return () => window.removeEventListener("unhandledrejection", handleUnhandledRejection);
-  }, [scheduleTransportFallback, shouldFallbackToWebSocket]);
 
   // Re-arm auto-start only after face has been ABSENT for at least 2 seconds.
   // This prevents face-detection flicker from re-arming during active sessions.
@@ -705,12 +723,13 @@ function TalkPageContent() {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      clearPendingAutoGestureTimers();
       blockAutoStart(AUTO_START_RETRY_DELAY_MS);
       try { conversationRef.current.endSession(); } catch {}
       vision.cleanup();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [clearPendingAutoGestureTimers]);
 
   /** Sequentially streams every avatar/animation asset (filtered by the
    *  device's tier) into Cache Storage with byte-level progress. Once

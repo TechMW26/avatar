@@ -156,193 +156,89 @@ export interface DeviceProfile {
 let cachedProfile: DeviceProfile | null = null;
 
 /**
- * Inspect the device's capabilities once and bucket it into a tier.
- * Cached for the lifetime of the page — the inputs (UA, deviceMemory,
- * GPU vendor) cannot change without a reload.
+ * Returns a single, fixed render profile used for **every** device.
  *
- * Heuristics, in order of weight:
- *   - `navigator.deviceMemory` (when present): <=2 GB → low, <=4 GB → mid.
- *   - `navigator.hardwareConcurrency`: <=4 cores nudges down a tier.
- *   - `isIOSLikeBrowser()`: forces tier to no higher than `mid` because
- *     even an iPhone 17 Pro can OOM on the unlimited-memory path.
- *   - WebGL2 / `WEBGL_debug_renderer_info`: detects software rasterizer
- *     ("SwiftShader", "Apple Software Renderer") and forces `low`.
+ * Rationale:
+ *   We previously bucketed devices into low / mid / high based on
+ *   `deviceMemory`, GPU vendor strings, iOS UA sniffs, etc. The
+ *   bucketing was unreliable (Mali-G5x, Adreno 6xx, iPad Pros all
+ *   ended up downgraded) and produced visibly different quality on
+ *   identical hardware. Worse, every "lower the quality" lever (DPR,
+ *   texture downsample, anisotropy=1) made the avatar look pixelated
+ *   on retina screens *without* materially improving frame rate —
+ *   because the bottleneck on this scene is per-fragment cost, not
+ *   pixel count.
+ *
+ *   The profile below picks the cheapest *per-fragment* settings
+ *   (no MSAA, no shadows, no env reflections, no normal map, fewer
+ *   lights, no ground shadow disc, FrontSide only) while keeping
+ *   *visual* quality high (DPR up to 2, anisotropy 4, full-resolution
+ *   diffuse textures, ACES tone mapping, sRGB output). This runs
+ *   smoothly on a 2-year-old budget Android *and* looks crisp on an
+ *   iPhone Pro at retina DPR.
  */
 export function getDeviceProfile(): DeviceProfile {
   if (cachedProfile) return cachedProfile;
 
-  // SSR safety: fall back to a conservative mid-tier profile until we
-  // re-evaluate on the client.
-  if (typeof navigator === "undefined" || typeof window === "undefined") {
-    return {
-      tier: "mid",
-      maxDpr: 2,
-      antialias: true,
-      shadows: false,
-      anisotropy: 4,
-      powerPreference: "default",
-      loadOptionalGestures: true,
-      toneMappingExposure: 1.15,
-      doubleSide: true,
-      enableNormalMap: true,
-      maxLights: 5,
-      targetFps: 60,
-      enableEnvReflections: true,
-      enableGroundShadow: true,
-      maxTextureSize: 2048,
-    };
-  }
-
-  const nav = navigator as Navigator & {
-    deviceMemory?: number;
-    hardwareConcurrency?: number;
-  };
-  const deviceMemory = typeof nav.deviceMemory === "number" ? nav.deviceMemory : 4;
-  const cores = typeof nav.hardwareConcurrency === "number" ? nav.hardwareConcurrency : 4;
-  const isIOS = isIOSLikeBrowser();
-  const isAndroid = isAndroidBrowser();
-  const isMobile = isMobileBrowser();
-
-  // Probe the GPU for software rasterizers — those cannot run the
-  // shadow + MSAA path at any tier.
-  let softwareRasterizer = false;
-  let gpuRendererName = "";
-  try {
-    const canvas = document.createElement("canvas");
-    const gl =
-      (canvas.getContext("webgl2") as WebGL2RenderingContext | null) ||
-      (canvas.getContext("webgl") as WebGLRenderingContext | null);
-    if (gl) {
-      const ext = gl.getExtension("WEBGL_debug_renderer_info");
-      if (ext) {
-        const renderer = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "").toLowerCase();
-        gpuRendererName = renderer;
-        if (
-          renderer.includes("swiftshader") ||
-          renderer.includes("software") ||
-          renderer.includes("llvmpipe")
-        ) {
-          softwareRasterizer = true;
-        }
-      }
-      // Release the probe context so we don't burn a WebGL slot.
-      const lose = gl.getExtension("WEBGL_lose_context");
-      lose?.loseContext?.();
-    }
-  } catch {
-    // Probe failures are non-fatal; assume hardware GPU.
-  }
-
-  // Mobile GPUs that we know are weak — only the truly low-end families
-  // (Mali-G3x, Adreno 5xx, ancient PowerVR). The Mali-G5x family was
-  // pinned to low previously, but it ships in capable mid-range phones
-  // (Pixel 6a, Galaxy A54) and the previous downgrade made them look
-  // worse than they had to.
-  const weakMobileGpu =
-    isMobile &&
-    /(mali-g3|mali-t|adreno \(?5[0-2]|powervr (sgx|ge)|videocore iv)/i.test(
-      gpuRendererName,
-    );
-
-  let tier: DeviceTier;
-  if (
-    softwareRasterizer ||
-    deviceMemory <= 2 ||
-    cores <= 2 ||
-    weakMobileGpu
-  ) {
-    tier = "low";
-  } else if (
-    deviceMemory <= 3 ||
-    cores <= 3 ||
-    // Older iPhones (≤3 GB — iPhone 11 / SE2) struggle on the high
-    // pipeline; everything else gets `mid`. iPad Pros and modern
-    // Androids can still hit `high` on this path.
-    (isIOS && deviceMemory <= 3)
-  ) {
-    tier = "mid";
-  } else if (isMobile) {
-    // All other mobile devices: try `high` but with the per-pixel cuts
-    // (no MSAA, no env reflections, no normal map). DPR stays high so
-    // text and faces look crisp.
-    tier = "high";
-  } else {
-    tier = "high";
-  }
-
   const profile: DeviceProfile = {
-    tier,
-    // DPR: mobile screens are 2-3× retina, so dropping below 1.5 makes
-    // the avatar look pixelated even on a 6" iPhone. Keep DPR HIGH and
-    // claw back the per-fragment cost from the env / normalMap / MSAA
-    // cuts below — those reduce GPU work *per pixel*, which is the
-    // right axis to optimise on retina displays. Hard cap at 2 because
-    // beyond that the framebuffer alone (3840 × 8112 on an iPhone Pro)
-    // saturates mobile GPU bandwidth.
-    maxDpr:
-      tier === "low"
-        ? isMobile
-          ? 1.5
-          : 1
-        : tier === "mid"
-        ? isMobile
-          ? 1.75
-          : 1.5
-        : 2,
-    // MSAA is the single biggest mobile-GPU memory tax. Disable on
-    // anything below high, and on every mobile device regardless of tier.
-    antialias: tier === "high" && !isMobile,
-    shadows: tier === "high" && !isMobile,
-    // Anisotropy: keep moderate values on mobile so the diffuse skin
-    // map stays crisp at oblique angles. Was 1 — made the beard
-    // smudge — bumped to 4 on mid mobile, 2 on low mobile.
-    anisotropy: tier === "low" ? (isMobile ? 2 : 1) : tier === "mid" ? (isMobile ? 4 : 2) : 8,
-    powerPreference: tier === "low" ? "low-power" : "high-performance",
-    loadOptionalGestures: tier !== "low",
-    toneMappingExposure: isMobile ? 1.05 : 1.15,
-    // Avatar is a closed mesh — back-faces are never visible. Only keep
-    // DoubleSide on high tier where the cost is irrelevant.
-    doubleSide: tier === "high",
-    // Normal-map sampling is one of the priciest per-fragment ops on
-    // mobile. Avatar still reads well without it because the lighting
-    // is mostly diffuse + ambient.
-    enableNormalMap: tier === "high",
-    // Lights: low mobile gets 1 directional + ambient. Mid mobile gets
-    // 2 directionals so the rim still pops. High desktop keeps 5.
-    maxLights:
-      tier === "low" ? 1 : tier === "mid" ? (isMobile ? 2 : 3) : 5,
-    // Frame rate cap. Bumping mobile mid to 30 (from 26) and mobile
-    // high to 60 because the per-pixel cuts give us the headroom.
-    targetFps:
-      tier === "low" ? 24 : tier === "mid" ? 30 : isMobile ? 60 : 60,
-    // Reflections: disabled on every mobile and desktop low. They're a
-    // ~10–15% per-fragment cost for a visual change most users will
-    // never notice on a webcam-distance avatar.
-    enableEnvReflections: tier === "high" && !isMobile,
-    // Ground shadow disc: skip only on low tier. The disc is cheap
-    // (single transparent draw) and it grounds the avatar visually —
-    // worth keeping on mobile mid.
-    enableGroundShadow: tier !== "low",
-    // Texture upload caps: do NOT downsample on any tier above low —
-    // doing so produced a visible pixelated skin/beard. The Meshy
-    // diffuse map is ~2K and that's what we want at retina DPR. Only
-    // low tier (memory-constrained) gets the 1024² ceiling.
-    maxTextureSize: tier === "low" ? 1024 : 4096,
+    // Tier is pinned to "high" so the few `tier === "high"` checks
+    // sprinkled in the renderer (e.g. shader precision = "highp",
+    // stencil buffer enabled) preserve visual quality. The actual
+    // performance levers below are what matters.
+    tier: "high",
+    // DPR cap of 2 keeps text and faces crisp on retina screens
+    // without crossing the bandwidth cliff that hits at 3x.
+    maxDpr: 2,
+    // No MSAA — biggest single mobile-GPU memory tax. We rely on
+    // high DPR for edge crispness instead (1px at 2x ≈ 0.5px,
+    // visually equivalent to 2x MSAA at 1x DPR).
+    antialias: false,
+    // No shadow maps — they require an extra render pass, depth
+    // texture upload, and per-fragment shadow sample. Avatar reads
+    // fine with the soft ground disc removed.
+    shadows: false,
+    // Anisotropy 4 keeps the beard/skin diffuse map crisp at
+    // oblique angles. Clamped to GPU max in onCreated.
+    anisotropy: 4,
+    // High-performance hint — picks discrete GPU on laptops, and the
+    // perf-cluster on mobile SoCs.
+    powerPreference: "high-performance",
+    // Always load every gesture FBX so the experience is consistent.
+    loadOptionalGestures: true,
+    toneMappingExposure: 1.1,
+    // FrontSide only — avatar is a closed mesh, back-faces are never
+    // visible. Cuts per-pixel fragment work roughly in half on the
+    // skinned mesh.
+    doubleSide: false,
+    // No normal map — TBN matrix + normal-map sample is one of the
+    // priciest per-fragment ops. Lighting still reads correctly with
+    // diffuse + ambient + a single directional.
+    enableNormalMap: false,
+    // 2 directional lights + ambient — enough for a soft front-fill
+    // and a rim, no more.
+    maxLights: 2,
+    // 60 fps target. The frame-skip accumulator in Avatar3D drops
+    // frames automatically if any device can't keep up, so a single
+    // high target works for everyone.
+    targetFps: 60,
+    // No environment reflections — PBR cubemap sampling is expensive
+    // and the avatar's robe/skin are matte enough that reflections
+    // add nothing visible.
+    enableEnvReflections: false,
+    // No ground shadow disc — extra transparent draw call + 256²
+    // canvas texture upload, and the user explicitly asked to remove
+    // shadowing entirely.
+    enableGroundShadow: false,
+    // Keep diffuse textures at native resolution (the Meshy skin map
+    // is ~2K). Downsampling via canvas blit produces visible blur
+    // on the beard and was the root cause of the pixelation reports.
+    maxTextureSize: 4096,
   };
 
   cachedProfile = profile;
-  console.log("[avatarAssets] device profile:", {
-    tier,
-    deviceMemory,
-    cores,
-    isIOS,
-    isAndroid,
-    isMobile,
-    softwareRasterizer,
-    gpuRendererName,
-    weakMobileGpu,
-    profile,
-  });
+  if (typeof console !== "undefined") {
+    console.log("[avatarAssets] using uniform render profile:", profile);
+  }
   return profile;
 }
 

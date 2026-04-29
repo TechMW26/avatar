@@ -63,6 +63,9 @@ const VISION_CDN =
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const DETECTION_INTERVAL_MS = 100; // run detection every 100ms (~10fps detection)
+const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
+const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
+const FACE_LOSS_GRACE_MS = 700; // short grace window smooths mobile jitter
 
 function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
   const byName = new Map<string, GestureInfo>();
@@ -93,6 +96,11 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
   const [faceDetected, setFaceDetected] = useState(false);
   const [facePresenceDurationMs, setFacePresenceDurationMs] = useState(0);
   const [faceCount, setFaceCount] = useState(0);
+  const stableFaceDetectedRef = useRef(false);
+  const faceSeenStreakRef = useRef(0);
+  const faceMissStreakRef = useRef(0);
+  const lastFaceSeenAtRef = useRef(0);
+  const lastVideoTimestampRef = useRef(0);
 
   // Smile tracking (from face landmarks)
   const [userSmile, setUserSmile] = useState(0);
@@ -131,9 +139,26 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
         // 1. Request camera permission early & acquire stream
         //    Try "user" facing first, then fall back to any available camera (USB webcams on Pi)
         let stream: MediaStream | null = null;
+        const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+        const isMobile = /android|iphone|ipad|ipod/i.test(ua);
         const constraints: MediaStreamConstraints[] = [
-          { video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false },
-          { video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false },
+          {
+            video: {
+              facingMode: "user",
+              width: { ideal: isMobile ? 640 : 960 },
+              height: { ideal: isMobile ? 480 : 540 },
+              frameRate: { ideal: 24, max: 30 },
+            },
+            audio: false,
+          },
+          {
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 480 },
+              frameRate: { ideal: 24, max: 30 },
+            },
+            audio: false,
+          },
           { video: true, audio: false },
         ];
 
@@ -331,7 +356,13 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       return;
     }
 
-    const now = performance.now();
+    // MediaPipe VIDEO mode is happiest with media timestamps. On mobile,
+    // `performance.now()` + camera buffering can cause occasional
+    // non-monotonic frame timing and transient misses.
+    const mediaTs = video.currentTime * 1000;
+    const now = Number.isFinite(mediaTs) && mediaTs > 0 ? mediaTs : performance.now();
+    const safeNow = Math.max(now, lastVideoTimestampRef.current + 1);
+    lastVideoTimestampRef.current = safeNow;
 
     // Throttle detection to ~10fps for performance
     if (now - lastDetectionTimeRef.current < DETECTION_INTERVAL_MS) {
@@ -343,22 +374,45 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     // ── Face Detection ──
     let faceResult: FaceDetectorResult | null = null;
     try {
-      faceResult = faceDetector.detectForVideo(video, now);
+      faceResult = faceDetector.detectForVideo(video, safeNow);
     } catch {
       // MediaPipe can throw on timestamp issues; skip frame
     }
 
     const faces = faceResult?.detections?.length ?? 0;
-    const hasFace = faces > 0;
+    const hasFaceRaw = faces > 0;
+    if (hasFaceRaw) {
+      faceSeenStreakRef.current += 1;
+      faceMissStreakRef.current = 0;
+      lastFaceSeenAtRef.current = safeNow;
+    } else {
+      faceSeenStreakRef.current = 0;
+      faceMissStreakRef.current += 1;
+    }
 
-    setFaceCount(faces);
-    setFaceDetected(hasFace);
+    let hasFace = stableFaceDetectedRef.current;
+    if (!hasFace) {
+      if (faceSeenStreakRef.current >= FACE_ACQUIRE_FRAMES) {
+        hasFace = true;
+      }
+    } else {
+      const withinGrace = safeNow - lastFaceSeenAtRef.current <= FACE_LOSS_GRACE_MS;
+      if (!withinGrace && faceMissStreakRef.current >= FACE_LOSS_FRAMES) {
+        hasFace = false;
+      }
+    }
+
+    if (hasFace !== stableFaceDetectedRef.current) {
+      stableFaceDetectedRef.current = hasFace;
+      setFaceDetected(hasFace);
+    }
+    setFaceCount(hasFace ? Math.max(1, faces) : 0);
 
     if (hasFace) {
       if (faceStartRef.current === null) {
-        faceStartRef.current = now;
+        faceStartRef.current = safeNow;
       }
-      setFacePresenceDurationMs(now - faceStartRef.current);
+      setFacePresenceDurationMs(safeNow - faceStartRef.current);
     } else {
       faceStartRef.current = null;
       setFacePresenceDurationMs(0);
@@ -367,7 +421,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     // ── Smile Detection + Gender Detection (FaceLandmarker blendshapes + landmarks) ──
     if (faceLandmarker && hasFace) {
       try {
-        const landmarkResult = faceLandmarker.detectForVideo(video, now);
+        const landmarkResult = faceLandmarker.detectForVideo(video, safeNow);
         if (landmarkResult?.faceBlendshapes?.[0]?.categories) {
           const cats = landmarkResult.faceBlendshapes[0].categories;
           // Average of left and right mouth smile blendshapes
@@ -455,7 +509,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     // ── Gesture Recognition ──
     let gestureResult: GestureRecognizerResult | null = null;
     try {
-      gestureResult = gestureRecognizer.recognizeForVideo(video, now);
+      gestureResult = gestureRecognizer.recognizeForVideo(video, safeNow);
     } catch {
       // skip frame
     }
@@ -601,7 +655,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     if (objectDetector && now - lastHeavyDetectionRef.current > HEAVY_INTERVAL) {
       lastHeavyDetectionRef.current = now;
       try {
-        const objResult = objectDetector.detectForVideo(video, now);
+        const objResult = objectDetector.detectForVideo(video, safeNow);
         const hasPhone = objResult?.detections?.some(
           d => d.categories?.some(c => c.categoryName === "cell phone" && c.score > 0.4)
         ) ?? false;
@@ -667,6 +721,11 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
     }
     setIsReady(false);
     setFaceDetected(false);
+    stableFaceDetectedRef.current = false;
+    faceSeenStreakRef.current = 0;
+    faceMissStreakRef.current = 0;
+    lastFaceSeenAtRef.current = 0;
+    lastVideoTimestampRef.current = 0;
     setFacePresenceDurationMs(0);
     setFaceCount(0);
     setCurrentGestures([]);
