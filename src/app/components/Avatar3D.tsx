@@ -982,9 +982,9 @@ function AvatarModel({
           // off-screen for the last ~25% of the clip so the climb beat
           // lands before the falling state takes over.
           const CLIMB_LIFT_MAX = 4.0;
-          // Reach the off-screen top slightly earlier and hold a bit
-          // longer so the climb beat is readable before the fall starts.
-          yBias = CLIMB_LIFT_MAX * ss(0, 0.5, p);
+          // Reach the off-screen top slightly later so the ascent reads
+          // less abruptly on handhelds.
+          yBias = CLIMB_LIFT_MAX * ss(0, 0.55, p);
         }
       } else if (state === "falling") {
         const fa = actions.falling;
@@ -992,9 +992,10 @@ function AvatarModel({
           const dur = fa.getClip().duration || 1;
           const p = Math.max(0, Math.min(1, fa.time / dur));
           const FALL_FROM = 4.0;
-          // Short anticipation, then accelerate downward like gravity.
-          const gravityStart = 0.08;
-          const gravityEnd = 0.7;
+          // Start this clip only once the character is already meaningfully
+          // into the descent, then accelerate downward like gravity.
+          const gravityStart = 0.22;
+          const gravityEnd = 0.62;
           const t = Math.max(0, Math.min(1, (p - gravityStart) / (gravityEnd - gravityStart)));
           const dropProgress = t * t;
           yBias = FALL_FROM * (1 - dropProgress);
@@ -1135,10 +1136,23 @@ function AvatarModel({
       notify(next);
       const playing = fadeToClip(STATE_TARGETS[next].clipKey, loop, once, fade);
 
+      if (next === "climbing") {
+        const climbingAction = actions.climbing;
+        if (climbingAction) {
+          climbingAction.setEffectiveTimeScale(0.9);
+        }
+      }
+
       if (next === "falling") {
         const fallingAction = actions.falling;
         if (fallingAction) {
           fallingAction.setEffectiveTimeScale(1.35);
+          const clip = fallingAction.getClip();
+          if (clip.duration > 0.001) {
+            // Skip the earliest portion so the falling body motion starts
+            // once the character is already lower in the air.
+            fallingAction.time = clip.duration * 0.22;
+          }
         }
       }
 
