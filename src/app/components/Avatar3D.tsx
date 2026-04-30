@@ -1294,14 +1294,13 @@ function AvatarModel({
           } else if (
             ai &&
             ai.nonce !== lastAiNonceRef.current &&
-            ai.name === "climbing" &&
-            actions.climbing &&
-            now - lastClimbAtRef.current > Math.max(8_000, SAME_GESTURE_COOLDOWN_MS)
+            ai.name === "climbing"
           ) {
-            // Effort / striving / ascending toward higher knowledge.
+            // `climbing` is reserved exclusively for attract-mode (no
+            // visitor in front of the camera). Consume the nonce so the
+            // gesture never fires mid-conversation, regardless of how
+            // the AI was triggered.
             lastAiNonceRef.current = ai.nonce;
-            lastClimbAtRef.current = now;
-            goTo("climbing", THREE.LoopOnce, true, 0.4);
           } else if (
             ai &&
             ai.nonce !== lastAiNonceRef.current &&

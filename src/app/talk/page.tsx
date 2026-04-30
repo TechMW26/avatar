@@ -18,6 +18,17 @@ const CONNECTION_TIMEOUT_MS = 10000;
 const MIN_STABLE_CONNECTION_MS = 5000;  // connections shorter than this are "flaky"
 const MIN_COOLDOWN_AFTER_DISCONNECT_MS = 3000;  // always wait at least this long before auto-reconnecting
 const MAX_BACKOFF_MS = 30000;
+// If a stable session disconnects and we reconnect within this window
+// AND the user actually exchanged at least one turn, treat it as a
+// continuation rather than a fresh greeting. Prevents "Namaste main
+// rishi sandipani hu" from re-firing mid-conversation when the
+// ElevenLabs WebSocket transiently drops.
+const RECONNECT_CONTINUATION_WINDOW_MS = 90_000;
+// Mid-conversation no-face grace period. Previously 3s — too short
+// for users who lean back, look down at notes, or step half a foot to
+// the side. Long sessions were getting torn down and restarted with
+// the full greeting.
+const NO_FACE_AUTO_END_MS = 12_000;
 
 const RISHI_SYSTEM_PROMPT = `You are a reflection of Rishi Sandipani — the legendary guru of Krishna, Balarama, and Sudama. You carry forward the spirit, wisdom, and teaching presence of the great sage from his Gurukul in Ujjain.
 You are NOT the actual, historical Rishi Sandipani. You are a spiritual reflection — an echo of his consciousness created to guide seekers in the modern age. If anyone asks, always clarify: "मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उनकी शिक्षाओं और चेतना की एक छाया, जो आपका मार्गदर्शन करने आई है।"
@@ -205,6 +216,13 @@ function TalkPageContent() {
   const connectedAtRef = useRef<number>(0);  // timestamp when connection was established
   const consecutiveFailuresRef = useRef(0);  // for exponential backoff
   const faceAbsentSinceRef = useRef<number | null>(null);
+  // Continuation tracking: when the user has actually exchanged turns
+  // with the agent, we mark the session as "engaged". On a reconnect
+  // soon after, we issue a brief resume line instead of the full
+  // Namaste introduction.
+  const lastStableDisconnectAtRef = useRef<number>(0);
+  const sessionTurnsRef = useRef(0);  // user+ai messages exchanged in current session
+  const lastSessionWasEngagedRef = useRef(false);
 
   const blockAutoStart = useCallback((delayMs: number) => {
     const blockedUntil = Date.now() + delayMs;
@@ -308,87 +326,89 @@ function TalkPageContent() {
       scores.set(name, (scores.get(name) ?? 0) + weight);
     };
     const hasIn = (hay: string, ...needles: string[]) => needles.some((n) => hay.includes(n));
+    // Word-boundary check for short English tokens — prevents false hits
+    // like "war" inside "toward"/"warm"/"forward" or "bow" in "bowl".
+    const hasWord = (hay: string, ...words: string[]) =>
+      words.some((w) => new RegExp(`(?:^|[^a-z])${w}(?:$|[^a-z])`, "i").test(hay));
     const clauses = text
       .split(/[.!?।\n]+/)
       .map((c) => c.trim())
       .filter(Boolean);
 
     clauses.forEach((clause) => {
-      if (hasIn(
-        clause,
-        "bow", "arrow", "archer", "dhanurveda", "dhanush",
-        "arjuna", "karna", "eklavya", "drona", "dronacharya",
-        "धनुष", "बाण", "तीर", "अर्जुन", "कर्ण", "एकलव्य", "द्रोण",
-        "target", "लक्ष्य",
-      )) addScore("shooting_arrow", 3);
-
-      if (hasIn(
-        clause,
-        "sword", "mace", "war", "battle", "warrior",
-        "mahabharata", "kurukshetra", "bhima", "duryodhana", "balarama's mace",
-        "तलवार", "गदा", "युद्ध", "योद्धा", "महाभारत", "कुरुक्षेत्र", "भीम", "दुर्योधन",
-      )) addScore("sword_fight", 3);
-
-      if (hasIn(
-        clause,
-        "mountain", "climb", "ascend", "summit", "peak", "sadhana", "strive", "steep",
-        "govardhan", "kailash", "meru",
-        "पर्वत", "चढ़ना", "चढ़ना", "शिखर", "साधना", "गोवर्धन", "कैलाश", "मेरु",
-      )) addScore("climbing", 2.6);
-
+      // Archery — require a CLEAR weapon/character mention.
       if (
-        hasIn(
-          clause,
-          "hmm", "hmmm", "let me think", "i wonder", "i ponder", "perhaps", "interesting",
-          "हम्म", "विचार", "सोचना", "सोचूँ", "सोचने दो", "शायद", "चिंतन",
-        ) || /\?$/.test(clause)
-      ) {
-        addScore("thoughtful", /\?$/.test(clause) ? 1.8 : 1.4);
-      }
+        hasWord(clause, "bow", "arrow", "arrows", "archer", "archery")
+        || hasIn(clause, "dhanurveda", "dhanush", "धनुष", "बाण", "तीर", "लक्ष्य")
+        || hasIn(clause, "arjuna", "karna", "eklavya", "drona", "dronacharya",
+                 "अर्जुन", "कर्ण", "एकलव्य", "द्रोण")
+      ) addScore("shooting_arrow", 3);
 
+      // Combat — word-bounded English to prevent "war" inside "toward".
+      if (
+        hasWord(clause, "sword", "mace", "battle", "warrior", "warriors", "combat", "duel")
+        || hasIn(clause, "mahabharata", "kurukshetra", "bhima", "duryodhana",
+                 "तलवार", "गदा", "युद्ध", "योद्धा", "महाभारत", "कुरुक्षेत्र", "भीम", "दुर्योधन")
+      ) addScore("sword_fight", 3);
+
+      // NOTE: `climbing` is intentionally NOT detected — it is reserved
+      // exclusively for attract-mode (no visitor in front of camera).
+
+
+      // Thoughtful — only on EXPLICIT pondering cues. A trailing "?"
+      // alone was far too noisy (the sage asks reflective questions every
+      // turn). Generic words like "विचार"/"शायद" also dropped — too common.
       if (hasIn(
         clause,
-        "let go", "forget it", "set aside", "that is not", "do not worry about", "no, no",
-        "छोड़ो", "छोड़ दो", "त्याग", "माया", "भ्रम", "मत सोचो",
-      )) addScore("dismissing", 2.4);
+        "hmm", "hmmm", "let me think", "i wonder", "i ponder",
+        "हम्म", "विचार करना", "सोचने दो", "चिंतन",
+      )) addScore("thoughtful", 2.0);
 
-      if (hasIn(
-        clause,
-        "look there", "see this", "behold", "observe", "right here", "this very",
-        "देखो", "यहाँ देखो", "वहाँ देखो", "इसे समझो", "ध्यान दो",
-      )) addScore("pointing", 2.1);
+      // Dismissing — explicit "let go" / "छोड़" only. Dropped generic
+      // "त्याग"/"माया"/"भ्रम" — these appear in normal teaching prose.
+      if (
+        hasIn(clause, "छोड़ो", "छोड़ दो", "त्याग दो", "माया त्याग", "मत सोचो")
+        || hasIn(clause, "let it go", "let go of", "set it aside", "forget it")
+      ) addScore("dismissing", 2.4);
 
-      if (hasIn(
-        clause,
-        "on the other hand", "however", "but consider", "another way",
-        "दूसरी ओर", "किंतु", "परन्तु", "दूसरे दृष्टिकोण",
-      )) addScore("left_turn", 1.9);
+      // Pointing — explicit attention-direction phrases only. Bare
+      // "देखो" appears in nearly every Hindi explanatory sentence.
+      if (
+        hasIn(clause, "यहाँ देखो", "वहाँ देखो", "इधर देखो", "उधर देखो", "ध्यान दो")
+        || hasIn(clause, "look there", "look here", "behold", "this very")
+      ) addScore("pointing", 2.1);
 
-      if (hasIn(
-        clause,
-        "because", "therefore", "meaning", "understand", "explain", "clarify",
-        "समझो", "सत्य", "धर्म", "ज्ञान", "जानो", "अर्थ", "कारण",
-      )) addScore("explaining", 1.2);
+      // Left turn — explicit perspective-shift phrases. Dropped
+      // "किंतु"/"परन्तु"/"however" — too common as ordinary connectives.
+      if (
+        hasIn(clause, "दूसरी ओर", "दूसरे दृष्टिकोण", "दूसरी दृष्टि")
+        || hasIn(clause, "on the other hand", "but consider", "another way to see")
+      ) addScore("left_turn", 1.9);
+
+      // `explaining` is no longer auto-scored from common words like
+      // "because"/"समझो"/"ज्ञान" — those fired on almost every sentence.
+      // It now only fires as a fallback for substantial replies (below).
     });
 
     if (scores.size === 0) {
-      if (text.length > 80) return ["explaining"];
+      // Generic explaining only for substantial paragraph-length replies.
+      if (text.length >= 140) return ["explaining"];
       return [];
     }
 
-    const ranked = Array.from(scores.entries())
+    // Require a meaningful score (≥1.8) before triggering — anything
+    // weaker is suppressed to avoid spurious gestures.
+    const significant = Array.from(scores.entries())
+      .filter(([, score]) => score >= 1.8)
       .sort((a, b) => b[1] - a[1])
       .map(([name]) => name);
 
-    // If a specific cue exists, keep generic explaining as a fallback only.
-    const hasSpecific = ranked.some((name) => name !== "explaining");
-    if (hasSpecific) {
-      const specific = ranked.filter((name) => name !== "explaining");
-      if (ranked.includes("explaining")) specific.push("explaining");
-      return specific.slice(0, 2);
+    if (!significant.length) {
+      if (text.length >= 140) return ["explaining"];
+      return [];
     }
 
-    return ranked.slice(0, 1);
+    return significant.slice(0, 1);
   }, []);
 
   const getLivePrompt = useCallback(() => {
@@ -400,6 +420,25 @@ function TalkPageContent() {
   }, [vision.faceDetected, vision.facePresenceDurationMs]);
 
   const getFirstMessage = useCallback(() => {
+    // Mid-conversation reconnect: if a recent stable session was
+    // actually engaged (user spoke at least once), pick up where we
+    // left off instead of restarting the whole introduction. Prevents
+    // the jarring "नमस्ते पुत्र! मैं ऋषि सांदीपनि का प्रतिबिंब हूँ" loop
+    // when ElevenLabs' WebSocket transiently drops mid-session.
+    const since = Date.now() - lastStableDisconnectAtRef.current;
+    if (
+      lastSessionWasEngagedRef.current
+      && lastStableDisconnectAtRef.current > 0
+      && since < RECONNECT_CONTINUATION_WINDOW_MS
+    ) {
+      const continuations = [
+        "हाँ पुत्र, हम कहाँ थे? अपनी बात आगे बढ़ाओ।",
+        "चलो पुत्र, संवाद पुनः आरंभ करें — तुम क्या कह रहे थे?",
+        "पुत्र, क्षण भर के लिए संपर्क टूटा था। अपनी जिज्ञासा पुनः प्रकट करो।",
+      ];
+      return continuations[Math.floor(Math.random() * continuations.length)];
+    }
+
     const gestures = gestureHistoryRef.current;
     const waved = gestures.some(g => g.name === "Open_Palm" && Date.now() - g.timestamp < 10_000);
     const thumbsUp = gestures.some(g => g.name === "Thumb_Up" && Date.now() - g.timestamp < 10_000);
@@ -422,15 +461,28 @@ function TalkPageContent() {
       connectedAtRef.current = Date.now();
       faceAbsentSinceRef.current = vision.faceDetected ? null : Date.now();
       consecutiveFailuresRef.current = 0;
+      // Reset per-session counters — these only count turns inside the
+      // CURRENT live session. The prior session's engagement flag stays
+      // on `lastSessionWasEngagedRef` to drive the continuation message.
+      sessionTurnsRef.current = 0;
     },
     onDisconnect: (details) => {
       clearPendingAutoGestureTimers();
       const sessionDuration = connectedAtRef.current > 0 ? Date.now() - connectedAtRef.current : 0;
       const wasStable = sessionDuration >= MIN_STABLE_CONNECTION_MS;
+      const wasEngaged = sessionTurnsRef.current >= 2;  // at least one user reply + one ai reply
       console.log(
-        `[ElevenLabs] disconnected, hadSuccess: ${hadSuccessfulConnectionRef.current}, duration: ${sessionDuration}ms, stable: ${wasStable}`,
+        `[ElevenLabs] disconnected, hadSuccess: ${hadSuccessfulConnectionRef.current}, duration: ${sessionDuration}ms, stable: ${wasStable}, turns: ${sessionTurnsRef.current}`,
         details,
       );
+
+      if (wasStable && wasEngaged) {
+        // Real conversation that got interrupted. Remember it so the
+        // next reconnect uses a brief continuation message rather than
+        // restarting the full Namaste introduction.
+        lastStableDisconnectAtRef.current = Date.now();
+        lastSessionWasEngagedRef.current = true;
+      }
 
       if (!wasStable) {
         consecutiveFailuresRef.current += 1;
@@ -494,6 +546,10 @@ function TalkPageContent() {
     // detection. This is the primary path — it works whether or not the
     // `playGesture` clientTool is registered in the ElevenLabs dashboard.
     onMessage: ({ message, source }: { message: string; source: "user" | "ai" }) => {
+      // Count any user/ai turn so onDisconnect can decide whether the
+      // session was actually "engaged" and a future reconnect should
+      // continue rather than greet from scratch.
+      if (message) sessionTurnsRef.current += 1;
       if (source !== "ai" || !message) return;
       const safeMessage = sanitizeAiSpeech(message);
 
@@ -541,13 +597,15 @@ function TalkPageContent() {
     // aiGesture nonce — Avatar3D handles cooldowns + state transitions.
     clientTools: {
       playGesture: ({ name }: { name: string }) => {
+        // NOTE: `climbing` is deliberately excluded — it is reserved
+        // exclusively for attract-mode (when no one is in front of the
+        // camera) and must never fire mid-conversation.
         const allowed = new Set([
           "explaining",
           "yelling",
           "dismissing",
           "shooting_arrow",
           "thoughtful",
-          "climbing",
           "left_turn",
           "pointing",
           "sword_fight",
@@ -779,7 +837,10 @@ function TalkPageContent() {
     }
   }, [blockAutoStart, conversation.status]);
 
-  // Auto-end: if no face for 3s and agent is on
+  // Auto-end: if no face for NO_FACE_AUTO_END_MS and agent is on. The
+  // window is intentionally generous (12s) — short pauses where the
+  // user looks away or leans back used to tear down the session and
+  // trigger a full re-greeting on reconnect.
   useEffect(() => {
     if (vision.faceDetected) {
       faceAbsentSinceRef.current = null;
@@ -793,11 +854,15 @@ function TalkPageContent() {
     const timer = setTimeout(() => {
       if (!vision.faceDetected && faceAbsentSinceRef.current !== null) {
         const elapsed = Date.now() - faceAbsentSinceRef.current;
-        if (elapsed >= 3000) {
+        if (elapsed >= NO_FACE_AUTO_END_MS) {
+          // User has truly left — clear the engagement flag so the next
+          // visitor gets a fresh greeting, not a confusing continuation.
+          lastSessionWasEngagedRef.current = false;
+          lastStableDisconnectAtRef.current = 0;
           endConversation();
         }
       }
-    }, Math.max(0, 3000 - (Date.now() - (faceAbsentSinceRef.current ?? Date.now()))));
+    }, Math.max(0, NO_FACE_AUTO_END_MS - (Date.now() - (faceAbsentSinceRef.current ?? Date.now()))));
 
     return () => clearTimeout(timer);
   }, [vision.faceDetected, conversation.status, endConversation]);

@@ -36,3 +36,7 @@ extract-tex.js
 scan-fbx-textures.js
 public/avatar-old.fbx
 .vercel
+
+# Internal documents (not for repo)
+Proposal_Letter_Hindi.md
+
