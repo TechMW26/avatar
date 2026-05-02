@@ -23,7 +23,7 @@ export const metadata: Metadata = {
   keywords: ["Rishi Sandipani", "Gurukul", "AI Guru", "Ujjain", "Indian mythology", "interactive AI", "Sanskrit", "vedic knowledge"],
   authors: [{ name: "MWFutureTech" }],
   creator: "MWFutureTech",
-  metadataBase: new URL("https://rishisandipani.com"),
+  metadataBase: new URL("https://rishi-sandipani.vercel.app"),
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
@@ -47,7 +47,7 @@ export const metadata: Metadata = {
     siteName: "Rishi Sandipani Gurukul",
     images: [
       {
-        url: "/og-image.png",
+        url: "https://rishi-sandipani.vercel.app/og-image.png",
         width: 1200,
         height: 630,
         alt: "Rishi Sandipani - AI Guru of Ujjain",
@@ -58,7 +58,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Rishi Sandipani - Gurukul AI",
     description: "Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered Gurukul experience.",
-    images: ["/og-image.png"],
+    images: ["https://rishi-sandipani.vercel.app/og-image.png"],
   },
 };
 
