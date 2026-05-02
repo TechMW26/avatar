@@ -18,8 +18,12 @@ export const viewport: Viewport = {
 
 export const metadata: Metadata = {
   title: "Rishi Sandipani - Gurukul AI",
-  description: "Interactive AI Guru - Rishi Sandipani from the Gurukul of Ujjain",
+  description: "Interactive AI Guru - Rishi Sandipani from the Gurukul of Ujjain. Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered experience.",
   manifest: "/manifest.json",
+  keywords: ["Rishi Sandipani", "Gurukul", "AI Guru", "Ujjain", "Indian mythology", "interactive AI", "Sanskrit", "vedic knowledge"],
+  authors: [{ name: "MWFutureTech" }],
+  creator: "MWFutureTech",
+  metadataBase: new URL("https://rishisandipani.com"),
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
@@ -34,6 +38,27 @@ export const metadata: Metadata = {
     ],
     shortcut: "/favicon.png",
     apple: "/apple-touch-icon.png",
+  },
+  openGraph: {
+    type: "website",
+    url: "https://rishisandipani.com",
+    title: "Rishi Sandipani - Gurukul AI",
+    description: "Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered Gurukul experience.",
+    siteName: "Rishi Sandipani Gurukul",
+    images: [
+      {
+        url: "/og-image.png",
+        width: 1200,
+        height: 630,
+        alt: "Rishi Sandipani - AI Guru of Ujjain",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Rishi Sandipani - Gurukul AI",
+    description: "Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered Gurukul experience.",
+    images: ["/og-image.png"],
   },
 };
 
