@@ -233,10 +233,6 @@ function TalkPageContent() {
     }
   }, []);
 
-  // Vision Detection (face + gestures) — deferred until the 3D avatar has
-  // mounted so the heavy MediaPipe pipeline doesn't compete with the FBX
-  // load on first paint.
-  const [avatarReady, setAvatarReady] = useState(false);
   // Asset preload state. We kick this off automatically on mount (no
   // "Tap to Begin" button) so the experience feels instant. Camera +
   // microphone permission prompts are handled organically by the
@@ -640,7 +636,6 @@ function TalkPageContent() {
       : conversation.status === "connecting"
         ? "starting"
         : "off";
-  const conversationStarted = agentState === "on";
 
   // conversationStatusRef is now kept in sync by onStatusChange callback
 
@@ -670,7 +665,7 @@ function TalkPageContent() {
     startInFlightRef.current = true;
     hadSuccessfulConnectionRef.current = false;
     setConversationError(null);
-    const connectionType: "websocket" = "websocket";
+    const connectionType = "websocket" as const;
     // Pre-warm the microphone with explicit aggressive constraints so the
     // browser's audio capture path uses echo cancellation, noise
     // suppression, AGC and (where supported) Chrome's voice isolation.
@@ -924,7 +919,7 @@ function TalkPageContent() {
   }, [runPreload]);
 
   return (
-    <div className="h-screen flex flex-col" style={{ background: "var(--bg)", position: "relative", overflow: "hidden" }}>
+    <div className="h-screen flex flex-col" style={{ background: "transparent", position: "relative", overflow: "hidden" }}>
       {/* Hidden video element for face/gesture detection */}
       <video
         ref={vision.videoRef}
@@ -932,13 +927,6 @@ function TalkPageContent() {
         muted
         style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
       />
-
-      {/* Ambient BG */}
-      <div className="ambient-bg">
-        <div className="orb orb-1" />
-        <div className="orb orb-2" />
-        <div className="orb orb-3" />
-      </div>
 
       {/* Vision Detection Status Indicator */}
       <div
@@ -1066,24 +1054,9 @@ function TalkPageContent() {
         style={{ position: "absolute", inset: 0, zIndex: 1 }}
       >
         {bootStage === "ready" ? (
-          <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} aiGesture={aiGesture} onReady={() => setAvatarReady(true)} />
+          <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} aiGesture={aiGesture} />
         ) : null}
       </div>
-
-      {/* Dark gradient at bottom */}
-      <div
-        className="talk-gradient-overlay"
-        style={{
-          position: "absolute",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          height: "50%",
-          background: "linear-gradient(to top, rgba(13,10,7,0.97) 0%, rgba(13,10,7,0.85) 25%, rgba(13,10,7,0.5) 55%, transparent 100%)",
-          pointerEvents: "none",
-          zIndex: 2,
-        }}
-      />
 
       {agentState === "on" ? (
         <div
@@ -1257,7 +1230,7 @@ function TalkPageContent() {
               position: "fixed",
               inset: 0,
               zIndex: 50,
-              background: "radial-gradient(circle at 50% 30%, #1a120a 0%, #0a0705 70%)",
+              background: "transparent",
               display: "flex",
               flexDirection: "column",
               alignItems: "center",

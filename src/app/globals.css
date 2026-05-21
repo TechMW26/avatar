@@ -2,7 +2,7 @@
 
 @layer base {
   :root {
-    --bg: #0D0A07;
+    --bg: transparent;
     --surface: rgba(255, 255, 255, 0.06);
     --surface-hover: rgba(255, 255, 255, 0.1);
     --border: rgba(255, 255, 255, 0.1);
@@ -22,7 +22,7 @@
 
   html, body {
     height: 100%;
-    background: var(--bg);
+    background: transparent;
     color: var(--text-1);
     font-family: var(--font-inter), -apple-system, sans-serif;
     overflow: hidden;
