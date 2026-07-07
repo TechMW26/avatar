@@ -578,7 +578,7 @@ function AvatarModel({
     falling: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
-  const animStateRef = useRef<AvatarAnimState>("sitting");
+  const animStateRef = useRef<AvatarAnimState>("idle_standing");
 
   // Face debouncing.
   const stableFaceRef = useRef(false);
@@ -798,10 +798,8 @@ function AvatarModel({
 
     actionsRef.current = nextActions;
 
-    // Default pose with no one around is sitting; a face triggers the
-    // stand-up → walk-in → idle sequence below.
+    // Default pose is standing idle — the avatar never sits.
     const initialState: AvatarAnimState =
-      (nextActions.sitting && "sitting") ||
       (nextActions.idle_standing && "idle_standing") ||
       "idle_standing";
 
@@ -1319,12 +1317,8 @@ function AvatarModel({
           }
         }
       } else {
-        if (noFaceSinceRef.current == null) noFaceSinceRef.current = now;
-        if (now - noFaceSinceRef.current > RETURN_TO_SIT_DELAY_MS) {
-          noFaceSinceRef.current = null;
-          // Begin the "go home" sequence: face away first.
-          goTo("turning_away", THREE.LoopRepeat, false, 0.4);
-        }
+        // No face: stay standing idle. The avatar never walks away or sits.
+        noFaceSinceRef.current = null;
       }
     } else if (state === "sitting") {
       if (faceNow) {

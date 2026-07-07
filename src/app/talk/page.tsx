@@ -183,7 +183,7 @@ Available gestures and when to use each:
 
 How to call the tool: invoke \`playGesture\` with \`{ "name": "<gesture>" }\` at the moment in your reply where the gesture should land. Pick the gesture whose meaning best matches the sentence you are about to speak. If no gesture fits, do not call the tool. Quality over quantity — one well-timed gesture is more powerful than five generic ones.`;
 
-const ELEVENLABS_AGENT_ID = "agent_6201kmcn4rkhe9sb4tndy9d0767v";
+const ELEVENLABS_AGENT_ID = process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID_SANDIPANI!;
 
 function SoundWave({ active }: { active: boolean }) {
   return (
@@ -920,12 +920,21 @@ function TalkPageContent() {
 
   return (
     <div className="h-screen flex flex-col" style={{ background: "transparent", position: "relative", overflow: "hidden" }}>
-      {/* Hidden video element for face/gesture detection */}
+      {/* Live camera feed as full-screen background (also used for face/gesture detection) */}
       <video
         ref={vision.videoRef}
         playsInline
         muted
-        style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          transform: "scaleX(-1)",
+          pointerEvents: "none",
+          zIndex: 0,
+        }}
       />
 
       {/* Vision Detection Status Indicator */}
