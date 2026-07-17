@@ -103,6 +103,29 @@ By default, the kiosk loads `https://algaetree.vercel.app`. To change this:
 sudo bash ~/algaetree-kiosk/update-url.sh https://your-url.com
 ```
 
+## Two-display / two-camera mode
+
+When two displays are connected, the kiosk automatically opens the normal
+front view on the primary display and the synchronized rear avatar view on
+the second display. By default, camera index `0` is used for the front
+background and camera index `1` is used for CV/rear background.
+
+For a stable installation, configure camera label fragments and (if needed)
+display indices in the systemd service:
+
+```ini
+Environment=ALGAETREE_FRONT_CAMERA=USB Camera
+Environment=ALGAETREE_CV_CAMERA=CV Camera
+Environment=ALGAETREE_FRONT_DISPLAY=0
+Environment=ALGAETREE_BACK_DISPLAY=1
+```
+
+Camera values may also be exact browser device IDs or `index:0` / `index:1`.
+Display values are sorted desktop indices; use `id:123` to target an exact
+Electron display ID.
+The front window owns conversation audio; the rear window owns MediaPipe CV
+and sends detection state to the front window.
+
 ---
 
 ## Maintenance Access

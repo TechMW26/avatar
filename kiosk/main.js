@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, session, powerSaveBlocker } = require("electron");
+const { app, BrowserWindow, globalShortcut, session, powerSaveBlocker, screen } = require("electron");
 const { exec, execSync } = require("child_process");
 const path = require("path");
 const net = require("net");
@@ -9,6 +9,8 @@ const CONNECTIVITY_CHECK_INTERVAL = 5000; // 5 seconds
 const CONNECTIVITY_CHECK_URL = "https://www.google.com";
 
 let mainWindow = null;
+let backWindow = null;
+let dualDisplayEnabled = false;
 let isOffline = false;
 let connectivityTimer = null;
 let powerBlockerId = null;
@@ -78,8 +80,13 @@ function connectToWifi(ssid, password) {
   });
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
+function createKioskWindow(display) {
+  const { x, y, width, height } = display.bounds;
+  const window = new BrowserWindow({
+    x,
+    y,
+    width,
+    height,
     fullscreen: true,
     kiosk: true,
     frame: false,
@@ -93,39 +100,88 @@ function createWindow() {
     },
   });
 
-  // Block all exit/navigation shortcuts
-  mainWindow.setMenu(null);
-  mainWindow.setMenuBarVisibility(false);
+  window.setMenu(null);
+  window.setMenuBarVisibility(false);
 
   // Prevent window from being closed
-  mainWindow.on("close", (e) => {
+  window.on("close", (e) => {
     e.preventDefault();
   });
 
   // Ensure fullscreen is always on
-  mainWindow.on("leave-full-screen", () => {
-    mainWindow.setFullScreen(true);
+  window.on("leave-full-screen", () => {
+    window.setFullScreen(true);
   });
 
   // Disable dev tools in production
-  mainWindow.webContents.on("devtools-opened", () => {
-    mainWindow.webContents.closeDevTools();
+  window.webContents.on("devtools-opened", () => {
+    window.webContents.closeDevTools();
   });
 
   // Disable all navigation away from app
-  mainWindow.webContents.on("will-navigate", (e, url) => {
-    if (!url.startsWith(APP_URL) && !url.startsWith("file://")) {
+  window.webContents.on("will-navigate", (e, url) => {
+    const allowedOrigin = new URL(APP_URL).origin;
+    if (!url.startsWith(allowedOrigin) && !url.startsWith("file://")) {
       e.preventDefault();
     }
   });
 
   // Disable new window creation
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
 
   // Handle page load errors (offline)
-  mainWindow.webContents.on("did-fail-load", () => {
-    loadOfflinePage();
+  window.webContents.on("did-fail-load", () => {
+    loadOfflinePage(window);
   });
+
+  return window;
+}
+
+function resolveDisplay(displays, configured, fallback) {
+  if (configured == null || configured === "") return fallback;
+  const value = String(configured).trim();
+  if (value.startsWith("id:")) {
+    const displayId = Number(value.slice(3));
+    return displays.find((display) => display.id === displayId) || fallback;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return displays[numeric] || fallback;
+}
+
+function buildRoleUrl(role) {
+  const url = new URL(APP_URL);
+  if (!dualDisplayEnabled) return url.toString();
+
+  url.searchParams.set("dual", "1");
+  if (role === "back") {
+    url.pathname = /\/talk\/?$/.test(url.pathname)
+      ? url.pathname.replace(/\/talk\/?$/, "/talk/back")
+      : `${url.pathname.replace(/\/$/, "")}/talk/back`;
+    const cvCamera = process.env.ALGAETREE_CV_CAMERA || "index:1";
+    url.searchParams.set("camera", cvCamera);
+  } else {
+    const frontCamera = process.env.ALGAETREE_FRONT_CAMERA || "index:0";
+    url.searchParams.set("camera", frontCamera);
+  }
+  return url.toString();
+}
+
+function createWindow() {
+  const displays = screen
+    .getAllDisplays()
+    .slice()
+    .sort((left, right) => left.bounds.x - right.bounds.x || left.bounds.y - right.bounds.y);
+  const primary = screen.getPrimaryDisplay();
+  const frontDisplay = resolveDisplay(displays, process.env.ALGAETREE_FRONT_DISPLAY, primary);
+  const backFallback = displays.find((display) => display.id !== frontDisplay.id) || null;
+  const backDisplay = resolveDisplay(displays, process.env.ALGAETREE_BACK_DISPLAY, backFallback);
+
+  dualDisplayEnabled = Boolean(backDisplay && backDisplay.id !== frontDisplay.id);
+  mainWindow = createKioskWindow(frontDisplay);
+  if (dualDisplayEnabled) {
+    backWindow = createKioskWindow(backDisplay);
+  }
 
   // Start connectivity monitoring
   startConnectivityCheck();
@@ -138,20 +194,29 @@ async function loadApp() {
   const online = await checkInternet();
   if (online) {
     isOffline = false;
-    mainWindow.loadURL(APP_URL);
+    const loads = [];
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      loads.push(mainWindow.loadURL(buildRoleUrl("front")));
+    }
+    if (backWindow && !backWindow.isDestroyed()) {
+      loads.push(backWindow.loadURL(buildRoleUrl("back")));
+    }
+    await Promise.allSettled(loads);
   } else {
-    loadOfflinePage();
+    loadOfflinePage(mainWindow);
+    loadOfflinePage(backWindow);
   }
 }
 
-function loadOfflinePage() {
+function loadOfflinePage(targetWindow) {
+  if (!targetWindow || targetWindow.isDestroyed()) return;
   isOffline = true;
   const networks = getWifiNetworks();
-  mainWindow.loadFile(path.join(__dirname, "offline.html")).then(() => {
-    mainWindow.webContents.executeJavaScript(
+  targetWindow.loadFile(path.join(__dirname, "offline.html")).then(() => {
+    targetWindow.webContents.executeJavaScript(
       `window.__setNetworks(${JSON.stringify(networks)})`
     );
-  });
+  }).catch(() => {});
 }
 
 function startConnectivityCheck() {
@@ -160,9 +225,10 @@ function startConnectivityCheck() {
     const online = await checkInternet();
     if (online && isOffline) {
       isOffline = false;
-      mainWindow.loadURL(APP_URL);
+      loadApp();
     } else if (!online && !isOffline) {
-      loadOfflinePage();
+      loadOfflinePage(mainWindow);
+      loadOfflinePage(backWindow);
     }
   }, CONNECTIVITY_CHECK_INTERVAL);
 }

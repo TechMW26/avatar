@@ -10,6 +10,7 @@ import {
   type FaceDetectorResult,
   type GestureRecognizerResult,
 } from "@mediapipe/tasks-vision";
+import { resolveCameraDeviceId } from "../lib/cameraDevices";
 
 /* ── Gesture name mapping for natural language ── */
 const GESTURE_LABELS: Record<string, string> = {
@@ -114,8 +115,12 @@ function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
   return Array.from(byName.values()).sort((left, right) => right.confidence - left.confidence);
 }
 
-export function useVisionDetection(options?: { enabled?: boolean }): VisionState {
+export function useVisionDetection(options?: {
+  enabled?: boolean;
+  cameraSelector?: string | null;
+}): VisionState {
   const enabled = options?.enabled ?? true;
+  const cameraSelector = options?.cameraSelector ?? null;
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
   const faceWorkerRef = useRef<Worker | null>(null);
@@ -310,50 +315,60 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
         // startup doesn't pay both latencies serially on mobile.
         const streamTask = (async (): Promise<MediaStream> => {
           let stream: MediaStream | null = null;
-          const constraints: MediaStreamConstraints[] = [
-            {
+          const preferredDeviceId = await resolveCameraDeviceId(cameraSelector);
+          console.log("[useVisionDetection] preferred deviceId:", preferredDeviceId?.slice(0, 12) ?? "null", "selector:", cameraSelector);
+
+          const constraints: MediaStreamConstraints[] = [];
+
+          // 1. Preferred camera with ideal resolution
+          if (preferredDeviceId) {
+            constraints.push({
               video: {
-                facingMode: "user",
+                deviceId: { exact: preferredDeviceId },
                 width: { ideal: isMobileDevice ? 640 : 960 },
                 height: { ideal: isMobileDevice ? 480 : 540 },
                 frameRate: { ideal: 24, max: 30 },
               },
               audio: false,
-            },
-            {
-              video: {
-                width: { ideal: 640 },
-                height: { ideal: 480 },
-                frameRate: { ideal: 24, max: 30 },
-              },
-              audio: false,
-            },
-            { video: true, audio: false },
-          ];
-
-          for (const c of constraints) {
-            try {
-              stream = await navigator.mediaDevices.getUserMedia(c);
-              break;
-            } catch {
-              // try next constraint set
-            }
+            });
           }
 
-          if (!stream) {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const videoDevice = devices.find((d) => d.kind === "videoinput");
-            if (videoDevice) {
-              stream = await navigator.mediaDevices.getUserMedia({
-                video: { deviceId: { exact: videoDevice.deviceId } },
-                audio: false,
-              });
+          // 2. Preferred camera without resolution constraints (relaxed)
+          if (preferredDeviceId) {
+            constraints.push({
+              video: { deviceId: { exact: preferredDeviceId } },
+              audio: false,
+            });
+          }
+
+          // 3. Any camera — last resort
+          constraints.push({
+            video: {
+              width: { ideal: isMobileDevice ? 640 : 960 },
+              height: { ideal: isMobileDevice ? 480 : 540 },
+              frameRate: { ideal: 24, max: 30 },
+            },
+            audio: false,
+          });
+          constraints.push({ video: true, audio: false });
+
+          let usedConstraint = -1;
+          for (let i = 0; i < constraints.length; i++) {
+            try {
+              stream = await navigator.mediaDevices.getUserMedia(constraints[i]);
+              usedConstraint = i;
+              break;
+            } catch (err) {
+              console.log(`[useVisionDetection] constraint ${i} failed:`, err instanceof Error ? err.message : err);
             }
           }
 
           if (!stream) {
             throw new Error("No camera found. Please connect a camera and grant permission.");
           }
+
+          const track = stream.getVideoTracks()[0];
+          console.log(`[useVisionDetection] opened "${track?.label ?? "unknown"}" (constraint #${usedConstraint})`);
 
           if (cancelled) {
             stream.getTracks().forEach((t) => t.stop());
@@ -538,7 +553,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       objectDetectorRef.current?.close();
       console.error = origError;
     };
-  }, [enabled]);
+  }, [cameraSelector, enabled]);
 
   // Detection loop — runs at DETECTION_INTERVAL_MS via rAF
   const detect = useCallback(() => {
@@ -644,9 +659,7 @@ export function useVisionDetection(options?: { enabled?: boolean }): VisionState
       }
     } else {
       faceStartRef.current = null;
-      if (facePresenceDurationMs !== 0) {
-        setFacePresenceDurationMs(0);
-      }
+      setFacePresenceDurationMs((previous) => (previous === 0 ? previous : 0));
     }
 
     // ── Smile Detection + Gender Detection (FaceLandmarker blendshapes + landmarks) ──

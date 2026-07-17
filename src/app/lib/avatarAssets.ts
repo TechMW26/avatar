@@ -294,16 +294,16 @@ export function getDeviceProfile(): DeviceProfile {
     // and the avatar's robe/skin are matte enough that reflections
     // add nothing visible.
     enableEnvReflections: false,
-    // No ground shadow disc — extra transparent draw call + 256²
-    // canvas texture upload, and the user explicitly asked to remove
-    // shadowing entirely.
-    enableGroundShadow: false,
+    // A single soft black contact shadow keeps the avatar visually planted
+    // against live camera backgrounds.
+    enableGroundShadow: true,
     // Handhelds use a tighter texture budget to reduce upload and VRAM.
     maxTextureSize: handheld ? 768 : 1024,
     // mediump materially reduces shader ALU pressure on budget phones.
     shaderPrecision: "mediump",
-    // Foot clamp is visually subtle but expensive on mobile skeletons.
-    enableFootClamp: !handheld,
+    // Keep at least one foot planted on every display. The clamp is
+    // throttled inside Avatar3D, so its cost remains modest on handhelds.
+    enableFootClamp: true,
   };
 
   cachedProfile = profile;
@@ -461,7 +461,7 @@ async function streamIntoCache(
  * `Avatar3D.tsx` should only be mounted after this resolves so its
  * Suspense-driven loaders find every URL warm in `caches.match`.
  */
-export async function preloadAvatarAssets(
+async function preloadAvatarAssetsUnlocked(
   onProgress: (p: PreloadProgress) => void,
   signal?: AbortSignal,
   profile: DeviceProfile = getDeviceProfile(),
@@ -536,6 +536,24 @@ export async function preloadAvatarAssets(
     loadedBytes,
     totalBytes,
   });
+}
+
+/** Serialize preload work across the front and rear browser windows. Both
+ * windows share Cache Storage, so the follower waits for the leader and
+ * then reads the warmed cache instead of downloading the 80 MB bundle a
+ * second time. */
+export async function preloadAvatarAssets(
+  onProgress: (p: PreloadProgress) => void,
+  signal?: AbortSignal,
+  profile: DeviceProfile = getDeviceProfile(),
+): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.locks?.request) {
+    await navigator.locks.request("rishi-avatar-preload", async () => {
+      await preloadAvatarAssetsUnlocked(onProgress, signal, profile);
+    });
+    return;
+  }
+  await preloadAvatarAssetsUnlocked(onProgress, signal, profile);
 }
 
 /**

@@ -6,10 +6,19 @@ import { motion, AnimatePresence } from "framer-motion";
 import { ConversationProvider, useConversation } from "@elevenlabs/react";
 import { useVisionDetection, buildGestureContext } from "../hooks/useVisionDetection";
 import type { GestureInfo } from "../hooks/useVisionDetection";
+import { useCameraFeed } from "../hooks/useCameraFeed";
 import {
   preloadAvatarAssets,
   type PreloadProgress,
 } from "../lib/avatarAssets";
+import {
+  getCameraSelectorFromUrl,
+  isDualDisplayMode,
+} from "../lib/cameraDevices";
+import {
+  useFrontDisplaySync,
+  useRemoteVision,
+} from "../lib/displaySync";
 
 const Avatar3D = dynamic(() => import("../components/Avatar3D"), { ssr: false });
 const AUTO_START_RETRY_DELAY_MS = 4000;
@@ -29,6 +38,7 @@ const RECONNECT_CONTINUATION_WINDOW_MS = 90_000;
 // the side. Long sessions were getting torn down and restarted with
 // the full greeting.
 const NO_FACE_AUTO_END_MS = 12_000;
+const SHOW_CONVERSATION_CONTROLS = false;
 
 const RISHI_SYSTEM_PROMPT = `You are a reflection of Rishi Sandipani — the legendary guru of Krishna, Balarama, and Sudama. You carry forward the spirit, wisdom, and teaching presence of the great sage from his Gurukul in Ujjain.
 You are NOT the actual, historical Rishi Sandipani. You are a spiritual reflection — an echo of his consciousness created to guide seekers in the modern age. If anyone asks, always clarify: "मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उनकी शिक्षाओं और चेतना की एक छाया, जो आपका मार्गदर्शन करने आई है।"
@@ -240,15 +250,22 @@ function TalkPageContent() {
   // browser will queue them after the user's first interaction with the
   // page (or, on most platforms, immediately).
   const [bootStage, setBootStage] = useState<"loading" | "ready">("loading");
+  const [modelReady, setModelReady] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [preloadProgress, setPreloadProgress] = useState<PreloadProgress | null>(null);
   const bootInFlightRef = useRef(false);
-  // Start camera + MediaPipe download IMMEDIATELY on mount, in parallel
-  // with the avatar asset preload. Previously we gated on `avatarReady`
-  // which meant the user stared at a black camera viewport for several
-  // seconds after the avatar appeared. Vision is purely a side panel —
-  // there's no reason to wait for the 3D scene to be ready.
-  const vision = useVisionDetection({ enabled: true });
+  // In dual-display mode the rear window owns the CV camera and publishes
+  // detections here. The front window opens only the presentation camera.
+  // Standalone browser use keeps the original single-camera behavior.
+  const [dualDisplay, setDualDisplay] = useState(() => isDualDisplayMode());
+  const [cameraSelector, setCameraSelector] = useState(() => getCameraSelectorFromUrl());
+  const localVision = useVisionDetection({ enabled: !dualDisplay });
+  const remoteVision = useRemoteVision(dualDisplay);
+  const frontCamera = useCameraFeed({
+    enabled: dualDisplay,
+    cameraSelector,
+  });
+  const vision = dualDisplay ? remoteVision : localVision;
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
 
@@ -640,6 +657,7 @@ function TalkPageContent() {
   // conversationStatusRef is now kept in sync by onStatusChange callback
 
   const isSpeaking = conversation.isSpeaking;
+  const publishAvatarState = useFrontDisplaySync(dualDisplay, isSpeaking);
 
   const currentGestureName = vision.currentGestures.length > 0
     ? vision.currentGestures[0].name
@@ -918,11 +936,44 @@ function TalkPageContent() {
     void runPreload();
   }, [runPreload]);
 
+  // Browser development launcher: once the front avatar is actually ready,
+  // open the synchronized rear display and convert this page into the dual
+  // front role. Electron already owns both BrowserWindows, so it bypasses
+  // this popup path entirely.
+  useEffect(() => {
+    if (!modelReady || typeof window === "undefined") return;
+    const electronWindow = window as Window & { kiosk?: unknown };
+    if (electronWindow.kiosk) return;
+
+    const rearUrl = new URL("/talk/back", window.location.origin);
+    rearUrl.searchParams.set("dual", "1");
+    rearUrl.searchParams.set("camera", "index:1");
+    const rearWindow = window.open(
+      rearUrl.toString(),
+      "rishi-rear-display",
+      `popup=yes,width=${window.screen.availWidth},height=${window.screen.availHeight}`,
+    );
+    if (!rearWindow) return;
+
+    if (!dualDisplay) {
+      const frontUrl = new URL(window.location.href);
+      frontUrl.searchParams.set("dual", "1");
+      frontUrl.searchParams.set("camera", "index:0");
+      window.history.replaceState(null, "", frontUrl);
+      setCameraSelector("index:0");
+      setDualDisplay(true);
+    }
+
+    return () => rearWindow.close();
+    // Opening is intentionally tied to the first completed model mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelReady]);
+
   return (
     <div className="h-screen flex flex-col" style={{ background: "transparent", position: "relative", overflow: "hidden" }}>
       {/* Live camera feed as full-screen background (also used for face/gesture detection) */}
       <video
-        ref={vision.videoRef}
+        ref={dualDisplay ? frontCamera.videoRef : vision.videoRef}
         playsInline
         muted
         style={{
@@ -980,6 +1031,23 @@ function TalkPageContent() {
               : "No face detected"}
           </span>
         </motion.div>
+
+        {dualDisplay && frontCamera.error && (
+          <div
+            role="alert"
+            className="rounded-full"
+            style={{
+              padding: "6px 12px",
+              background: "rgba(239,68,68,0.14)",
+              border: "1px solid rgba(239,68,68,0.3)",
+              backdropFilter: "blur(12px)",
+              fontSize: 10,
+              color: "#fca5a5",
+            }}
+          >
+            Front camera: {frontCamera.error}
+          </div>
+        )}
 
         {/* Gesture indicators */}
         <AnimatePresence>
@@ -1063,11 +1131,23 @@ function TalkPageContent() {
         style={{ position: "absolute", inset: 0, zIndex: 1 }}
       >
         {bootStage === "ready" ? (
-          <Avatar3D isSpeaking={isSpeaking} getAudioData={getAudioData} getVolume={getVolume} gesture={currentGestureName} userSmile={vision.userSmile} faceDetected={vision.faceDetected} aiGesture={aiGesture} />
+          <Avatar3D
+            isSpeaking={isSpeaking}
+            getAudioData={getAudioData}
+            getVolume={getVolume}
+            gesture={currentGestureName}
+            userSmile={vision.userSmile}
+            faceDetected={vision.faceDetected}
+            aiGesture={aiGesture}
+            syncMode="leader"
+            viewMode="front"
+            onAnimationStateChange={publishAvatarState}
+            onReady={() => setModelReady(true)}
+          />
         ) : null}
       </div>
 
-      {agentState === "on" ? (
+      {SHOW_CONVERSATION_CONTROLS && (agentState === "on" ? (
         <div
           className="talk-controls-overlay"
           style={{
@@ -1219,7 +1299,7 @@ function TalkPageContent() {
             </motion.div>
           </AnimatePresence>
         </div>
-      )}
+      ))}
 
       {/* Boot overlay: covers the whole viewport while we sequentially
           preload the avatar/animation assets into Cache Storage. Without

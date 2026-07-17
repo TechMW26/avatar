@@ -22,6 +22,10 @@ import {
   isAssetEnabled,
   isAssetMissing,
 } from "../lib/avatarAssets";
+import type {
+  AvatarAnimationCommand,
+  AvatarAnimationState,
+} from "../lib/displaySync";
 
 const AVATAR_URL = "/avatar.fbx";
 
@@ -70,27 +74,16 @@ const ALL_ANIM_URLS = [
   ANIM_FALLING_URL,
 ] as const;
 
-type AvatarAnimState =
-  | "sitting"
-  | "standing_up"
-  | "walking_in"
-  | "walking_out"
-  | "turning_away"
-  | "turning_back"
-  | "stopping"
-  | "idle_standing"
-  | "waving"
-  | "praying"
-  | "explaining"
-  | "yelling"
-  | "dismissing"
-  | "shooting_arrow"
-  | "thoughtful"
-  | "climbing"
-  | "falling"
-  | "left_turn"
-  | "pointing"
-  | "sword_fight";
+type AvatarAnimState = AvatarAnimationState;
+
+const FOLLOWER_LOOPING_STATES = new Set<AvatarAnimState>([
+  "sitting",
+  "walking_in",
+  "walking_out",
+  "turning_away",
+  "turning_back",
+  "idle_standing",
+]);
 
 /** The underlying animation clips we actually loaded. Multiple states can
  *  reuse the same clip (walking_in/out share `walking`, the turn states
@@ -128,10 +121,6 @@ type GestureName =
 
 const CAMERA_Z_FAR = 9.5;
 const CAMERA_Z_NEAR = 5.7;
-// Time without a face before we sit back down. Long enough that the avatar
-// doesn't oscillate when MediaPipe drops a frame or two, but short enough
-// that the kiosk feels responsive when visitors leave.
-const RETURN_TO_SIT_DELAY_MS = 3_000;
 // Required ms of consistent face presence/absence before changing pose.
 const FACE_DEBOUNCE_MS = 350;
 // Never replay the same gesture too quickly, even if a narrower trigger
@@ -142,18 +131,22 @@ const SAME_GESTURE_COOLDOWN_MS = 4_500;
    The avatar's feet are anchored at y = 0 inside the local scene, so the
    group's world Y becomes the floor line. Walking just lerps Z (and uniform
    scale, to fake distance) between two stage marks. */
-const GROUND_Y = -1.3;
+const GROUND_Y = -1.68;
 // Sit dip — the Mixamo sit clip rotates the legs into a cross-leg position
 // but we strip the Hips translation track (cm-scale problem), so without a
 // small additional drop the seated pose looks like he's hovering.
 const SIT_GROUND_OFFSET_Y = -0.55;
 const BACK_Z = -2.0;
 const FRONT_Z = 0;
-const DYNAMIC_SCALE_MULT = 1.15;
+const DYNAMIC_SCALE_MULT = 1.4;
 const BACK_SCALE = 0.65 * DYNAMIC_SCALE_MULT;
 // Keep the close mark visually present but avoid edge clipping on
 // narrow portrait screens.
 const FRONT_SCALE = 0.9 * DYNAMIC_SCALE_MULT;
+// The front-facing mesh reads smaller than the robe-heavy rear silhouette.
+// Scale around the grounded local origin so both displays have the same
+// apparent full-body height without moving either model's feet.
+const FRONT_VIEW_SCALE = FRONT_SCALE / BACK_SCALE;
 
 const STATE_TARGETS: Record<
   AvatarAnimState,
@@ -492,20 +485,24 @@ class AvatarErrorBoundary extends Component<
 function AvatarModel({
   gestureRef,
   faceDetectedRef,
-  isSpeakingRef,
   aiGestureRef,
   onAnimStateChangeRef,
   onReadyRef,
+  syncMode,
+  syncedAnimationRef,
+  viewMode,
 }: {
   gestureRef: MutableRefObject<GestureName>;
   faceDetectedRef: MutableRefObject<boolean>;
-  isSpeakingRef: MutableRefObject<boolean>;
   /** AI-triggered gesture (e.g. ElevenLabs clientTool fires it on a
    *  high-weight phrase). The avatar plays the named gesture once and
    *  then ignores subsequent ticks until the nonce changes again. */
   aiGestureRef: MutableRefObject<{ name: string; nonce: number } | null>;
   onAnimStateChangeRef: MutableRefObject<(state: AvatarAnimState) => void>;
   onReadyRef: MutableRefObject<(() => void) | undefined>;
+  syncMode: "leader" | "follower";
+  syncedAnimationRef: MutableRefObject<AvatarAnimationCommand | null>;
+  viewMode: "front" | "rear";
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const notify = useCallback(
@@ -603,6 +600,7 @@ function AvatarModel({
   const lastPointAtRef = useRef<number>(0);
   const lastSwordAtRef = useRef<number>(0);
   const lastAiNonceRef = useRef<number>(-1);
+  const lastSyncedSequenceRef = useRef<number>(-1);
 
   /* ── Attract mode ──
      If the sage sits with no visitor for a long random interval, he
@@ -808,12 +806,7 @@ function AvatarModel({
     if (initialAction) {
       initialAction
         .reset()
-        .setLoop(
-          initialState === "idle_standing" || initialState === "sitting"
-            ? THREE.LoopRepeat
-            : THREE.LoopOnce,
-          Infinity,
-        )
+        .setLoop(THREE.LoopRepeat, Infinity)
         .play();
       initialAction.setEffectiveWeight(1);
       currentActionRef.current = initialAction;
@@ -824,7 +817,7 @@ function AvatarModel({
       const grp = groupRef.current;
       if (grp) {
         const t = STATE_TARGETS[initialState];
-        grp.position.set(0, GROUND_Y + (initialState === "sitting" ? SIT_GROUND_OFFSET_Y : 0), t.z);
+        grp.position.set(0, GROUND_Y, t.z);
         grp.rotation.y = t.rotY;
         grp.scale.setScalar(t.scale);
       }
@@ -899,13 +892,11 @@ function AvatarModel({
   // Running it every other tick is imperceptible at 30fps but cuts
   // CPU markedly on iPhones.
   const footClampTickRef = useRef(0);
-  // Persistent low-pass-filtered floor offset. Holds the slow-moving
-  // "how high above the ground does the breathing-idle clip park the
-  // hips" correction so we don't fight the per-frame yLerp. Without
-  // this, modifying grp.position.y from the foot clamp every frame
-  // produces visible vertical bob on lower-fps Android tablets where
-  // the breathing oscillation aliases against the lerp.
+  // Persistent filtered distance between the animated planted foot and
+  // the avatar root. Subtracting it from GROUND_Y keeps the sole locked
+  // to the floor while smoothing small idle-animation variations.
   const footFloorOffsetRef = useRef(0);
+  const footClampInitializedRef = useRef(false);
 
   useFrame((_, delta) => {
     const baseFrameMs = targetFrameMs;
@@ -1013,10 +1004,9 @@ function AvatarModel({
          Mixamo's breathing-idle clip lifts the Hips a few cm above the
          bind pose. Without correction the toes float above GROUND_Y. We
          sample whichever toe is currently lower and update a persistent
-         `footFloorOffsetRef` with a SLOW exponential filter (~3 s time
-         constant) so we capture the long-term hip-lift offset without
-         tracking the breathing oscillation itself. The offset is then
-         applied to `tgtY` above on the NEXT frame, which means the
+         `footFloorOffsetRef` with an immediate initial correction followed
+         by a short exponential filter. The offset is then applied to
+         `tgtY` above on the NEXT frame, which means the
          correction never fights the yLerp on the same frame — eliminating
          the visible vertical bob on capped-fps mobile devices. Skipped
          during walking (already time-driven), sitting (cross-leg pose
@@ -1037,21 +1027,28 @@ function AvatarModel({
           footClampTickRef.current = (footClampTickRef.current + 1) & 3;
           if (footClampTickRef.current === 0) {
             // Make sure transforms are up to date for the new mixer pose.
-            scene.updateMatrixWorld();
+            // Update from the moving/scaling outer group so foot world
+            // positions include the transform applied earlier this frame.
+            grp.updateMatrixWorld(true);
             let minFootY = Infinity;
             const v = new THREE.Vector3();
             if (lf) { lf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
             if (rf) { rf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
             if (Number.isFinite(minFootY)) {
-              // Drift from the desired floor line at this exact frame —
-              // includes both the long-term hip lift AND the instantaneous
-              // breathing oscillation. We only want the long-term part.
-              const measuredOffset = minFootY - GROUND_Y;
-              // ~3 s time constant (assuming clamp ticks at ~7 Hz this is
-              // alpha ≈ 0.045 per sample). Slow enough to ignore the 0.5
-              // Hz breathing wobble entirely.
-              footFloorOffsetRef.current +=
-                (measuredOffset - footFloorOffsetRef.current) * 0.05;
+              // Measure the animated foot height relative to the avatar
+              // root, not relative to the already-corrected floor. Using
+              // the floor here creates feedback and only removes half the
+              // offset, which is why the avatar appeared to float.
+              const measuredOffset = minFootY - grp.position.y;
+              if (!footClampInitializedRef.current) {
+                footFloorOffsetRef.current = measuredOffset;
+                footClampInitializedRef.current = true;
+              } else {
+                // Settle quickly enough to keep the planted foot stable,
+                // while still smoothing small breathing-idle variations.
+                footFloorOffsetRef.current +=
+                  (measuredOffset - footFloorOffsetRef.current) * 0.2;
+              }
             }
           }
         }
@@ -1059,6 +1056,7 @@ function AvatarModel({
         // Decay the offset back to zero whenever we're in a state that
         // doesn't use the clamp, so re-entering idle doesn't snap.
         footFloorOffsetRef.current *= 0.92;
+        footClampInitializedRef.current = false;
       }
 
       if (isWalking) {
@@ -1174,6 +1172,41 @@ function AvatarModel({
 
     /* ── Debounce face presence/absence ── */
     const now = performance.now();
+
+    if (syncMode === "follower") {
+      const command = syncedAnimationRef.current;
+      if (command && command.sequence !== lastSyncedSequenceRef.current) {
+        lastSyncedSequenceRef.current = command.sequence;
+        const looping = FOLLOWER_LOOPING_STATES.has(command.state);
+        goTo(
+          command.state,
+          looping ? THREE.LoopRepeat : THREE.LoopOnce,
+          !looping,
+          0.12,
+        );
+
+        const elapsedSeconds = Math.max(0, (Date.now() - command.startedAt) / 1000);
+        const action = actions[STATE_TARGETS[command.state].clipKey];
+        if (action) {
+          const duration = action.getClip().duration;
+          if (duration > 0.001) {
+            const playbackRate = action.getEffectiveTimeScale();
+            const initialOffset = command.state === "falling" ? duration * 0.22 : 0;
+            const seekTime = initialOffset + elapsedSeconds * playbackRate;
+            action.time = looping
+              ? seekTime % duration
+              : Math.min(seekTime, Math.max(0, duration - 0.001));
+          }
+        }
+        if (command.state === "walking_in" || command.state === "walking_out") {
+          walkFromZRef.current = command.state === "walking_in" ? BACK_Z : FRONT_Z;
+          walkToZRef.current = command.state === "walking_in" ? FRONT_Z : BACK_Z;
+          walkStartRef.current = performance.now() - elapsedSeconds * 1000;
+        }
+      }
+      return;
+    }
+
     const rawFace = faceDetectedRef.current;
     if (rawFace !== lastFaceRawRef.current) {
       lastFaceRawRef.current = rawFace;
@@ -1510,7 +1543,12 @@ function AvatarModel({
 
   return (
     <group ref={groupRef}>
-      <primitive object={scene} />
+      <group
+        rotation={[0, viewMode === "rear" ? Math.PI : 0, 0]}
+        scale={viewMode === "front" ? FRONT_VIEW_SCALE : 1}
+      >
+        <primitive object={scene} />
+      </group>
     </group>
   );
 }
@@ -1681,52 +1719,28 @@ function DynamicDprController({ maxDpr }: { maxDpr: number }) {
   return null;
 }
 
-/* ── Ground ──
-   A soft circular shadow disc beneath the avatar so the feet have something
-   to stand on visually. Rendered with a procedural radial-fade canvas so it
-   blends into any background without needing an asset. */
+/* A screen-space contact shadow stays visible against every camera angle.
+   The previous horizontal Three.js plane was edge-on to the stage camera,
+   which made it effectively invisible. */
 function Ground() {
-  const texture = useMemo(() => {
-    const size = 256;
-    const canvas = document.createElement("canvas");
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext("2d")!;
-    const grad = ctx.createRadialGradient(
-      size / 2,
-      size / 2,
-      size * 0.05,
-      size / 2,
-      size / 2,
-      size * 0.5,
-    );
-    grad.addColorStop(0, "rgba(0, 0, 0, 0.55)");
-    grad.addColorStop(0.55, "rgba(0, 0, 0, 0.18)");
-    grad.addColorStop(1, "rgba(0, 0, 0, 0)");
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, size, size);
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.anisotropy = 8;
-    return tex;
-  }, []);
-
-  // Slightly above GROUND_Y so it sits on top of the floor plane (avoids
-  // z-fighting with the avatar's foot soles).
   return (
-    <mesh
-      rotation={[-Math.PI / 2, 0, 0]}
-      position={[0, GROUND_Y + 0.001, -0.6]}
-      renderOrder={-1}
-    >
-      <planeGeometry args={[6, 6]} />
-      <meshBasicMaterial
-        map={texture}
-        transparent
-        depthWrite={false}
-        toneMapped={false}
-      />
-    </mesh>
+    <div
+      aria-hidden="true"
+      style={{
+        position: "absolute",
+        left: "50%",
+        bottom: "0.5%",
+        width: "34%",
+        height: "6%",
+        transform: "translateX(-50%)",
+        borderRadius: "50%",
+        background:
+          "radial-gradient(ellipse at center, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.48) 42%, rgba(0,0,0,0) 74%)",
+        filter: "blur(6px)",
+        pointerEvents: "none",
+        zIndex: 0,
+      }}
+    />
   );
 }
 
@@ -1748,13 +1762,31 @@ export interface Avatar3DProps {
    *  vision pipeline so the avatar always renders before face detection
    *  starts firing state-machine transitions. */
   onReady?: () => void;
+  /** Leader publishes its state changes; follower consumes timestamped
+   * commands and does not run an independent animation state machine. */
+  syncMode?: "leader" | "follower";
+  syncedAnimation?: AvatarAnimationCommand | null;
+  onAnimationStateChange?: (state: AvatarAnimationState) => void;
+  /** Rear mode keeps the stage position unchanged and renders the model
+   * from the opposite side. */
+  viewMode?: "front" | "rear";
 }
 
-export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture, onReady }: Avatar3DProps) {
+export default function Avatar3D({
+  isSpeaking,
+  gesture,
+  faceDetected,
+  aiGesture,
+  onReady,
+  syncMode = "leader",
+  syncedAnimation = null,
+  onAnimationStateChange,
+  viewMode = "front",
+}: Avatar3DProps) {
   const gestureRef = useRef<GestureName>(null);
   const faceDetectedRef = useRef(faceDetected ?? false);
-  const isSpeakingRef = useRef(isSpeaking);
   const aiGestureRef = useRef<{ name: string; nonce: number } | null>(aiGesture ?? null);
+  const syncedAnimationRef = useRef<AvatarAnimationCommand | null>(syncedAnimation);
   const cameraTargetRef = useRef(CAMERA_Z_NEAR);
 
   // Sync incoming props into refs so AvatarModel's per-frame loop can read
@@ -1762,9 +1794,9 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
   useEffect(() => {
     gestureRef.current = (gesture as GestureName) ?? null;
     faceDetectedRef.current = faceDetected ?? false;
-    isSpeakingRef.current = isSpeaking;
     aiGestureRef.current = aiGesture ?? null;
-  }, [gesture, faceDetected, isSpeaking, aiGesture]);
+    syncedAnimationRef.current = syncedAnimation;
+  }, [gesture, faceDetected, aiGesture, syncedAnimation]);
 
   // Stable callback so AvatarModel's useEffect (which wires up the mixer)
   // doesn't tear down on every parent re-render.
@@ -1793,7 +1825,8 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
     } else {
       cameraTargetRef.current = (CAMERA_Z_FAR + CAMERA_Z_NEAR) / 2;
     }
-  }, []);
+    onAnimationStateChange?.(state);
+  }, [onAnimationStateChange]);
 
   const onAnimStateChangeRef = useRef(handleAnimStateChange);
   useEffect(() => {
@@ -1816,18 +1849,27 @@ export default function Avatar3D({ isSpeaking, gesture, faceDetected, aiGesture,
   return (
     <AvatarErrorBoundary fallback={(err) => <FallbackOrb isSpeaking={isSpeaking} error={err} />}>
       <Suspense fallback={<Loader />}>
-        <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
+        <div
+          style={{
+            width: "100%",
+            height: "100%",
+            overflow: "hidden",
+            position: "relative",
+          }}
+        >
+          {showGroundShadow && <Ground />}
           <DeviceTunedCanvas isSpeaking={isSpeaking}>
             <SceneLights />
             <CameraAnimator targetZRef={cameraTargetRef} />
-            {showGroundShadow && <Ground />}
             <AvatarModel
               gestureRef={gestureRef}
               faceDetectedRef={faceDetectedRef}
-              isSpeakingRef={isSpeakingRef}
               aiGestureRef={aiGestureRef}
               onAnimStateChangeRef={onAnimStateChangeRef}
               onReadyRef={onReadyRef}
+              syncMode={syncMode}
+              syncedAnimationRef={syncedAnimationRef}
+              viewMode={viewMode}
             />
           </DeviceTunedCanvas>
         </div>
@@ -1912,7 +1954,13 @@ function DeviceTunedCanvas({
         const targetAniso = Math.min(profile.anisotropy, gpuMaxAniso);
         (gl as unknown as { __maxAnisotropy?: number }).__maxAnisotropy = targetAniso;
       }}
-      style={{ background: "transparent", width: "100%", height: "100%" }}
+      style={{
+        background: "transparent",
+        width: "100%",
+        height: "100%",
+        position: "relative",
+        zIndex: 1,
+      }}
     >
       <DynamicDprController maxDpr={profile.maxDpr} />
       {children}
