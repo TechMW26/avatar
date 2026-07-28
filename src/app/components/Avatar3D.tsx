@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable react-hooks/immutability -- R3F frame callbacks intentionally mutate Three.js scene objects. */
 
 import {
   useRef,
@@ -9,10 +10,11 @@ import {
   Component,
   ReactNode,
   MutableRefObject,
+  RefObject,
 } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
-import { SkeletonUtils, FBXLoader } from "three-stdlib";
+import { SkeletonUtils, FBXLoader, GLTFLoader } from "three-stdlib";
 import {
   ASSET_BASE_URL,
   ASSET_CACHE_NAME,
@@ -26,8 +28,16 @@ import type {
   AvatarAnimationCommand,
   AvatarAnimationState,
 } from "../lib/displaySync";
+import {
+  AVATAR_VISEMES,
+  classifyViseme,
+  type LipSyncFrame,
+} from "../lib/lipSync";
 
-const AVATAR_URL = "/avatar.fbx";
+const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
+const LIP_SYNC_OPEN_GAIN = 1.22;
+const LIP_SYNC_CLOSURE_GAIN = 1.08;
+const MAX_LIP_SYNC_INFLUENCE = 0.68;
 
 // User-provided FBX animation files (Mixamo rigs).
 // The five "full body" idle/walking/waving Mixamo exports were ~74 MB each
@@ -128,52 +138,118 @@ const FACE_DEBOUNCE_MS = 350;
 const SAME_GESTURE_COOLDOWN_MS = 4_500;
 
 /* ── Stage geometry ──
-   The avatar's feet are anchored at y = 0 inside the local scene, so the
-   group's world Y becomes the floor line. Walking just lerps Z (and uniform
-   scale, to fake distance) between two stage marks. */
-const GROUND_Y = -1.68;
+   Avatars occupy exactly the lower 90% of the viewport: feet on the
+   bottom edge and 10% clear space above the head. Both the floor line and
+   scale are derived from the live camera frustum and the model's actual
+   posed height so this remains true after resizing and on both displays. */
+const MODEL_NORMALIZED_HEIGHT = 2.45;
+const CLOSE_SCREEN_HEIGHT = 0.90;
+const FAR_SCREEN_HEIGHT = 0.90;
 // Sit dip — the Mixamo sit clip rotates the legs into a cross-leg position
 // but we strip the Hips translation track (cm-scale problem), so without a
 // small additional drop the seated pose looks like he's hovering.
 const SIT_GROUND_OFFSET_Y = -0.55;
 const BACK_Z = -2.0;
 const FRONT_Z = 0;
-const DYNAMIC_SCALE_MULT = 1.4;
-const BACK_SCALE = 0.65 * DYNAMIC_SCALE_MULT;
-// Keep the close mark visually present but avoid edge clipping on
-// narrow portrait screens.
-const FRONT_SCALE = 0.9 * DYNAMIC_SCALE_MULT;
-// The front-facing mesh reads smaller than the robe-heavy rear silhouette.
-// Scale around the grounded local origin so both displays have the same
-// apparent full-body height without moving either model's feet.
-const FRONT_VIEW_SCALE = FRONT_SCALE / BACK_SCALE;
+
+function getVisibleHeightAtZ(camera: THREE.Camera, z: number): number {
+  if (!(camera instanceof THREE.PerspectiveCamera)) return 3.7;
+  const distance = Math.max(0.1, Math.abs(camera.position.z - z));
+  return 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * distance;
+}
+
+function getGroundY(camera: THREE.Camera, z: number): number {
+  return camera.position.y - getVisibleHeightAtZ(camera, z) / 2;
+}
+
+function getScaleForScreenHeight(
+  camera: THREE.Camera,
+  z: number,
+  screenHeight: number,
+  modelHeight = MODEL_NORMALIZED_HEIGHT,
+): number {
+  return (
+    getVisibleHeightAtZ(camera, z)
+    * screenHeight
+    / Math.max(0.001, modelHeight)
+  );
+}
+
+function getSceneLocalBounds(scene: THREE.Group): THREE.Box3 {
+  scene.updateMatrixWorld(true);
+  const worldToScene = scene.matrixWorld.clone().invert();
+  const bounds = new THREE.Box3();
+
+  scene.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+
+    let meshBounds: THREE.Box3 | null = null;
+    const skinnedMesh = mesh as THREE.SkinnedMesh;
+    if (skinnedMesh.isSkinnedMesh) {
+      skinnedMesh.computeBoundingBox();
+      meshBounds = skinnedMesh.boundingBox;
+    } else {
+      mesh.geometry.computeBoundingBox();
+      meshBounds = mesh.geometry.boundingBox;
+    }
+    if (!meshBounds || meshBounds.isEmpty()) return;
+
+    const meshToScene = worldToScene.clone().multiply(mesh.matrixWorld);
+    bounds.union(meshBounds.clone().applyMatrix4(meshToScene));
+  });
+
+  return bounds;
+}
+
+function measurePosedModelHeight(
+  scene: THREE.Group,
+  group: THREE.Group,
+): number {
+  // SkinnedMesh bounding boxes are not updated automatically after the
+  // mixer changes the skeleton. Refresh them once for the initial standing
+  // pose, then remove the outer group's screen-space scale from the result.
+  scene.traverse((object) => {
+    const mesh = object as THREE.SkinnedMesh;
+    if (mesh.isSkinnedMesh) mesh.computeBoundingBox();
+  });
+  group.updateMatrixWorld(true);
+  const bounds = new THREE.Box3().setFromObject(scene);
+  if (bounds.isEmpty()) return MODEL_NORMALIZED_HEIGHT;
+  const worldHeight = bounds.max.y - bounds.min.y;
+  const groupScale = Math.max(0.001, Math.abs(group.scale.y));
+  const posedHeight = worldHeight / groupScale;
+  return Number.isFinite(posedHeight) && posedHeight > 0.001
+    ? posedHeight
+    : MODEL_NORMALIZED_HEIGHT;
+}
 
 const STATE_TARGETS: Record<
   AvatarAnimState,
-  { z: number; rotY: number; scale: number; clipKey: ClipKey }
+  { z: number; rotY: number; screenHeight: number; clipKey: ClipKey }
 > = {
-  sitting:       { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "sitting" },
-  standing_up:   { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "standing_up" },
-  walking_in:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "walking" },
-  idle_standing: { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "idle_standing" },
-  waving:        { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "waving" },
-  praying:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "praying" },
-  explaining:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "explaining" },
-  yelling:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "yelling" },
-  dismissing:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "dismissing" },
-  shooting_arrow:{ z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "shooting_arrow" },
-  thoughtful:    { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "thoughtful" },
-  climbing:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "climbing" },
+  sitting:       { z: BACK_Z,  rotY: 0,        screenHeight: FAR_SCREEN_HEIGHT,   clipKey: "sitting" },
+  standing_up:   { z: BACK_Z,  rotY: 0,        screenHeight: FAR_SCREEN_HEIGHT,   clipKey: "standing_up" },
+  walking_in:    { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "walking" },
+  idle_standing: { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "idle_standing" },
+  waving:        { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "waving" },
+  praying:       { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "praying" },
+  explaining:    { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "explaining" },
+  yelling:       { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "yelling" },
+  dismissing:    { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "dismissing" },
+  shooting_arrow:{ z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "shooting_arrow" },
+  thoughtful:    { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "thoughtful" },
+  climbing:      { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "climbing" },
   // `falling` reuses the climbing scale because the avatar drops back
   // down onto the front mark to close out the attract loop.
-  falling:       { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "falling" },
-  left_turn:     { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "left_turn" },
-  pointing:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "pointing" },
-  sword_fight:   { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "sword_fight" },
-  turning_away:  { z: FRONT_Z, rotY: Math.PI,  scale: FRONT_SCALE, clipKey: "idle_standing" },
-  walking_out:   { z: BACK_Z,  rotY: Math.PI,  scale: BACK_SCALE,  clipKey: "walking" },
-  turning_back:  { z: BACK_Z,  rotY: 0,        scale: BACK_SCALE,  clipKey: "idle_standing" },
-  stopping:      { z: FRONT_Z, rotY: 0,        scale: FRONT_SCALE, clipKey: "stopping" },
+  falling:       { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "falling" },
+  left_turn:     { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "left_turn" },
+  pointing:      { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "pointing" },
+  sword_fight:   { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "sword_fight" },
+  turning_away:  { z: FRONT_Z, rotY: Math.PI,  screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "idle_standing" },
+  walking_out:   { z: BACK_Z,  rotY: Math.PI,  screenHeight: FAR_SCREEN_HEIGHT,   clipKey: "walking" },
+  turning_back:  { z: BACK_Z,  rotY: 0,        screenHeight: FAR_SCREEN_HEIGHT,   clipKey: "idle_standing" },
+  stopping:      { z: FRONT_Z, rotY: 0,        screenHeight: CLOSE_SCREEN_HEIGHT, clipKey: "stopping" },
 };
 
 // Mixamo bone names → avatar rig bone names. The current avatar uses the
@@ -242,9 +318,12 @@ function remapClipToAvatarRig(
   /** Map of `strippedBoneName` → actual rig bone name (preserving the rig's
    *  prefix so the AnimationMixer can find the bone by name). */
   avatarBoneByStripped: Map<string, string>,
+  avatarRestQuaternionByStripped: Map<string, THREE.Quaternion>,
   /** When true, drop all tracks targeting the lower body (UpLeg/Leg/Foot/Toe).
    *  Keep available for future upper-body-only idles. */
   lockLegs = false,
+  protectGeneratedMesh = false,
+  generatedLimbStrength = 0.45,
 ): THREE.AnimationClip | null {
   const tracks: THREE.KeyframeTrack[] = [];
   const skipped: string[] = [];
@@ -253,6 +332,12 @@ function remapClipToAvatarRig(
     "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase", "LeftToe_End",
     "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase", "RightToe_End",
   ]);
+  const GENERATED_LIMB_BONES = new Set([
+    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
+    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
+  ]);
+  const GENERATED_TORSO_BONES = new Set(["Spine", "Spine1", "Spine2", "Neck"]);
+  const GENERATED_HEAD_BONES = new Set(["Head"]);
 
   for (const track of clip.tracks) {
     const dot = track.name.indexOf(".");
@@ -283,6 +368,37 @@ function remapClipToAvatarRig(
 
     const cloned = track.clone();
     cloned.name = `${actualBoneName}.${property}`;
+    if (
+      protectGeneratedMesh
+      && property === "quaternion"
+      && cloned instanceof THREE.QuaternionKeyframeTrack
+      && (
+        GENERATED_LIMB_BONES.has(lookup)
+        || GENERATED_TORSO_BONES.has(lookup)
+        || GENERATED_HEAD_BONES.has(lookup)
+      )
+    ) {
+      // Meshy characters are single-shell scans without production edge
+      // loops around shoulders and wrists. Preserve the authored gesture
+      // while limiting rotation away from its clean first-frame pose, which
+      // prevents sleeves, palms, and torso cloth from opening at their seams.
+      const strength = GENERATED_LIMB_BONES.has(lookup)
+        ? generatedLimbStrength
+        : GENERATED_HEAD_BONES.has(lookup)
+          ? 0
+          : 0.65;
+      const base = (
+        avatarRestQuaternionByStripped.get(lookup)
+        ?? new THREE.Quaternion()
+      ).clone().normalize();
+      const sample = new THREE.Quaternion();
+      const limited = new THREE.Quaternion();
+      for (let offset = 0; offset < cloned.values.length; offset += 4) {
+        sample.fromArray(cloned.values, offset).normalize();
+        limited.copy(base).slerp(sample, strength).normalize();
+        limited.toArray(cloned.values, offset);
+      }
+    }
     tracks.push(cloned);
   }
 
@@ -358,8 +474,11 @@ async function fetchAssetCached(path: string): Promise<ArrayBuffer> {
 }
 
 const fbxSceneCache = new Map<string, THREE.Group>();
+const gltfSceneCache = new Map<string, THREE.Group>();
+const gltfClipCache = new Map<string, THREE.AnimationClip[]>();
 const fbxClipCache = new Map<string, THREE.AnimationClip[]>();
 const fbxScenePromises = new Map<string, Promise<THREE.Group>>();
+const gltfScenePromises = new Map<string, Promise<THREE.Group>>();
 const fbxClipPromises = new Map<string, Promise<THREE.AnimationClip[]>>();
 
 function loadFbxScene(url: string): Promise<THREE.Group> {
@@ -382,10 +501,50 @@ function loadFbxScene(url: string): Promise<THREE.Group> {
   return p;
 }
 
-function useFbxScene(url: string): THREE.Group {
+function readFbxScene(url: string): THREE.Group {
   const cached = fbxSceneCache.get(url);
   if (cached) return cached;
   throw loadFbxScene(url);
+}
+
+function loadAvatarScene(url: string): Promise<THREE.Group> {
+  if (!/\.gl(?:b|tf)($|\?)/i.test(url)) return loadFbxScene(url);
+  let promise = gltfScenePromises.get(url);
+  if (!promise) {
+    const loader = new GLTFLoader();
+    promise = fetchAssetCached(url)
+      .then((buffer) => loader.parseAsync(buffer, ""))
+      .then((gltf) => {
+        const scene = gltf.scene as THREE.Group;
+        gltfSceneCache.set(url, scene);
+        gltfClipCache.set(
+          url,
+          gltf.animations.map((clip) => clip.clone()),
+        );
+        return scene;
+      })
+      .catch((error) => {
+        console.error("[Avatar] GLB scene load failed:", url, error);
+        gltfScenePromises.delete(url);
+        throw error;
+      });
+    gltfScenePromises.set(url, promise);
+  }
+  return promise;
+}
+
+function readAvatarScene(url: string): THREE.Group {
+  if (!/\.gl(?:b|tf)($|\?)/i.test(url)) return readFbxScene(url);
+  const cached = gltfSceneCache.get(url);
+  if (cached) return cached;
+  throw loadAvatarScene(url);
+}
+
+function readEmbeddedAvatarClips(url: string): THREE.AnimationClip[] {
+  if (!/\.gl(?:b|tf)($|\?)/i.test(url)) return EMPTY_CLIPS;
+  const cached = gltfClipCache.get(url);
+  if (cached) return cached;
+  throw loadAvatarScene(url);
 }
 
 function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
@@ -442,7 +601,8 @@ function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
   return p;
 }
 
-function useFbxClips(url: string): THREE.AnimationClip[] {
+function useFbxClips(url: string, enabled = true): THREE.AnimationClip[] {
+  if (!enabled) return EMPTY_CLIPS;
   // Low-tier devices skip optional gesture animations entirely. Returning
   // an empty clip array makes `pickClip()` resolve to `null`, which
   // downstream code already treats as "this gesture is unavailable" and
@@ -483,6 +643,11 @@ class AvatarErrorBoundary extends Component<
 }
 
 function AvatarModel({
+  avatarUrl,
+  isSpeakingRef,
+  getAudioDataRef,
+  getLipSyncFrameRef,
+  onLipSyncFrameRef,
   gestureRef,
   faceDetectedRef,
   aiGestureRef,
@@ -492,6 +657,11 @@ function AvatarModel({
   syncedAnimationRef,
   viewMode,
 }: {
+  avatarUrl: string;
+  isSpeakingRef: MutableRefObject<boolean>;
+  getAudioDataRef: MutableRefObject<(() => Uint8Array | undefined) | undefined>;
+  getLipSyncFrameRef: MutableRefObject<(() => LipSyncFrame | null) | undefined>;
+  onLipSyncFrameRef: MutableRefObject<((frame: LipSyncFrame | null) => void) | undefined>;
   gestureRef: MutableRefObject<GestureName>;
   faceDetectedRef: MutableRefObject<boolean>;
   /** AI-triggered gesture (e.g. ElevenLabs clientTool fires it on a
@@ -504,36 +674,42 @@ function AvatarModel({
   syncedAnimationRef: MutableRefObject<AvatarAnimationCommand | null>;
   viewMode: "front" | "rear";
 }) {
+  const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
   const notify = useCallback(
     (state: AvatarAnimState) => onAnimStateChangeRef.current?.(state),
     [onAnimStateChangeRef],
   );
-  const baseFbx = useFbxScene(AVATAR_URL);
+  const baseFbx = readAvatarScene(avatarUrl);
+  const usesEmbeddedAnimation = /\.gl(?:b|tf)($|\?)/i.test(avatarUrl);
+  const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
 
-  const idleClips = useFbxClips(ANIM_IDLE_URL);
-  const sittingClips = useFbxClips(ANIM_SITTING_URL);
-  const standingClips = useFbxClips(ANIM_STANDING_URL);
-  const stoppingClips = useFbxClips(ANIM_STOPPING_URL);
-  const walkingClips = useFbxClips(ANIM_WALKING_URL);
-  const wavingClips = useFbxClips(ANIM_WAVING_URL);
-  const prayingClips = useFbxClips(ANIM_PRAYING_URL);
-  const explainingClips = useFbxClips(ANIM_EXPLAINING_URL);
-  const yellingClips = useFbxClips(ANIM_YELLING_URL);
-  const dismissingClips = useFbxClips(ANIM_DISMISSING_URL);
-  const shootingArrowClips = useFbxClips(ANIM_SHOOTING_ARROW_URL);
-  const thoughtfulClips = useFbxClips(ANIM_THOUGHTFUL_URL);
-  const climbingClips = useFbxClips(ANIM_CLIMBING_URL);
-  const leftTurnClips = useFbxClips(ANIM_LEFT_TURN_URL);
-  const pointingClips = useFbxClips(ANIM_POINTING_URL);
-  const swordFightClips = useFbxClips(ANIM_SWORD_FIGHT_URL);
-  const fallingClips = useFbxClips(ANIM_FALLING_URL);
+  const idleClips = useFbxClips(ANIM_IDLE_URL, !usesEmbeddedAnimation);
+  const sittingClips = useFbxClips(ANIM_SITTING_URL, !usesEmbeddedAnimation);
+  const standingClips = useFbxClips(ANIM_STANDING_URL, !usesEmbeddedAnimation);
+  const stoppingClips = useFbxClips(ANIM_STOPPING_URL, !usesEmbeddedAnimation);
+  const walkingClips = useFbxClips(ANIM_WALKING_URL, !usesEmbeddedAnimation);
+  const wavingClips = useFbxClips(ANIM_WAVING_URL, !usesEmbeddedAnimation);
+  const prayingClips = useFbxClips(ANIM_PRAYING_URL, !usesEmbeddedAnimation);
+  const explainingClips = useFbxClips(ANIM_EXPLAINING_URL, !usesEmbeddedAnimation);
+  const yellingClips = useFbxClips(ANIM_YELLING_URL, !usesEmbeddedAnimation);
+  const dismissingClips = useFbxClips(ANIM_DISMISSING_URL, !usesEmbeddedAnimation);
+  const shootingArrowClips = useFbxClips(ANIM_SHOOTING_ARROW_URL, !usesEmbeddedAnimation);
+  const thoughtfulClips = useFbxClips(ANIM_THOUGHTFUL_URL, !usesEmbeddedAnimation);
+  const climbingClips = useFbxClips(ANIM_CLIMBING_URL, !usesEmbeddedAnimation);
+  const leftTurnClips = useFbxClips(ANIM_LEFT_TURN_URL, !usesEmbeddedAnimation);
+  const pointingClips = useFbxClips(ANIM_POINTING_URL, !usesEmbeddedAnimation);
+  const swordFightClips = useFbxClips(ANIM_SWORD_FIGHT_URL, !usesEmbeddedAnimation);
+  const fallingClips = useFbxClips(ANIM_FALLING_URL, !usesEmbeddedAnimation);
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
   const sourceClips = useMemo(
     () => ({
-      idle_standing: pickClip(idleClips),
+      idle_standing: usesEmbeddedAnimation
+        ? embeddedClips.find((clip) => clip.name.includes("rigify_clip"))
+          ?? pickClip(embeddedClips)
+        : pickClip(idleClips),
       sitting: pickClip(sittingClips),
       standing_up: pickClip(standingClips),
       stopping: pickClip(stoppingClips),
@@ -551,7 +727,7 @@ function AvatarModel({
       sword_fight: pickClip(swordFightClips),
       falling: pickClip(fallingClips),
     }),
-    [idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips, climbingClips, leftTurnClips, pointingClips, swordFightClips, fallingClips],
+    [usesEmbeddedAnimation, embeddedClips, idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips, climbingClips, leftTurnClips, pointingClips, swordFightClips, fallingClips],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -575,6 +751,7 @@ function AvatarModel({
     falling: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
+  const embeddedIdleActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("idle_standing");
 
   // Face debouncing.
@@ -614,17 +791,27 @@ function AvatarModel({
   const nextAttractAtRef = useRef<number>(0);
   const ATTRACT_MIN_IDLE_MS = 60_000;   // 1 min
   const ATTRACT_MAX_IDLE_MS = 180_000;  // 3 min
-  const ATTRACT_SCALE_MULT = 1.2;       // 20% larger than normal close-up
 
   /* ── Foot bones for per-frame ground clamp.
      Mixamo idle/breathing clips routinely shift the Hips Y a few cm above
      the bind pose, which makes the avatar look like it's hovering. We grab
      the toe bones at mount and, each frame, snap the group's Y so the
-     lower toe sits exactly on GROUND_Y. */
+     lower toe sits exactly on the viewport floor. */
   const footBonesRef = useRef<{ left: THREE.Object3D | null; right: THREE.Object3D | null }>({
     left: null,
     right: null,
   });
+  // Persistent filtered distance between the animated planted foot and
+  // the avatar root. It keeps the sole locked to the bottom edge while
+  // smoothing small idle-animation variations.
+  const footFloorOffsetRef = useRef(0);
+  const footClampInitializedRef = useRef(false);
+  const posedModelHeightRef = useRef(MODEL_NORMALIZED_HEIGHT);
+  const lipSyncMeshesRef = useRef<THREE.Mesh[]>([]);
+  const breathingMeshesRef = useRef<THREE.Mesh[]>([]);
+  const activeVisemeRef = useRef<(typeof AVATAR_VISEMES)[number]>("viseme_PP");
+  const activeVisemeSinceRef = useRef(0);
+  const lastPublishedLipFrameRef = useRef(0);
 
   // Walking traversal: time-driven so the walking clip plays a whole
   // number of cycles (no half-step landing). Trip duration is computed
@@ -649,11 +836,38 @@ function AvatarModel({
     // settings picked by `<DeviceTunedCanvas>`.
     const matProfile = getDeviceProfile();
     const avatarBoneByStripped = new Map<string, string>();
+    const avatarRestQuaternionByStripped = new Map<string, THREE.Quaternion>();
+    const lipSyncMeshes: THREE.Mesh[] = [];
+    const breathingMeshes: THREE.Mesh[] = [];
 
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
-        if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) {
+        const breathingIndex = mesh.morphTargetDictionary?.breathing;
+        if (
+          breathingIndex !== undefined
+          && mesh.morphTargetInfluences
+        ) {
+          mesh.morphTargetInfluences[breathingIndex] = 0;
+          breathingMeshes.push(mesh);
+        }
+        if (
+          mesh.morphTargetDictionary
+          && mesh.morphTargetInfluences
+          && AVATAR_VISEMES.some(
+            (name) => mesh.morphTargetDictionary?.[name] !== undefined,
+          )
+        ) {
+          lipSyncMeshes.push(mesh);
+          for (const name of AVATAR_VISEMES) {
+            const index = mesh.morphTargetDictionary[name];
+            if (index !== undefined) mesh.morphTargetInfluences[index] = 0;
+          }
+        }
+        if (
+          (mesh as THREE.SkinnedMesh).isSkinnedMesh
+          && !usesEmbeddedAnimation
+        ) {
           (mesh as THREE.SkinnedMesh).normalizeSkinWeights();
         }
         const mats = Array.isArray(mesh.material) ? [...mesh.material] : [mesh.material];
@@ -710,9 +924,13 @@ function AvatarModel({
             m.emissiveMap = null;
           }
           m.emissive = new THREE.Color(0x000000);
-          // Avatar is a closed mesh — back-faces are never visible. Use
-          // FrontSide on mid/low to roughly halve fragment shader work.
-          m.side = matProfile.doubleSide ? THREE.DoubleSide : THREE.FrontSide;
+          // Meshy clothing is a thin, single-shell surface. Large shoulder
+          // poses can expose its reverse side even with correct skinning,
+          // so keep GLB character materials double-sided.
+          const isMeshyCharacter = /\.gl(?:b|tf)(?:$|\?)/i.test(avatarUrl);
+          m.side = isMeshyCharacter || matProfile.doubleSide
+            ? THREE.DoubleSide
+            : THREE.FrontSide;
           m.needsUpdate = true;
         });
         mesh.material = Array.isArray(mesh.material) ? mats : mats[0];
@@ -721,6 +939,10 @@ function AvatarModel({
       if ((obj as THREE.Bone).isBone) {
         const stripped = stripMixamoPrefix(obj.name);
         avatarBoneByStripped.set(stripped, obj.name);
+        avatarRestQuaternionByStripped.set(
+          stripped,
+          (obj as THREE.Bone).quaternion.clone(),
+        );
         if (stripped === "LeftToeBase" || stripped === "LeftFoot") {
           // Prefer the toe (lowest), but fall back to foot if the rig has no toe.
           if (!footBonesRef.current.left || stripped === "LeftToeBase") {
@@ -733,6 +955,8 @@ function AvatarModel({
         }
       }
     });
+    lipSyncMeshesRef.current = lipSyncMeshes;
+    breathingMeshesRef.current = breathingMeshes;
 
     /* ── Scale + ground the avatar ──
        Anchor the avatar's feet at scene-local y = 0 so the parent group's
@@ -741,19 +965,21 @@ function AvatarModel({
        — essential for the "walk closer = grow" stage trick below. */
     scene.position.set(0, 0, 0);
     scene.scale.set(1, 1, 1);
-    scene.updateMatrixWorld(true);
-    const rawBox = new THREE.Box3().setFromObject(scene);
+    const rawBox = getSceneLocalBounds(scene);
     const modelHeight = rawBox.max.y - rawBox.min.y;
-    const desiredHeight = 2.45;
+    const desiredHeight = MODEL_NORMALIZED_HEIGHT;
+    let modelScale = 1;
     if (modelHeight > 0.001) {
-      const s = desiredHeight / modelHeight;
-      scene.scale.setScalar(s);
+      modelScale = desiredHeight / modelHeight;
+      scene.scale.setScalar(modelScale);
     }
-    scene.updateMatrixWorld(true);
-    const scaledBox = new THREE.Box3().setFromObject(scene);
     const center = new THREE.Vector3();
-    scaledBox.getCenter(center);
-    scene.position.set(-center.x, -scaledBox.min.y, -center.z);
+    rawBox.getCenter(center);
+    scene.position.set(
+      -center.x * modelScale,
+      -rawBox.min.y * modelScale,
+      -center.z * modelScale,
+    );
     scene.updateMatrixWorld(true);
 
     /* ── Build mixer + actions ── */
@@ -783,9 +1009,15 @@ function AvatarModel({
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
       const clip = sourceClips[key];
       if (!clip) return;
-      // The custom standing idle should play as-authored.
-      const lockLegs = false;
-      const mapped = remapClipToAvatarRig(clip, avatarBoneByStripped, lockLegs);
+      // Pre-animated GLBs play their supplied clip exactly as authored.
+      // Retargeting is reserved for the legacy FBX avatar only.
+      const mapped = usesEmbeddedAnimation
+        ? clip.clone()
+        : remapClipToAvatarRig(
+            clip,
+            avatarBoneByStripped,
+            avatarRestQuaternionByStripped,
+          );
       if (!mapped) return;
       const action = mixer.clipAction(mapped, scene);
       action.enabled = true;
@@ -810,6 +1042,9 @@ function AvatarModel({
         .play();
       initialAction.setEffectiveWeight(1);
       currentActionRef.current = initialAction;
+      embeddedIdleActionRef.current = usesEmbeddedAnimation
+        ? initialAction
+        : null;
       animStateRef.current = initialState;
 
       // Snap the group to the initial state's stage marks so the very first
@@ -817,16 +1052,80 @@ function AvatarModel({
       const grp = groupRef.current;
       if (grp) {
         const t = STATE_TARGETS[initialState];
-        grp.position.set(0, GROUND_Y, t.z);
+        grp.position.set(0, getGroundY(camera, t.z), t.z);
         grp.rotation.y = t.rotY;
-        grp.scale.setScalar(t.scale);
+        grp.scale.setScalar(
+          getScaleForScreenHeight(camera, t.z, t.screenHeight),
+        );
       }
 
       mixer.update(0);
+      if (grp) {
+        posedModelHeightRef.current = measurePosedModelHeight(scene, grp);
+        const target = STATE_TARGETS[initialState];
+        grp.scale.setScalar(
+          getScaleForScreenHeight(
+            camera,
+            target.z,
+            target.screenHeight,
+            posedModelHeightRef.current,
+          ),
+        );
+        grp.updateMatrixWorld(true);
+      }
+      // Plant the first rendered pose immediately. Waiting for the
+      // throttled frame clamp made the model visibly hover during startup.
+      if (grp) {
+        grp.updateMatrixWorld(true);
+        let minFootY = Infinity;
+        const footPosition = new THREE.Vector3();
+        for (const foot of [footBonesRef.current.left, footBonesRef.current.right]) {
+          if (!foot) continue;
+          foot.getWorldPosition(footPosition);
+          minFootY = Math.min(minFootY, footPosition.y);
+        }
+        if (Number.isFinite(minFootY)) {
+          const measuredOffset = minFootY - grp.position.y;
+          footFloorOffsetRef.current = measuredOffset;
+          footClampInitializedRef.current = true;
+          grp.position.y = getGroundY(camera, grp.position.z) - measuredOffset;
+          grp.updateMatrixWorld(true);
+        }
+      }
       notify(initialState);
       // Tell the host the avatar is on screen so it can spin up the camera
       // pipeline now — we deliberately defer onReady to the next frame so
       // React commits the Canvas before MediaPipe starts hammering the GPU.
+      requestAnimationFrame(() => onReadyRef.current?.());
+    } else {
+      // Static/morph-only replacement models have no compatible skeleton.
+      // They still need the same stage placement, grounding, ready signal,
+      // rear-view rotation and audio-driven facial animation.
+      animStateRef.current = initialState;
+      const grp = groupRef.current;
+      if (grp) {
+        const target = STATE_TARGETS[initialState];
+        grp.position.set(0, getGroundY(camera, target.z), target.z);
+        grp.rotation.y = target.rotY;
+        grp.scale.setScalar(
+          getScaleForScreenHeight(camera, target.z, target.screenHeight),
+        );
+      }
+      mixer.update(0);
+      if (grp) {
+        posedModelHeightRef.current = measurePosedModelHeight(scene, grp);
+        const target = STATE_TARGETS[initialState];
+        grp.scale.setScalar(
+          getScaleForScreenHeight(
+            camera,
+            target.z,
+            target.screenHeight,
+            posedModelHeightRef.current,
+          ),
+        );
+        grp.updateMatrixWorld(true);
+      }
+      notify(initialState);
       requestAnimationFrame(() => onReadyRef.current?.());
     }
 
@@ -843,6 +1142,9 @@ function AvatarModel({
       mixer.uncacheRoot(scene);
       mixerRef.current = null;
       currentActionRef.current = null;
+      embeddedIdleActionRef.current = null;
+      lipSyncMeshesRef.current = [];
+      breathingMeshesRef.current = [];
       actionsRef.current = {
         sitting: undefined,
         standing_up: undefined,
@@ -866,7 +1168,7 @@ function AvatarModel({
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
     // tear down the mixer on every parent re-render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scene, sourceClips]);
+  }, [camera, scene, sourceClips, usesEmbeddedAnimation]);
 
   // Frame-rate cap. We accumulate `delta` and only run the heavy
   // per-frame work (mixer.update + foot clamp + transform lerps) when
@@ -892,12 +1194,6 @@ function AvatarModel({
   // Running it every other tick is imperceptible at 30fps but cuts
   // CPU markedly on iPhones.
   const footClampTickRef = useRef(0);
-  // Persistent filtered distance between the animated planted foot and
-  // the avatar root. Subtracting it from GROUND_Y keeps the sole locked
-  // to the floor while smoothing small idle-animation variations.
-  const footFloorOffsetRef = useRef(0);
-  const footClampInitializedRef = useRef(false);
-
   useFrame((_, delta) => {
     const baseFrameMs = targetFrameMs;
     const maxFrameMs = 1000 / 30; // never drop below 30fps pacing
@@ -926,9 +1222,113 @@ function AvatarModel({
     frameAccumRef.current = 0;
     delta = stepDelta;
 
+    /* ── Audio-driven visemes ──
+       The front display classifies ElevenLabs' live output spectrum. The
+       rear display consumes the same timestamped frame over BroadcastChannel.
+       Every target returns to zero when speech stops, so the authored
+       closed-mouth Basis is always the resting pose. */
+    const lipNow = performance.now();
+    const remoteFrame = getLipSyncFrameRef.current?.() ?? null;
+    const classified = remoteFrame
+      ? remoteFrame
+      : isSpeakingRef.current
+        ? classifyViseme(
+            getAudioDataRef.current?.(),
+          )
+        : null;
+    if (
+      classified
+      && (
+        classified.viseme === activeVisemeRef.current
+        || classified.viseme === "viseme_PP"
+        || lipNow - activeVisemeSinceRef.current >= 55
+      )
+    ) {
+      if (classified.viseme !== activeVisemeRef.current) {
+        activeVisemeRef.current = classified.viseme;
+        activeVisemeSinceRef.current = lipNow;
+      }
+    }
+    const mouthOpen = Boolean(
+      isSpeakingRef.current
+      && classified
+      && (!remoteFrame || Date.now() - remoteFrame.sentAt < 250),
+    );
+    const activeViseme = activeVisemeRef.current;
+    const sourceIntensity = classified?.intensity ?? 0;
+    const gain =
+      activeViseme === "viseme_PP"
+        ? LIP_SYNC_CLOSURE_GAIN
+        : LIP_SYNC_OPEN_GAIN;
+    const activeIntensity = mouthOpen
+      ? syncMode === "follower"
+        ? sourceIntensity
+        : Math.min(MAX_LIP_SYNC_INFLUENCE, sourceIntensity * gain)
+      : 0;
+    const closingLips = !mouthOpen || activeViseme === "viseme_PP";
+    const mouthBlend = 1 - Math.exp(-delta * (closingLips ? 42 : 18));
+    for (const mesh of lipSyncMeshesRef.current) {
+      const dictionary = mesh.morphTargetDictionary;
+      const influences = mesh.morphTargetInfluences;
+      if (!dictionary || !influences) continue;
+      for (const viseme of AVATAR_VISEMES) {
+        const index = dictionary[viseme];
+        if (index === undefined) continue;
+        const targetInfluence = viseme === activeViseme ? activeIntensity : 0;
+        influences[index] += (targetInfluence - influences[index]) * mouthBlend;
+      }
+    }
+    if (onLipSyncFrameRef.current && lipNow - lastPublishedLipFrameRef.current >= 33) {
+      lastPublishedLipFrameRef.current = lipNow;
+      onLipSyncFrameRef.current(
+        mouthOpen
+          ? { viseme: activeViseme, intensity: activeIntensity, sentAt: Date.now() }
+          : null,
+      );
+    }
+
     const mixer = mixerRef.current;
     const actions = actionsRef.current;
-    if (mixer) mixer.update(Math.min(delta, 0.05));
+    if (mixer) {
+      const embeddedIdle = embeddedIdleActionRef.current;
+      if (usesEmbeddedAnimation && embeddedIdle) {
+        const duration = embeddedIdle.getClip().duration;
+        if (duration > 0.001) {
+          // The supplied idle clips are not authored as seamless cycles:
+          // their final pose differs from their first pose. A hard modulo
+          // therefore snaps the skeleton at every loop boundary. Play the
+          // clip forward and backward with cosine-eased turnarounds instead.
+          // Wall-clock phase keeps the front and rear displays frame-locked.
+          const cycleDuration = duration * 2;
+          const cyclePhase = ((Date.now() / 1000) % cycleDuration) / cycleDuration;
+          const easedPingPong = 0.5 - 0.5 * Math.cos(cyclePhase * Math.PI * 2);
+          embeddedIdle.time = Math.min(
+            easedPingPong * duration,
+            Math.max(0, duration - 0.000001),
+          );
+        }
+        mixer.update(0);
+      } else {
+        mixer.update(Math.min(delta, 0.05));
+      }
+    }
+
+    /* ── Subtle synchronized chest breathing ──
+       Morph-only characters cannot inherit the Mixamo idle's ribcage
+       motion. Drive their authored inhale target from wall-clock time so
+       the front and rear displays remain phase-locked. Speech reduces the
+       amplitude because the voice animation already supplies motion. */
+    const breathPhase = (Date.now() % 4_800) / 4_800;
+    const inhale = 0.5 - 0.5 * Math.cos(breathPhase * Math.PI * 2);
+    const breathTarget = inhale * (isSpeakingRef.current ? 0.35 : 1);
+    const breathBlend = 1 - Math.exp(-delta * 3.5);
+    for (const mesh of breathingMeshesRef.current) {
+      const index = mesh.morphTargetDictionary?.breathing;
+      const influences = mesh.morphTargetInfluences;
+      if (index === undefined || !influences) continue;
+      influences[index] +=
+        (breathTarget - influences[index]) * breathBlend;
+    }
 
     /* ── Smoothly drive group transform toward the current state's marks ── */
     const grp = groupRef.current;
@@ -990,7 +1390,8 @@ function AvatarModel({
           yBias = FALL_FROM * (1 - dropProgress);
         }
       }
-      const tgtY = GROUND_Y + yBias - footFloorOffsetRef.current;
+      const floorY = getGroundY(camera, grp.position.z);
+      const tgtY = floorY + yBias - footFloorOffsetRef.current;
 
       // Snappier follow during climb / fall so the lift+drop tracks the
       // curve closely. Climb needs to commit instantly when entering;
@@ -1002,7 +1403,8 @@ function AvatarModel({
 
       /* ── Foot-to-floor clamp (low-pass filtered) ──
          Mixamo's breathing-idle clip lifts the Hips a few cm above the
-         bind pose. Without correction the toes float above GROUND_Y. We
+         bind pose. Without correction the toes float above the viewport
+         floor. We
          sample whichever toe is currently lower and update a persistent
          `footFloorOffsetRef` with an immediate initial correction followed
          by a short exponential filter. The offset is then applied to
@@ -1077,22 +1479,35 @@ function AvatarModel({
       while (drot < -Math.PI) drot += Math.PI * 2;
       grp.rotation.y += drot * rotLerp;
 
-      // Lock scale to z-progress so the zoom-in happens *during* the walk
-      // rather than after, and resolves exactly when z does. Clamped to
-      // the BACK_Z..FRONT_Z range so off-mark states still pick a sane
-      // value.
+      // Derive scale from the live camera frustum and the initial posed
+      // bounds. Every state occupies exactly 90% of the screen height,
+      // leaving a strict 10% gap above the head.
       const zProgress =
         (grp.position.z - BACK_Z) / (FRONT_Z - BACK_Z);
       const t = Math.max(0, Math.min(1, zProgress));
-      const derivedScale = BACK_SCALE + (FRONT_SCALE - BACK_SCALE) * t;
-      // Attract mode zooms 20% beyond the normal front-mark scale so the
-      // climbing gesture really commands attention.
-      const scaleMult = attractModeRef.current ? ATTRACT_SCALE_MULT : 1;
-      grp.scale.setScalar(derivedScale * scaleMult);
+      const screenHeight =
+        FAR_SCREEN_HEIGHT
+        + (CLOSE_SCREEN_HEIGHT - FAR_SCREEN_HEIGHT) * t;
+      grp.scale.setScalar(
+        getScaleForScreenHeight(
+          camera,
+          grp.position.z,
+          screenHeight,
+          posedModelHeightRef.current,
+        ),
+      );
+
+      const targetScale =
+        getScaleForScreenHeight(
+          camera,
+          target.z,
+          target.screenHeight,
+          posedModelHeightRef.current,
+        );
 
       onMark =
         Math.abs(target.z - grp.position.z) < 0.04 &&
-        Math.abs(target.scale * scaleMult - grp.scale.x) < 0.012;
+        Math.abs(targetScale - grp.scale.x) < 0.012;
       facingTarget = Math.abs(drot) < 0.05;
     }
 
@@ -1172,6 +1587,11 @@ function AvatarModel({
 
     /* ── Debounce face presence/absence ── */
     const now = performance.now();
+
+    // Supplied character GLBs currently contain only their authored idle.
+    // Keep that clip running and ignore body-state/gesture requests until a
+    // matching pre-animated GLB clip is provided for the requested action.
+    if (usesEmbeddedAnimation) return;
 
     if (syncMode === "follower") {
       const command = syncedAnimationRef.current;
@@ -1545,7 +1965,6 @@ function AvatarModel({
     <group ref={groupRef}>
       <group
         rotation={[0, viewMode === "rear" ? Math.PI : 0, 0]}
-        scale={viewMode === "front" ? FRONT_VIEW_SCALE : 1}
       >
         <primitive object={scene} />
       </group>
@@ -1625,7 +2044,6 @@ function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }
     // Portrait screens need extra camera distance to keep the full body in-frame.
     const portraitBoost = aspect < 0.62 ? Math.min(1.2, ((0.62 - aspect) / 0.62) * 1.2) : 0;
     const target = targetZRef.current + portraitBoost;
-    // eslint-disable-next-line react-hooks/immutability
     camera.position.z += (target - camera.position.z) * Math.min(1, delta * 1.5);
   });
   return null;
@@ -1638,24 +2056,171 @@ function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }
  * for the lost fill. Visually almost identical for a talking-head shot,
  * but cuts shader work substantially on tile-based mobile GPUs.
  */
-function SceneLights() {
+function SceneLights({
+  cameraVideoRef,
+}: {
+  cameraVideoRef?: RefObject<HTMLVideoElement | null>;
+}) {
   const profile = useMemo(() => getDeviceProfile(), []);
   const max = profile.maxLights;
-  // Boost ambient when we drop the warm fills so the avatar's shadow
-  // side doesn't read as dead-black.
-  const ambient = max >= 5 ? 0.7 : max >= 2 ? 0.85 : 1.0;
+  const baseAmbient = max >= 5 ? 0.7 : max >= 2 ? 0.85 : 1.0;
+  const ambientRef = useRef<THREE.AmbientLight>(null);
+  const keyRef = useRef<THREE.DirectionalLight>(null);
+  const fillRef = useRef<THREE.DirectionalLight>(null);
+  const rimRef = useRef<THREE.DirectionalLight>(null);
+  const pointRef = useRef<THREE.PointLight>(null);
+  const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const nextSampleAtRef = useRef(0);
+  const targetRef = useRef({
+    ambient: baseAmbient,
+    key: 1,
+    fill: 0.35,
+    rim: 0.15,
+    point: 0.3,
+    keyX: 2,
+    color: new THREE.Color(1, 0.94, 0.87),
+  });
+
+  useFrame(({ clock }, delta) => {
+    const video = cameraVideoRef?.current;
+    const now = clock.elapsedTime;
+
+    if (
+      video &&
+      video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      video.videoWidth > 0 &&
+      now >= nextSampleAtRef.current
+    ) {
+      nextSampleAtRef.current = now + 0.75;
+      const canvas =
+        sampleCanvasRef.current ??
+        (sampleCanvasRef.current = document.createElement("canvas"));
+      canvas.width = 24;
+      canvas.height = 14;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+
+      if (context) {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        ).data;
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let luminance = 0;
+        let rawLeft = 0;
+        let rawRight = 0;
+        let samples = 0;
+
+        for (let index = 0; index < pixels.length; index += 4) {
+          const r = pixels[index] / 255;
+          const g = pixels[index + 1] / 255;
+          const b = pixels[index + 2] / 255;
+          const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          red += r;
+          green += g;
+          blue += b;
+          luminance += luma;
+          const pixelIndex = index / 4;
+          if (pixelIndex % canvas.width < canvas.width / 2) {
+            rawLeft += luma;
+          } else {
+            rawRight += luma;
+          }
+          samples += 1;
+        }
+
+        const averageLuminance = luminance / Math.max(1, samples);
+        const exposure = THREE.MathUtils.clamp(
+          (averageLuminance - 0.08) / 0.7,
+          0,
+          1,
+        );
+        const average = (red + green + blue) / Math.max(1, samples * 3);
+        const target = targetRef.current;
+        target.ambient = baseAmbient * (0.58 + exposure * 0.62);
+        target.key = 0.55 + exposure * 0.95;
+        target.fill = 0.2 + exposure * 0.3;
+        target.rim = 0.08 + exposure * 0.12;
+        target.point = 0.14 + exposure * 0.3;
+
+        // The video is mirrored in CSS, so swap its measured left/right
+        // brightness when positioning the key light in model space.
+        const displayedLeft = rawRight;
+        const displayedRight = rawLeft;
+        const balance =
+          (displayedRight - displayedLeft) /
+          Math.max(0.001, displayedRight + displayedLeft);
+        target.keyX = THREE.MathUtils.clamp(balance * 7, -3.5, 3.5);
+
+        target.color.setRGB(
+          THREE.MathUtils.clamp(red / Math.max(0.001, samples * average), 0.72, 1.12),
+          THREE.MathUtils.clamp(green / Math.max(0.001, samples * average), 0.72, 1.12),
+          THREE.MathUtils.clamp(blue / Math.max(0.001, samples * average), 0.72, 1.12),
+        );
+      }
+    }
+
+    const target = targetRef.current;
+    const blend = Math.min(1, delta * 2.2);
+    if (ambientRef.current) {
+      ambientRef.current.intensity +=
+        (target.ambient - ambientRef.current.intensity) * blend;
+      ambientRef.current.color.lerp(target.color, blend * 0.35);
+    }
+    if (keyRef.current) {
+      keyRef.current.intensity +=
+        (target.key - keyRef.current.intensity) * blend;
+      keyRef.current.position.x +=
+        (target.keyX - keyRef.current.position.x) * blend;
+      keyRef.current.color.lerp(target.color, blend);
+    }
+    if (fillRef.current) {
+      fillRef.current.intensity +=
+        (target.fill - fillRef.current.intensity) * blend;
+      fillRef.current.color.lerp(target.color, blend * 0.5);
+    }
+    if (rimRef.current) {
+      rimRef.current.intensity +=
+        (target.rim - rimRef.current.intensity) * blend;
+    }
+    if (pointRef.current) {
+      pointRef.current.intensity +=
+        (target.point - pointRef.current.intensity) * blend;
+      pointRef.current.color.lerp(target.color, blend);
+    }
+  });
+
   return (
     <>
-      <ambientLight intensity={ambient} />
+      <ambientLight ref={ambientRef} intensity={baseAmbient} />
       {/* Key light — always on. */}
-      <directionalLight position={[2, 3, 3]} intensity={1.0} />
+      <directionalLight ref={keyRef} position={[2, 3, 3]} intensity={1.0} />
       {max >= 2 && (
-        <directionalLight position={[-1.5, 2, 1]} intensity={0.35} color="#ffeedd" />
+        <directionalLight
+          ref={fillRef}
+          position={[-1.5, 2, 1]}
+          intensity={0.35}
+          color="#ffeedd"
+        />
       )}
       {max >= 5 && (
         <>
-          <directionalLight position={[-2, 1, -1]} intensity={0.15} color="#FF9933" />
-          <pointLight position={[0, 0.3, 0.9]} intensity={0.3} color="#ffe4c9" />
+          <directionalLight
+            ref={rimRef}
+            position={[-2, 1, -1]}
+            intensity={0.15}
+            color="#FF9933"
+          />
+          <pointLight
+            ref={pointRef}
+            position={[0, 0.3, 0.9]}
+            intensity={0.3}
+            color="#ffe4c9"
+          />
         </>
       )}
     </>
@@ -1719,35 +2284,16 @@ function DynamicDprController({ maxDpr }: { maxDpr: number }) {
   return null;
 }
 
-/* A screen-space contact shadow stays visible against every camera angle.
-   The previous horizontal Three.js plane was edge-on to the stage camera,
-   which made it effectively invisible. */
-function Ground() {
-  return (
-    <div
-      aria-hidden="true"
-      style={{
-        position: "absolute",
-        left: "50%",
-        bottom: "0.5%",
-        width: "34%",
-        height: "6%",
-        transform: "translateX(-50%)",
-        borderRadius: "50%",
-        background:
-          "radial-gradient(ellipse at center, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.48) 42%, rgba(0,0,0,0) 74%)",
-        filter: "blur(6px)",
-        pointerEvents: "none",
-        zIndex: 0,
-      }}
-    />
-  );
-}
-
 export interface Avatar3DProps {
+  /** Character mesh. All three profiles currently share the Sandipani
+   * model; this path can be replaced per profile when new FBX files arrive. */
+  avatarUrl?: string;
   isSpeaking: boolean;
   getAudioData?: () => Uint8Array | undefined;
-  getVolume?: () => number;
+  /** Rear display reads the leader's already-classified mouth pose. */
+  getLipSyncFrame?: () => LipSyncFrame | null;
+  /** Leader publishes its real-time mouth pose to the rear display. */
+  onLipSyncFrame?: (frame: LipSyncFrame | null) => void;
   gesture?: string | null;
   userSmile?: number;
   faceDetected?: boolean;
@@ -1770,10 +2316,17 @@ export interface Avatar3DProps {
   /** Rear mode keeps the stage position unchanged and renders the model
    * from the opposite side. */
   viewMode?: "front" | "rear";
+  /** Live background camera used to match avatar exposure, light colour,
+   * and the dominant left/right light direction. */
+  cameraVideoRef?: RefObject<HTMLVideoElement | null>;
 }
 
 export default function Avatar3D({
+  avatarUrl = DEFAULT_AVATAR_URL,
   isSpeaking,
+  getAudioData,
+  getLipSyncFrame,
+  onLipSyncFrame,
   gesture,
   faceDetected,
   aiGesture,
@@ -1782,8 +2335,13 @@ export default function Avatar3D({
   syncedAnimation = null,
   onAnimationStateChange,
   viewMode = "front",
+  cameraVideoRef,
 }: Avatar3DProps) {
   const gestureRef = useRef<GestureName>(null);
+  const isSpeakingRef = useRef(isSpeaking);
+  const getAudioDataRef = useRef(getAudioData);
+  const getLipSyncFrameRef = useRef(getLipSyncFrame);
+  const onLipSyncFrameRef = useRef(onLipSyncFrame);
   const faceDetectedRef = useRef(faceDetected ?? false);
   const aiGestureRef = useRef<{ name: string; nonce: number } | null>(aiGesture ?? null);
   const syncedAnimationRef = useRef<AvatarAnimationCommand | null>(syncedAnimation);
@@ -1792,11 +2350,24 @@ export default function Avatar3D({
   // Sync incoming props into refs so AvatarModel's per-frame loop can read
   // the latest values without re-rendering the Canvas tree.
   useEffect(() => {
+    isSpeakingRef.current = isSpeaking;
+    getAudioDataRef.current = getAudioData;
+    getLipSyncFrameRef.current = getLipSyncFrame;
+    onLipSyncFrameRef.current = onLipSyncFrame;
     gestureRef.current = (gesture as GestureName) ?? null;
     faceDetectedRef.current = faceDetected ?? false;
     aiGestureRef.current = aiGesture ?? null;
     syncedAnimationRef.current = syncedAnimation;
-  }, [gesture, faceDetected, aiGesture, syncedAnimation]);
+  }, [
+    isSpeaking,
+    getAudioData,
+    getLipSyncFrame,
+    onLipSyncFrame,
+    gesture,
+    faceDetected,
+    aiGesture,
+    syncedAnimation,
+  ]);
 
   // Stable callback so AvatarModel's useEffect (which wires up the mixer)
   // doesn't tear down on every parent re-render.
@@ -1838,14 +2409,6 @@ export default function Avatar3D({
     onReadyRef.current = onReady;
   }, [onReady]);
 
-  // Skip the soft shadow disc on phones / low-tier — it's a transparent
-  // draw call + a 256² canvas texture upload that those devices don't
-  // need under the avatar (the user can't see the floor anyway).
-  const showGroundShadow = useMemo(
-    () => getDeviceProfile().enableGroundShadow,
-    [],
-  );
-
   return (
     <AvatarErrorBoundary fallback={(err) => <FallbackOrb isSpeaking={isSpeaking} error={err} />}>
       <Suspense fallback={<Loader />}>
@@ -1857,11 +2420,15 @@ export default function Avatar3D({
             position: "relative",
           }}
         >
-          {showGroundShadow && <Ground />}
           <DeviceTunedCanvas isSpeaking={isSpeaking}>
-            <SceneLights />
+            <SceneLights cameraVideoRef={cameraVideoRef} />
             <CameraAnimator targetZRef={cameraTargetRef} />
             <AvatarModel
+              avatarUrl={avatarUrl}
+              isSpeakingRef={isSpeakingRef}
+              getAudioDataRef={getAudioDataRef}
+              getLipSyncFrameRef={getLipSyncFrameRef}
+              onLipSyncFrameRef={onLipSyncFrameRef}
               gestureRef={gestureRef}
               faceDetectedRef={faceDetectedRef}
               aiGestureRef={aiGestureRef}
@@ -1936,7 +2503,7 @@ function DeviceTunedCanvas({
       }}
       dpr={[1, profile.maxDpr]}
       shadows={profile.shadows}
-      // Skip object sorting — the scene has only the avatar + ground;
+      // Skip object sorting — the scene has only the avatar;
       // the GPU's depth test handles correct occlusion. Sorting costs
       // a per-frame O(n log n) on the CPU side.
       onCreated={({ gl, scene: glScene }) => {
@@ -1973,7 +2540,7 @@ function DeviceTunedCanvas({
 // On low-tier devices we skip the optional gesture FBXs so we don't burn
 // memory + bandwidth on animations that will never play.
 if (typeof window !== "undefined") {
-  void loadFbxScene(AVATAR_URL);
+  void loadAvatarScene(DEFAULT_AVATAR_URL);
   const profile = getDeviceProfile();
   ALL_ANIM_URLS.forEach((url) => {
     if (!isAssetEnabled(url, profile)) return;

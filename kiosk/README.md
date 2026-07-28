@@ -107,7 +107,9 @@ sudo bash ~/algaetree-kiosk/update-url.sh https://your-url.com
 
 When two displays are connected, the kiosk automatically opens the normal
 front view on the primary display and the synchronized rear avatar view on
-the second display. By default, camera index `0` is used for the front
+the second display. The front display starts on the character-selection
+screen; the rear display waits for that choice before mounting the matching
+avatar. By default, camera index `0` is used for the front
 background and camera index `1` is used for CV/rear background.
 
 For a stable installation, configure camera label fragments and (if needed)

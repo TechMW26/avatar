@@ -4,7 +4,7 @@ const path = require("path");
 const net = require("net");
 
 // ── Configuration ──
-const APP_URL = process.env.ALGAETREE_URL || "https://algaetree.vercel.app/talk";
+const APP_URL = process.env.ALGAETREE_URL || "https://algaetree.vercel.app/";
 const CONNECTIVITY_CHECK_INTERVAL = 5000; // 5 seconds
 const CONNECTIVITY_CHECK_URL = "https://www.google.com";
 

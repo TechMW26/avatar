@@ -134,6 +134,7 @@ export function useVisionDetection(options?: {
   const objectDetectorRef = useRef<ObjectDetector | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number>(0);
+  const detectRef = useRef<() => void>(() => {});
   const lastDetectionTimeRef = useRef<number>(0);
   // Run heavy detectors (object detection) at a slower rate
   const lastHeavyDetectionRef = useRef<number>(0);
@@ -214,7 +215,6 @@ export function useVisionDetection(options?: {
 
     async function init() {
       try {
-        const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
         const isDesktopGesturePlatform = isMacOrWindowsDesktop();
         const isMobileDevice = !isDesktopGesturePlatform;
         isMobileRef.current = isMobileDevice;
@@ -262,12 +262,18 @@ export function useVisionDetection(options?: {
                 }
                 if (msg.type === "error") {
                   faceWorkerInFlightRef.current = false;
-                  // Init failure should not sit until timeout; fail fast so
-                  // main-thread fallback starts immediately.
+                  faceWorkerReadyRef.current = false;
+                  faceWorkerEnabledRef.current = false;
+                  // Init failure should not sit until timeout. Detection
+                  // failure must also immediately hand over to the always
+                  // available main-thread detector.
                   if (msg.stage === "init") {
-                    faceWorkerReadyRef.current = false;
-                    faceWorkerEnabledRef.current = false;
                     finish(false);
+                  } else {
+                    try { worker.terminate(); } catch {}
+                    if (faceWorkerRef.current === worker) {
+                      faceWorkerRef.current = null;
+                    }
                   }
                 }
               };
@@ -407,33 +413,21 @@ export function useVisionDetection(options?: {
             }
           }
 
-          const workerReadyFast = await Promise.race<boolean>([
-            faceWorkerTask,
-            new Promise<boolean>((resolve) => {
-              window.setTimeout(() => resolve(false), 1_250);
+          // Keep a local detector alive even when the worker starts. Module
+          // workers can become unavailable after startup (CDN/CSP/context
+          // loss); face detection must continue without reloading the page.
+          void faceWorkerTask;
+          const faceDetector = await createWithFallback((v, d) =>
+            FaceDetector.createFromOptions(v, {
+              baseOptions: {
+                modelAssetPath:
+                  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+                delegate: d,
+              },
+              runningMode: "VIDEO",
+              minDetectionConfidence: 0.5,
             }),
-          ]);
-          let faceDetector: FaceDetector | null = null;
-          if (!workerReadyFast) {
-            faceDetector = await createWithFallback((v, d) =>
-              FaceDetector.createFromOptions(v, {
-                baseOptions: {
-                  modelAssetPath:
-                    "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
-                  delegate: d,
-                },
-                runningMode: "VIDEO",
-                minDetectionConfidence: 0.5,
-              }),
-            );
-            if (typeof window !== "undefined") {
-              // Fallback proved healthy; keep it as primary to avoid repeated
-              // worker startup churn on devices where worker init is flaky.
-              window.localStorage.setItem(FACE_WORKER_MODE_KEY, "fallback");
-              window.localStorage.setItem(FACE_WORKER_FAIL_COUNT_KEY, "0");
-              window.localStorage.setItem(FACE_WORKER_DISABLE_UNTIL_KEY, "0");
-            }
-          }
+          );
 
           // Mobile devices skip hand-gesture model entirely to reduce
           // startup time and steady-state CPU/GPU load.
@@ -457,11 +451,11 @@ export function useVisionDetection(options?: {
                 return null;
               });
 
-          return { vision, createWithFallback, faceDetector, gestureRecognizerTask };
+          return { createWithFallback, faceDetector, gestureRecognizerTask };
         })();
 
         const [stream, modelBundle] = await Promise.all([streamTask, modelTask]);
-        const { vision, createWithFallback, faceDetector, gestureRecognizerTask } = modelBundle;
+        const { createWithFallback, faceDetector, gestureRecognizerTask } = modelBundle;
 
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
@@ -569,7 +563,7 @@ export function useVisionDetection(options?: {
       (!faceWorkerReadyRef.current && !faceDetector) ||
       video.readyState < 2
     ) {
-      rafRef.current = requestAnimationFrame(detect);
+      rafRef.current = requestAnimationFrame(() => detectRef.current());
       return;
     }
 
@@ -586,7 +580,7 @@ export function useVisionDetection(options?: {
       ? DETECTION_INTERVAL_MOBILE_MS
       : DETECTION_INTERVAL_MS;
     if (now - lastDetectionTimeRef.current < detectionInterval) {
-      rafRef.current = requestAnimationFrame(detect);
+      rafRef.current = requestAnimationFrame(() => detectRef.current());
       return;
     }
     lastDetectionTimeRef.current = now;
@@ -603,10 +597,21 @@ export function useVisionDetection(options?: {
           })
           .catch(() => {
             faceWorkerInFlightRef.current = false;
+            faceWorkerReadyRef.current = false;
+            faceWorkerEnabledRef.current = false;
           });
       }
-      if (safeNow - faceWorkerLastTsRef.current <= FACE_WORKER_STALE_MS) {
+      const hasFreshWorkerResult =
+        faceWorkerLastTsRef.current > 0
+        && safeNow - faceWorkerLastTsRef.current <= FACE_WORKER_STALE_MS;
+      if (hasFreshWorkerResult) {
         faces = faceWorkerCountRef.current;
+      } else if (faceDetector) {
+        try {
+          faces = faceDetector.detectForVideo(video, safeNow).detections.length;
+        } catch {
+          // MediaPipe can throw on timestamp issues; skip frame.
+        }
       }
     } else if (faceDetector) {
       let faceResult: FaceDetectorResult | null = null;
@@ -963,13 +968,14 @@ export function useVisionDetection(options?: {
       setCurrentGestures(nextGestures);
     }
 
-    rafRef.current = requestAnimationFrame(detect);
+    rafRef.current = requestAnimationFrame(() => detectRef.current());
   }, []);
 
   // Start detection loop once ready
   useEffect(() => {
+    detectRef.current = detect;
     if (isReady) {
-      rafRef.current = requestAnimationFrame(detect);
+      rafRef.current = requestAnimationFrame(() => detectRef.current());
       return () => {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
       };

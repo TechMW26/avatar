@@ -17,17 +17,17 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  title: "Rishi Sandipani - Gurukul AI",
-  description: "Interactive AI Guru - Rishi Sandipani from the Gurukul of Ujjain. Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered experience.",
+  title: "Bharat Darshan AI - Living History",
+  description: "Choose a historical guide and have an immersive AI-powered conversation with Rishi Sandipani, Rani Lakshmi Bai, or Chhatrapati Shivaji Maharaj.",
   manifest: "/manifest.json",
-  keywords: ["Rishi Sandipani", "Gurukul", "AI Guru", "Ujjain", "Indian mythology", "interactive AI", "Sanskrit", "vedic knowledge"],
+  keywords: ["Rishi Sandipani", "Rani Lakshmi Bai", "Chhatrapati Shivaji Maharaj", "Indian history", "interactive AI", "living history"],
   authors: [{ name: "MWFutureTech" }],
   creator: "MWFutureTech",
   metadataBase: new URL("https://rishi-sandipani.vercel.app"),
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "Rishi Sandipani",
+    title: "Bharat Darshan AI",
   },
   icons: {
     icon: [
@@ -42,22 +42,22 @@ export const metadata: Metadata = {
   openGraph: {
     type: "website",
     url: "https://rishisandipani.com",
-    title: "Rishi Sandipani - Gurukul AI",
-    description: "Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered Gurukul experience.",
-    siteName: "Rishi Sandipani Gurukul",
+    title: "Bharat Darshan AI - Living History",
+    description: "Meet three iconic historical guides in an immersive AI-powered experience.",
+    siteName: "Bharat Darshan AI",
     images: [
       {
         url: "https://rishi-sandipani.vercel.app/og-image.png",
         width: 1200,
         height: 630,
-        alt: "Rishi Sandipani - AI Guru of Ujjain",
+        alt: "Bharat Darshan AI historical guides",
       },
     ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Rishi Sandipani - Gurukul AI",
-    description: "Seek wisdom from the legendary sage of Ujjain in an immersive AI-powered Gurukul experience.",
+    title: "Bharat Darshan AI - Living History",
+    description: "Meet three iconic historical guides in an immersive AI-powered experience.",
     images: ["https://rishi-sandipani.vercel.app/og-image.png"],
   },
 };
@@ -74,6 +74,7 @@ export default function RootLayout({
         <link rel="preconnect" href="https://storage.googleapis.com" crossOrigin="anonymous" />
       </head>
       <body
+        suppressHydrationWarning
         className={`${inter.variable} antialiased`}
       >
         {children}

@@ -24,7 +24,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v5";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v21";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
@@ -65,10 +65,9 @@ export function assetUrl(path: string): string {
 }
 
 /**
- * Every asset the avatar pulls during boot. Order matters — we load the
- * largest blocking files first (the avatar mesh + idle clip) so the
- * `Avatar3D` component can render its first frame as early as possible
- * even if a later gesture clip is still streaming in.
+ * Pre-animated character bundles pulled during boot. Each GLB contains its
+ * supplied skeleton, skin, idle animation, and the facial visemes added by
+ * our lip-sync-only preparation step, so no separate body clips are needed.
  *
  * Estimated bytes are a fallback for progress when the server omits
  * `Content-Length` (rare, but happens behind some proxies). Keep them
@@ -81,25 +80,16 @@ export interface AvatarAssetSpec {
 }
 
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
-  { path: "/avatar.fbx", estBytes: 74 * 1024 * 1024 },
-  { path: "/animations/neutral-idle.fbx", estBytes: 870_000 },
-  { path: "/animations/sitting-idle.clip.json", estBytes: 720_000 },
-  { path: "/animations/standing.clip.json", estBytes: 360_000 },
-  { path: "/animations/stop-walking.clip.json", estBytes: 390_000 },
-  { path: "/animations/walking.fbx", estBytes: 390_000 },
-  { path: "/animations/waving.clip.json", estBytes: 580_000 },
-  { path: "/animations/praying.fbx", estBytes: 420_000 },
-  { path: "/animations/explaining.fbx", estBytes: 640_000 },
-  { path: "/animations/yelling.fbx", estBytes: 950_000 },
-  { path: "/animations/dismissing.fbx", estBytes: 510_000 },
-  { path: "/animations/shooting-arrow.fbx", estBytes: 650_000 },
-  { path: "/animations/thoughtful.fbx", estBytes: 760_000 },
-  { path: "/animations/climbing.fbx", estBytes: 630_000 },
-  { path: "/animations/left-turn.fbx", estBytes: 370_000 },
-  { path: "/animations/pointing.fbx", estBytes: 610_000 },
-  { path: "/animations/sword-fight.fbx", estBytes: 780_000 },
-  { path: "/animations/falling-to-landing.fbx", estBytes: 380_000 },
+  { path: "/models/sandipani.glb", estBytes: 64 * 1024 * 1024 },
+  { path: "/models/rani-laxmi-bai.glb", estBytes: 62 * 1024 * 1024 },
+  { path: "/models/shivaji-maharaj.glb", estBytes: 29 * 1024 * 1024 },
 ];
+
+const AVATAR_MODEL_PATHS = new Set([
+  "/models/sandipani.glb",
+  "/models/rani-laxmi-bai.glb",
+  "/models/shivaji-maharaj.glb",
+]);
 
 function hashString(input: string): string {
   let hash = 2166136261;
@@ -200,10 +190,6 @@ export interface DeviceProfile {
    *  PBR reflections are one of the costlier per-fragment ops on mobile
    *  GPUs and the avatar reads fine without them. */
   enableEnvReflections: boolean;
-  /** When false, the soft circular shadow disc beneath the avatar is
-   *  not rendered. Saves a transparent draw call + 256² canvas texture
-   *  upload on memory-tight phones. */
-  enableGroundShadow: boolean;
   /** Hard cap on diffuse texture max(width,height). Anything larger is
    *  downsampled at material-setup time with a 2D canvas blit so the
    *  GPU never uploads a 4K skin texture on a 2 GB Android tablet. */
@@ -294,9 +280,6 @@ export function getDeviceProfile(): DeviceProfile {
     // and the avatar's robe/skin are matte enough that reflections
     // add nothing visible.
     enableEnvReflections: false,
-    // A single soft black contact shadow keeps the avatar visually planted
-    // against live camera backgrounds.
-    enableGroundShadow: true,
     // Handhelds use a tighter texture budget to reduce upload and VRAM.
     maxTextureSize: handheld ? 768 : 1024,
     // mediump materially reduces shader ALU pressure on budget phones.
@@ -313,13 +296,15 @@ export function getDeviceProfile(): DeviceProfile {
   return profile;
 }
 
-/** Build the asset queue for a given device profile. Mandatory assets
- *  are always included; optional gesture FBXs are dropped on low-tier
- *  devices. Use this to decide what to preload AND to test at runtime
- *  whether a given URL should be fetched at all. */
-export function getAssetQueueForProfile(profile: DeviceProfile): AvatarAssetSpec[] {
-  if (profile.loadOptionalGestures) return AVATAR_ASSETS;
-  return AVATAR_ASSETS.filter((a) => !OPTIONAL_GESTURE_PATHS.has(a.path));
+/** Build the asset queue for the selected pre-animated character. */
+export function getAssetQueueForProfile(
+  profile: DeviceProfile,
+  avatarPath = "/models/sandipani.glb",
+): AvatarAssetSpec[] {
+  return AVATAR_ASSETS.filter((asset) => {
+    if (AVATAR_MODEL_PATHS.has(asset.path) && asset.path !== avatarPath) return false;
+    return profile.loadOptionalGestures || !OPTIONAL_GESTURE_PATHS.has(asset.path);
+  });
 }
 
 /** Whether a given asset path is allowed to be fetched on this profile. */
@@ -465,6 +450,7 @@ async function preloadAvatarAssetsUnlocked(
   onProgress: (p: PreloadProgress) => void,
   signal?: AbortSignal,
   profile: DeviceProfile = getDeviceProfile(),
+  avatarPath = "/avatar.fbx",
 ): Promise<void> {
   // Resolve the cache once. If unavailable (private mode, very old
   // browsers), we still complete the downloads — they go straight to
@@ -479,7 +465,7 @@ async function preloadAvatarAssetsUnlocked(
     }
   }
 
-  const queue = getAssetQueueForProfile(profile);
+  const queue = getAssetQueueForProfile(profile, avatarPath);
 
   // Pre-compute the total byte budget so the progress ratio is stable
   // even before the first Content-Length header lands.
@@ -546,14 +532,15 @@ export async function preloadAvatarAssets(
   onProgress: (p: PreloadProgress) => void,
   signal?: AbortSignal,
   profile: DeviceProfile = getDeviceProfile(),
+  avatarPath = "/models/sandipani.glb",
 ): Promise<void> {
   if (typeof navigator !== "undefined" && navigator.locks?.request) {
     await navigator.locks.request("rishi-avatar-preload", async () => {
-      await preloadAvatarAssetsUnlocked(onProgress, signal, profile);
+      await preloadAvatarAssetsUnlocked(onProgress, signal, profile, avatarPath);
     });
     return;
   }
-  await preloadAvatarAssetsUnlocked(onProgress, signal, profile);
+  await preloadAvatarAssetsUnlocked(onProgress, signal, profile, avatarPath);
 }
 
 /**

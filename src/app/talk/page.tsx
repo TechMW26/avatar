@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable react-hooks/set-state-in-effect -- Browser media/bootstrap state is initialized and synchronized from effects. */
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import dynamic from "next/dynamic";
@@ -19,6 +20,18 @@ import {
   useFrontDisplaySync,
   useRemoteVision,
 } from "../lib/displaySync";
+import {
+  CHARACTER_STORAGE_KEY,
+  getCharacter,
+  getCharacterFromLocation,
+  type CharacterProfile,
+} from "../lib/characters";
+import { getCharacterSystemPrompt } from "../lib/characterPrompts";
+import {
+  updateRemoteCharacter,
+  useRemoteControlState,
+} from "../hooks/useRemoteControl";
+import { PronunciationLipSync } from "../lib/lipSync";
 
 const Avatar3D = dynamic(() => import("../components/Avatar3D"), { ssr: false });
 const AUTO_START_RETRY_DELAY_MS = 4000;
@@ -193,8 +206,6 @@ Available gestures and when to use each:
 
 How to call the tool: invoke \`playGesture\` with \`{ "name": "<gesture>" }\` at the moment in your reply where the gesture should land. Pick the gesture whose meaning best matches the sentence you are about to speak. If no gesture fits, do not call the tool. Quality over quantity — one well-timed gesture is more powerful than five generic ones.`;
 
-const ELEVENLABS_AGENT_ID = process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID_SANDIPANI!;
-
 function SoundWave({ active }: { active: boolean }) {
   return (
     <div className="flex items-center h-8" style={{ gap: 5 }}>
@@ -215,7 +226,8 @@ function SoundWave({ active }: { active: boolean }) {
   );
 }
 
-function TalkPageContent() {
+function TalkPageContent({ character }: { character: CharacterProfile }) {
+  const pronunciationLipSyncRef = useRef(new PronunciationLipSync());
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [retryWakeAt, setRetryWakeAt] = useState(0);
   const startInFlightRef = useRef(false);
@@ -233,6 +245,10 @@ function TalkPageContent() {
   const lastStableDisconnectAtRef = useRef<number>(0);
   const sessionTurnsRef = useRef(0);  // user+ai messages exchanged in current session
   const lastSessionWasEngagedRef = useRef(false);
+
+  useEffect(() => {
+    document.title = `${character.name} · Living History`;
+  }, [character.name]);
 
   const blockAutoStart = useCallback((delayMs: number) => {
     const blockedUntil = Date.now() + delayMs;
@@ -429,8 +445,10 @@ function TalkPageContent() {
     const faceCtx = vision.faceDetected
       ? `\n\nLIVE CAMERA CONTEXT:\nA face is currently detected (${Math.round(vision.facePresenceDurationMs / 1000)}s). The student is present. If the student is silent, do NOT ask "Are you still there?". Instead ask a relevant reflective prompt, observation, or next-step question in Hindi.`
       : "\n\nLIVE CAMERA CONTEXT:\nNo face is currently detected.";
-    return RISHI_SYSTEM_PROMPT + gestureCtx + faceCtx;
-  }, [vision.faceDetected, vision.facePresenceDurationMs]);
+    return getCharacterSystemPrompt(character.slug, RISHI_SYSTEM_PROMPT)
+      + gestureCtx
+      + faceCtx;
+  }, [character.slug, vision.faceDetected, vision.facePresenceDurationMs]);
 
   const getFirstMessage = useCallback(() => {
     // Mid-conversation reconnect: if a recent stable session was
@@ -444,11 +462,7 @@ function TalkPageContent() {
       && lastStableDisconnectAtRef.current > 0
       && since < RECONNECT_CONTINUATION_WINDOW_MS
     ) {
-      const continuations = [
-        "हाँ पुत्र, हम कहाँ थे? अपनी बात आगे बढ़ाओ।",
-        "चलो पुत्र, संवाद पुनः आरंभ करें — तुम क्या कह रहे थे?",
-        "पुत्र, क्षण भर के लिए संपर्क टूटा था। अपनी जिज्ञासा पुनः प्रकट करो।",
-      ];
+      const continuations = character.greetings.continuations;
       return continuations[Math.floor(Math.random() * continuations.length)];
     }
 
@@ -458,16 +472,17 @@ function TalkPageContent() {
     const peace = gestures.some(g => g.name === "Victory" && Date.now() - g.timestamp < 10_000);
     const namaste = gestures.some(g => g.name === "Namaste" && Date.now() - g.timestamp < 10_000);
 
-    if (namaste) return "नमस्ते पुत्र! 🙏 गुरुकुल में तुम्हारा स्वागत है। मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उनकी शिक्षाओं की एक छाया। बताओ, आज तुम क्या सीखना चाहते हो?";
-    if (waved) return "आओ पुत्र! मैंने तुम्हें देख लिया। मैं ऋषि सांदीपनि का प्रतिबिंब हूँ, तुम्हारा मार्गदर्शक। बताओ, आज तुम्हारे मन में क्या है?";
-    if (thumbsUp) return "बहुत अच्छा पुत्र! तुम्हारा उत्साह देखकर मन प्रसन्न हुआ। मैं ऋषि सांदीपनि का प्रतिबिंब हूँ। आओ, आज कुछ नया सीखते हैं।";
-    if (peace) return "शांति! स्वागत है पुत्र। मैं ऋषि सांदीपनि का प्रतिबिंब हूँ। तुम्हारे मन में जो भी प्रश्न हो, निःसंकोच पूछो।";
-    return "नमस्ते पुत्र! मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उज्जैन के गुरुकुल की शिक्षाओं की छाया। मैंने तुम्हें यहाँ आते देखा। बताओ, आज तुम क्या जानना चाहते हो?";
-  }, []);
+    if (namaste) return character.greetings.namaste;
+    if (waved) return character.greetings.wave;
+    if (thumbsUp) return character.greetings.approval;
+    if (peace) return character.greetings.peace;
+    return character.greetings.default;
+  }, [character]);
 
   const conversation = useConversation({
     onConnect: () => {
       console.log("[ElevenLabs] connected");
+      pronunciationLipSyncRef.current.clear();
       setConversationError(null);
       startInFlightRef.current = false;
       hadSuccessfulConnectionRef.current = true;
@@ -480,6 +495,7 @@ function TalkPageContent() {
       sessionTurnsRef.current = 0;
     },
     onDisconnect: (details) => {
+      pronunciationLipSyncRef.current.clear();
       clearPendingAutoGestureTimers();
       const sessionDuration = connectedAtRef.current > 0 ? Date.now() - connectedAtRef.current : 0;
       const wasStable = sessionDuration >= MIN_STABLE_CONNECTION_MS;
@@ -517,6 +533,7 @@ function TalkPageContent() {
       connectedAtRef.current = 0;
     },
     onError: (error: string, context?: unknown) => {
+      pronunciationLipSyncRef.current.clear();
       clearPendingAutoGestureTimers();
       console.error("[ElevenLabs] error:", error, context);
       setConversationError(error || "Conversation connection failed");
@@ -549,6 +566,15 @@ function TalkPageContent() {
         blockAutoStart(backoff);
         setConversationError("Connection failed. Tap to retry.");
       }
+    },
+    onAudioAlignment: (alignment) => {
+      pronunciationLipSyncRef.current.enqueue(alignment);
+    },
+    onInterruption: () => {
+      pronunciationLipSyncRef.current.clear();
+    },
+    onModeChange: ({ mode }) => {
+      if (mode === "listening") pronunciationLipSyncRef.current.clear();
     },
     // NOTE: onDebug fires on every audio/event packet. Logging it to the
     // devtools console causes the audio worklet to stall under load and is
@@ -657,7 +683,10 @@ function TalkPageContent() {
   // conversationStatusRef is now kept in sync by onStatusChange callback
 
   const isSpeaking = conversation.isSpeaking;
-  const publishAvatarState = useFrontDisplaySync(dualDisplay, isSpeaking);
+  const { publishAvatarState, publishLipSyncFrame } = useFrontDisplaySync(
+    dualDisplay,
+    isSpeaking,
+  );
 
   const currentGestureName = vision.currentGestures.length > 0
     ? vision.currentGestures[0].name
@@ -667,9 +696,9 @@ function TalkPageContent() {
     () => conversation.getOutputByteFrequencyData(),
     [conversation],
   );
-  const getVolume = useCallback(
-    () => conversation.getOutputVolume(),
-    [conversation],
+  const getPronunciationLipSyncFrame = useCallback(
+    () => pronunciationLipSyncRef.current.getFrame(),
+    [],
   );
 
   const conversationRef = useRef(conversation);
@@ -721,7 +750,7 @@ function TalkPageContent() {
     Promise.resolve(preflight).finally(() => {
       try {
         conv.startSession({
-          agentId: ELEVENLABS_AGENT_ID,
+          agentId: character.agentId,
           connectionType,
         });
       } catch (err) {
@@ -736,7 +765,7 @@ function TalkPageContent() {
         startInFlightRef.current = false;
       }
     });
-  }, [blockAutoStart]);
+  }, [blockAutoStart, character.agentId]);
 
   const endConversation = useCallback(() => {
     try {
@@ -917,7 +946,12 @@ function TalkPageContent() {
     });
 
     try {
-      await preloadAvatarAssets((p) => setPreloadProgress(p));
+      await preloadAvatarAssets(
+        (p) => setPreloadProgress(p),
+        undefined,
+        undefined,
+        character.modelPath,
+      );
       setBootStage("ready");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to load avatar assets";
@@ -926,7 +960,7 @@ function TalkPageContent() {
     } finally {
       bootInFlightRef.current = false;
     }
-  }, []);
+  }, [character.modelPath]);
 
   // Kick off the preload as soon as the page mounts. No "Tap to Begin"
   // gate — the preloader streams sequentially so it doesn't OOM mobile
@@ -948,6 +982,7 @@ function TalkPageContent() {
     const rearUrl = new URL("/talk/back", window.location.origin);
     rearUrl.searchParams.set("dual", "1");
     rearUrl.searchParams.set("camera", "index:1");
+    rearUrl.searchParams.set("character", character.slug);
     const rearWindow = window.open(
       rearUrl.toString(),
       "rishi-rear-display",
@@ -959,6 +994,7 @@ function TalkPageContent() {
       const frontUrl = new URL(window.location.href);
       frontUrl.searchParams.set("dual", "1");
       frontUrl.searchParams.set("camera", "index:0");
+      frontUrl.searchParams.set("character", character.slug);
       window.history.replaceState(null, "", frontUrl);
       setCameraSelector("index:0");
       setDualDisplay(true);
@@ -967,7 +1003,7 @@ function TalkPageContent() {
     return () => rearWindow.close();
     // Opening is intentionally tied to the first completed model mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelReady]);
+  }, [character.slug, modelReady]);
 
   return (
     <div className="h-screen flex flex-col" style={{ background: "transparent", position: "relative", overflow: "hidden" }}>
@@ -985,6 +1021,17 @@ function TalkPageContent() {
           transform: "scaleX(-1)",
           pointerEvents: "none",
           zIndex: 0,
+        }}
+      />
+      <div
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          inset: 0,
+          zIndex: 1,
+          pointerEvents: "none",
+          background:
+            "radial-gradient(ellipse at 50% 45%, transparent 34%, rgba(0,0,0,0.1) 58%, rgba(0,0,0,0.72) 100%)",
         }}
       />
 
@@ -1128,19 +1175,22 @@ function TalkPageContent() {
           repeatedly occurred"). */}
       <div
         className="talk-avatar-container"
-        style={{ position: "absolute", inset: 0, zIndex: 1 }}
+        style={{ position: "absolute", inset: 0, zIndex: 2 }}
       >
         {bootStage === "ready" ? (
           <Avatar3D
+            avatarUrl={character.modelPath}
             isSpeaking={isSpeaking}
             getAudioData={getAudioData}
-            getVolume={getVolume}
+            getLipSyncFrame={getPronunciationLipSyncFrame}
+            onLipSyncFrame={publishLipSyncFrame}
             gesture={currentGestureName}
             userSmile={vision.userSmile}
             faceDetected={vision.faceDetected}
             aiGesture={aiGesture}
             syncMode="leader"
             viewMode="front"
+            cameraVideoRef={dualDisplay ? frontCamera.videoRef : vision.videoRef}
             onAnimationStateChange={publishAvatarState}
             onReady={() => setModelReady(true)}
           />
@@ -1347,10 +1397,10 @@ function TalkPageContent() {
               <div style={{ fontSize: 48, lineHeight: 1 }}>🙏</div>
               <div>
                 <p style={{ fontSize: 18, fontWeight: 700, color: "var(--text-1, #f5e9d8)", margin: 0 }}>
-                  गुरुकुल में आपका स्वागत है
+                  {character.hindiName} से संवाद
                 </p>
                 <p style={{ fontSize: 13, color: "var(--text-3, #b8a890)", marginTop: 6 }}>
-                  Welcome to the Gurukul of Rishi Sandipani
+                  Preparing {character.name}
                 </p>
               </div>
 
@@ -1429,9 +1479,87 @@ function TalkPageContent() {
 }
 
 export default function TalkPage() {
+  const [character, setCharacter] = useState<CharacterProfile | null>(null);
+  const remoteControl = useRemoteControlState(Boolean(character));
+
+  useEffect(() => {
+    const navigationEntry = performance.getEntriesByType("navigation")[0] as
+      | PerformanceNavigationTiming
+      | undefined;
+    if (navigationEntry?.type === "reload") {
+      window.localStorage.removeItem(CHARACTER_STORAGE_KEY);
+      void updateRemoteCharacter(null, "display-refresh").finally(() => {
+        const selectionUrl = new URL("/", window.location.origin);
+        const current = new URL(window.location.href);
+        const dual = current.searchParams.get("dual");
+        const camera = current.searchParams.get("camera");
+        if (dual) selectionUrl.searchParams.set("dual", dual);
+        if (camera) selectionUrl.searchParams.set("camera", camera);
+        window.location.replace(selectionUrl);
+      });
+      return;
+    }
+
+    const selected = getCharacterFromLocation();
+    window.localStorage.setItem(CHARACTER_STORAGE_KEY, selected.slug);
+    setCharacter(selected);
+  }, []);
+
+  useEffect(() => {
+    if (!character || !remoteControl.state) return;
+
+    if (!remoteControl.state.character) {
+      window.localStorage.removeItem(CHARACTER_STORAGE_KEY);
+      const selectionUrl = new URL("/", window.location.origin);
+      const current = new URL(window.location.href);
+      const dual = current.searchParams.get("dual");
+      const camera = current.searchParams.get("camera");
+      if (dual) selectionUrl.searchParams.set("dual", dual);
+      if (camera) selectionUrl.searchParams.set("camera", camera);
+      window.location.replace(selectionUrl);
+      return;
+    }
+
+    if (remoteControl.state.character !== character.slug) {
+      const selected = getCharacter(remoteControl.state.character);
+      window.localStorage.setItem(CHARACTER_STORAGE_KEY, selected.slug);
+      const talkUrl = new URL("/talk", window.location.origin);
+      const current = new URL(window.location.href);
+      talkUrl.searchParams.set("character", selected.slug);
+      const dual = current.searchParams.get("dual");
+      const camera = current.searchParams.get("camera");
+      if (dual) talkUrl.searchParams.set("dual", dual);
+      if (camera) talkUrl.searchParams.set("camera", camera);
+      window.location.replace(talkUrl);
+    }
+  }, [character, remoteControl.state]);
+
+  if (!character) {
+    return <main style={{ minHeight: "100dvh", background: "#090705" }} />;
+  }
+
+  if (!character.agentId) {
+    return (
+      <main
+        role="alert"
+        style={{
+          minHeight: "100dvh",
+          display: "grid",
+          placeItems: "center",
+          padding: 24,
+          background: "#090705",
+          color: "#ffd6ad",
+          textAlign: "center",
+        }}
+      >
+        ElevenLabs agent is not configured for {character.name}.
+      </main>
+    );
+  }
+
   return (
-    <ConversationProvider agentId={ELEVENLABS_AGENT_ID}>
-      <TalkPageContent />
+    <ConversationProvider key={character.slug} agentId={character.agentId}>
+      <TalkPageContent character={character} />
     </ConversationProvider>
   );
 }

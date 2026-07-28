@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { GestureInfo, VisionState } from "../hooks/useVisionDetection";
+import type { LipSyncFrame } from "./lipSync";
 
 const DISPLAY_CHANNEL_NAME = "rishi-dual-display-v1";
 const REMOTE_VISION_STALE_MS = 4_000;
@@ -51,6 +52,7 @@ export interface VisionSnapshot {
 type DisplayMessage =
   | { type: "vision"; payload: VisionSnapshot }
   | { type: "avatar"; command: AvatarAnimationCommand; isSpeaking: boolean }
+  | { type: "lipsync"; frame: LipSyncFrame | null }
   | { type: "sync-request" };
 
 const EMPTY_VISION: VisionSnapshot = {
@@ -176,7 +178,7 @@ export function useFrontDisplaySync(enabled: boolean, isSpeaking: boolean) {
     publishCurrent();
   }, [isSpeaking, publishCurrent]);
 
-  return useCallback((state: AvatarAnimationState) => {
+  const publishAvatarState = useCallback((state: AvatarAnimationState) => {
     sequenceRef.current += 1;
     commandRef.current = {
       state,
@@ -185,6 +187,16 @@ export function useFrontDisplaySync(enabled: boolean, isSpeaking: boolean) {
     };
     publishCurrent();
   }, [publishCurrent]);
+
+  const publishLipSyncFrame = useCallback((frame: LipSyncFrame | null) => {
+    if (!enabled) return;
+    channelRef.current?.postMessage({
+      type: "lipsync",
+      frame,
+    } satisfies DisplayMessage);
+  }, [enabled]);
+
+  return { publishAvatarState, publishLipSyncFrame };
 }
 
 export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
@@ -196,6 +208,7 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
     sequence: 0,
   });
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const lipSyncFrameRef = useRef<LipSyncFrame | null>(null);
 
   useEffect(() => {
     if (!enabled) return;
@@ -203,15 +216,21 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
     if (!channel) return;
     channelRef.current = channel;
     channel.onmessage = (event: MessageEvent<DisplayMessage>) => {
-      if (event.data?.type !== "avatar") return;
-      const { command, isSpeaking: nextSpeaking } = event.data;
-      setAvatarCommand((current) => (
-        current.sequence === command.sequence
-        && current.startedAt === command.startedAt
-          ? current
-          : command
-      ));
-      setIsSpeaking(nextSpeaking);
+      if (event.data?.type === "lipsync") {
+        lipSyncFrameRef.current = event.data.frame;
+        return;
+      }
+      if (event.data?.type === "avatar") {
+        const { command, isSpeaking: nextSpeaking } = event.data;
+        setAvatarCommand((current) => (
+          current.sequence === command.sequence
+          && current.startedAt === command.startedAt
+            ? current
+            : command
+        ));
+        setIsSpeaking(nextSpeaking);
+        if (!nextSpeaking) lipSyncFrameRef.current = null;
+      }
     };
     channel.postMessage({ type: "sync-request" } satisfies DisplayMessage);
     postVisionSnapshot(channel, visionRef.current);
@@ -231,5 +250,7 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
     postVisionSnapshot(channelRef.current, visionRef.current);
   }, [enabled, vision]);
 
-  return { avatarCommand, isSpeaking };
+  const getLipSyncFrame = useCallback(() => lipSyncFrameRef.current, []);
+
+  return { avatarCommand, isSpeaking, getLipSyncFrame };
 }
