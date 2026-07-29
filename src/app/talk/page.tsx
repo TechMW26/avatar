@@ -1072,7 +1072,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
           />
           <span style={{ fontSize: 10, fontWeight: 600, color: vision.faceDetected ? "#FFB366" : "var(--text-3)" }}>
             {!vision.isReady
-              ? "Loading vision..."
+              ? `Loading vision...${vision.faceWorkerMode === "disabled" ? " (worker disabled)" : ""}`
               : vision.faceDetected
               ? `Face detected${vision.faceCount > 1 ? ` (${vision.faceCount})` : ""}`
               : "No face detected"}

@@ -53,6 +53,8 @@ export interface VisionState {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   /** Whether MediaPipe models are loaded and camera is ready */
   isReady: boolean;
+  /** Face worker mode: "worker" (offloaded), "main-thread" (fallback), or "disabled" */
+  faceWorkerMode: "worker" | "main-thread" | "disabled";
   /** Any error that occurred during setup */
   error: string | null;
   /** Imperatively stop camera, detection, and release all resources */
@@ -180,11 +182,27 @@ export function useVisionDetection(options?: {
 
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [faceWorkerMode, setFaceWorkerMode] = useState<"worker" | "main-thread" | "disabled">("disabled");
 
   // Initialize MediaPipe models and camera
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
+
+    // ── Reset vision state via URL param (clears stuck worker disable) ──
+    if (typeof window !== "undefined" && typeof URLSearchParams !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("reset-vision")) {
+        console.log("[useVisionDetection] resetting vision worker state via URL param");
+        window.localStorage.removeItem(FACE_WORKER_MODE_KEY);
+        window.localStorage.removeItem(FACE_WORKER_FAIL_COUNT_KEY);
+        window.localStorage.removeItem(FACE_WORKER_DISABLE_UNTIL_KEY);
+        // Clean URL without reload
+        const url = new URL(window.location.href);
+        url.searchParams.delete("reset-vision");
+        window.history.replaceState(null, "", url);
+      }
+    }
 
     const readStoredNumber = (key: string): number => {
       if (typeof window === "undefined") return 0;
@@ -225,6 +243,11 @@ export function useVisionDetection(options?: {
           const disableUntil = readStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY);
           const mode = getWorkerMode();
           if (mode === "fallback" || Date.now() < disableUntil) {
+            const remainingMin = disableUntil > Date.now()
+              ? Math.ceil((disableUntil - Date.now()) / 60000)
+              : 0;
+            console.log("[useVisionDetection] face worker skipped: mode=", mode, "disabled for", remainingMin, "more min. Use ?reset-vision to clear.");
+            setFaceWorkerMode(mode === "fallback" ? "disabled" : "main-thread");
             return false;
           }
           if (typeof Worker === "undefined" || typeof createImageBitmap === "undefined") {
@@ -248,6 +271,8 @@ export function useVisionDetection(options?: {
                 if (msg.type === "ready") {
                   faceWorkerReadyRef.current = true;
                   faceWorkerEnabledRef.current = true;
+                  setFaceWorkerMode("worker");
+                  console.log("[useVisionDetection] face worker ready (offloaded mode)");
                   writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, 0);
                   writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, 0);
                   setWorkerMode("auto");
@@ -296,6 +321,11 @@ export function useVisionDetection(options?: {
               if (failCount >= FACE_WORKER_FAILS_BEFORE_DISABLE) {
                 writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, Date.now() + FACE_WORKER_DISABLE_MS);
                 setWorkerMode("fallback");
+                setFaceWorkerMode("disabled");
+                console.warn("[useVisionDetection] face worker disabled for 24h after", failCount, "failures. Use ?reset-vision to clear.");
+              } else {
+                setFaceWorkerMode("main-thread");
+                console.warn("[useVisionDetection] face worker init failed (attempt", failCount, "), using main-thread fallback");
               }
               try { worker.terminate(); } catch {}
               faceWorkerRef.current = null;
@@ -1040,6 +1070,7 @@ export function useVisionDetection(options?: {
     userGender,
     videoRef,
     isReady,
+    faceWorkerMode,
     error,
     cleanup,
   };

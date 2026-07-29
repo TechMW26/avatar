@@ -45,6 +45,7 @@ export interface VisionSnapshot {
   phoneDetected: boolean;
   userGender: "male" | "female" | "unknown";
   isReady: boolean;
+  faceWorkerMode: "worker" | "main-thread" | "disabled";
   error: string | null;
   sentAt: number;
 }
@@ -65,6 +66,7 @@ const EMPTY_VISION: VisionSnapshot = {
   phoneDetected: false,
   userGender: "unknown",
   isReady: false,
+  faceWorkerMode: "disabled",
   error: null,
   sentAt: 0,
 };
@@ -87,6 +89,7 @@ function postVisionSnapshot(channel: BroadcastChannel, vision: VisionState) {
     phoneDetected: vision.phoneDetected,
     userGender: vision.userGender,
     isReady: vision.isReady,
+    faceWorkerMode: vision.faceWorkerMode,
     error: vision.error,
     sentAt: Date.now(),
   };
