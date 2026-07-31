@@ -1,8 +1,9 @@
-"""Add facial visemes to a pre-animated GLB without changing its body rig.
+"""Add facial visemes without changing the supplied body geometry or rig.
 
-The input skeleton, skin weights, bind matrices, and embedded animation
-actions are imported and exported untouched. Only morph targets on the
-existing character mesh are added.
+For rigged inputs, the skeleton, skin weights, bind matrices, and embedded
+animation actions are imported and exported untouched. Static FBX/GLB skins
+are also supported: their original mesh is exported without adding a rig or
+body animation. In both cases only morph targets in the facial region change.
 
 Run with Blender:
   blender --background --python scripts/add-visemes-to-preanimated-glb.py -- \
@@ -45,10 +46,11 @@ PROFILES = {
         "bottom_outer_z": 0.0350,
         "face_front_y": -0.1200,
         "face_back_y": -0.0550,
-        "lower_close": 1.30,
-        "upper_close": 1.15,
-        "lower_forward_close": 0.0020,
-        "upper_forward_close": 0.0004,
+        # Preserve five percent of the authored lip seam in neutral.
+        "lower_close": 0.95,
+        "upper_close": 0.0,
+        "lower_forward_close": 0.0,
+        "upper_forward_close": 0.0,
         "closed_offset": 0.0,
         "jaw_angle": 15.0,
         "jaw_front_y": -0.0737,
@@ -155,17 +157,17 @@ armatures = [obj for obj in bpy.context.scene.objects if obj.type == "ARMATURE"]
 character_meshes = [
     obj
     for obj in meshes
-    if len(obj.data.vertices) > 1_000 and len(obj.vertex_groups) > 0
+    if len(obj.data.vertices) > 1_000
 ]
-if len(character_meshes) != 1 or len(armatures) != 1:
+if len(character_meshes) != 1 or len(armatures) > 1:
     raise RuntimeError(
-        f"Expected one supplied character mesh and armature, found "
+        f"Expected one supplied character mesh and at most one armature, found "
         f"{[(obj.name, len(obj.data.vertices)) for obj in meshes]} and "
         f"{[obj.name for obj in armatures]}"
     )
 
 mesh = character_meshes[0]
-armature = armatures[0]
+armature = armatures[0] if armatures else None
 if mesh.data.shape_keys:
     raise RuntimeError("Supplied model already contains facial morph targets")
 
@@ -211,7 +213,11 @@ if material_source_path:
 original_bones = {
     bone.name: tuple(round(value, 8) for row in bone.matrix_local for value in row)
     for bone in armature.data.bones
-}
+} if armature else {}
+original_vertex_positions = tuple(
+    tuple(round(component, 8) for component in vertex.co)
+    for vertex in mesh.data.vertices
+)
 original_weights = tuple(
     tuple(
         sorted(
@@ -424,7 +430,7 @@ for shape in mesh.data.shape_keys.key_blocks:
 current_bones = {
     bone.name: tuple(round(value, 8) for row in bone.matrix_local for value in row)
     for bone in armature.data.bones
-}
+} if armature else {}
 current_weights = tuple(
     tuple(
         sorted(
@@ -436,6 +442,12 @@ current_weights = tuple(
 )
 if current_bones != original_bones or current_weights != original_weights:
     raise RuntimeError("Body rig or skin weights changed while adding visemes")
+current_vertex_positions = tuple(
+    tuple(round(component, 8) for component in vertex.co)
+    for vertex in mesh.data.vertices
+)
+if current_vertex_positions != original_vertex_positions:
+    raise RuntimeError("Body base geometry changed while adding visemes")
 
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
 for scene_object in list(bpy.context.scene.objects):
@@ -443,13 +455,14 @@ for scene_object in list(bpy.context.scene.objects):
         bpy.data.objects.remove(scene_object, do_unlink=True)
 bpy.ops.object.select_all(action="DESELECT")
 mesh.select_set(True)
-armature.select_set(True)
-bpy.context.view_layer.objects.active = armature
+if armature:
+    armature.select_set(True)
+bpy.context.view_layer.objects.active = armature or mesh
 bpy.ops.export_scene.gltf(
     filepath=output_path,
     export_format="GLB",
     use_selection=True,
-    export_animations=True,
+    export_animations=bool(armature and original_actions),
     export_morph=True,
     export_morph_normal=False,
     export_morph_tangent=False,

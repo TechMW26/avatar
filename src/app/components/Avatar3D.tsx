@@ -252,44 +252,6 @@ function pickClip(
 }
 
 /**
- * Keep the authored Mixamo idle in-place. Mixamo FBX exports commonly key
- * `Hips.position`; even a tiny Y/root drift makes an otherwise stationary
- * character hover above its ground marker and a non-zero end displacement
- * creates a jump at LoopRepeat's seam. Freezing that single translation at
- * its authored first-frame value preserves every joint rotation in the idle
- * while keeping both feet in the same stage coordinate system.
- */
-function makeInPlaceIdleClip(
-  source: THREE.AnimationClip | null,
-): THREE.AnimationClip | null {
-  if (!source) return null;
-  const clip = source.clone();
-  clip.name = `${source.name || "mixamo-idle"}-in-place`;
-  clip.tracks = clip.tracks.map((sourceTrack) => {
-    const track = sourceTrack.clone();
-    const separator = track.name.lastIndexOf(".");
-    const nodeName = separator >= 0 ? track.name.slice(0, separator) : "";
-    const propertyName = separator >= 0 ? track.name.slice(separator + 1) : "";
-    if (
-      propertyName === "position"
-      && stripMixamoPrefix(nodeName).toLowerCase() === "hips"
-      && track.getValueSize() >= 3
-    ) {
-      const values = track.values;
-      const stride = track.getValueSize();
-      for (let index = stride; index < values.length; index += stride) {
-        for (let axis = 0; axis < stride; axis += 1) {
-          values[index + axis] = values[axis];
-        }
-      }
-    }
-    return track;
-  });
-  clip.resetDuration();
-  return clip;
-}
-
-/**
  * If a texture's source bitmap is larger than `maxSize`, blit it down to
  * a maxSize-clamped canvas in place. Saves GPU memory and per-frag
  * sampling cost on mobile devices that load high-res Meshy skin maps.
@@ -603,11 +565,11 @@ function AvatarModel({
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
   const idleClip = useMemo(
-    () => makeInPlaceIdleClip(
+    () => (
       embeddedClips.find((clip) => (
         /idle|mixamo|rigify_clip/i.test(clip.name)
-      )) ?? pickClip(embeddedClips),
-    ),
+      )) ?? pickClip(embeddedClips)
+    )?.clone() ?? null,
     [embeddedClips],
   );
 
@@ -1174,9 +1136,8 @@ function AvatarModel({
     const mixer = mixerRef.current;
     const actions = actionsRef.current;
     if (mixer) {
-      // Play the supplied Mixamo idle forward at its authored speed. The
-      // action is LoopRepeat and its Hips translation was made in-place
-      // above, so there is no reverse-motion ping-pong or root jump.
+      // Play the sole supplied Mixamo idle forward at its authored speed.
+      // Embedded character clips are not retargeted or rewritten.
       mixer.update(Math.min(delta, 0.05));
     }
 
@@ -1902,11 +1863,11 @@ function GroundPatch() {
   const fluffyGrassScene = readAvatarScene("/grass/grassLODs.glb");
   const grassAlphaTexture = useLoader(
     THREE.TextureLoader,
-    "/grass/grass.jpeg",
+    assetUrl("/grass/grass.jpeg"),
   );
   const noiseTexture = useLoader(
     THREE.TextureLoader,
-    "/grass/perlinnoise.webp",
+    assetUrl("/grass/perlinnoise.webp"),
   );
   const groundTexture = useMemo(() => {
     const size = 128;

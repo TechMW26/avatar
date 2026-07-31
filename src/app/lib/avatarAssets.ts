@@ -21,7 +21,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v29";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v34";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
@@ -57,10 +57,12 @@ export async function ensureFreshAssetCache(): Promise<string> {
 }
 
 export function assetUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+
   const resolved = ASSET_BASE_URL
     ? `${ASSET_BASE_URL}/${path.replace(/^\//, "")}`
     : path;
-  return AVATAR_MODEL_PATHS.has(path)
+  return AVATAR_MODEL_PATHS.has(path) || path.startsWith("/grass/")
     ? `${resolved}?v=${encodeURIComponent(ASSET_CACHE_NAME)}`
     : resolved;
 }

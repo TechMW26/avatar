@@ -23,7 +23,7 @@ import path from 'node:path';
 import { put } from '@vercel/blob';
 
 const ROOT = path.resolve(process.cwd(), 'public');
-const ASSETS = [
+const KNOWN_ASSETS = [
   'models/sandipani.glb',
   'models/rani-laxmi-bai.glb',
   'models/shivaji-maharaj.glb',
@@ -31,6 +31,13 @@ const ASSETS = [
   'grass/grass.jpeg',
   'grass/perlinnoise.webp',
 ];
+const requestedAssets = process.argv.slice(2);
+const ASSETS = requestedAssets.length ? requestedAssets : KNOWN_ASSETS;
+const unknownAssets = ASSETS.filter((asset) => !KNOWN_ASSETS.includes(asset));
+if (unknownAssets.length) {
+  console.error(`Unknown runtime assets: ${unknownAssets.join(', ')}`);
+  process.exit(1);
+}
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
   console.error('Missing BLOB_READ_WRITE_TOKEN. Add it to .env.local first.');

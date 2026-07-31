@@ -47,7 +47,7 @@ PROFILES = {
         "mouth_bottom_outer_z": 0.095,
         "face_front_y": -0.185,
         "face_back_y": 0.045,
-        "lower_lip_close_strength": 1.0,
+        "lower_lip_close_strength": 0.95,
         "upper_lip_close_strength": 0.0,
         "closed_target_offset": 0.018,
         "closed_seam": 0.0002,
@@ -132,6 +132,8 @@ PROFILES = {
         "jaw_lower_fade_z": 0.520,
         "shoulder_narrowing": 0.15,
         "shoulder_weight_radius": 0.42,
+        "use_transferred_body_weights": True,
+        "rigid_hand_weights": True,
         "lower_jaw_only": True,
         "smooth_facial_morphs": False,
         "use_animation_armature": True,
@@ -569,7 +571,14 @@ def replace_vertex_weights(vertex, assignments):
             )
 
 
-perform_anatomy_overrides = source_pose_frame is None
+perform_anatomy_overrides = (
+    source_pose_frame is None
+    and not profile.get("use_transferred_body_weights")
+)
+needs_arm_samples = (
+    perform_anatomy_overrides
+    or profile.get("rigid_hand_weights")
+)
 arm_samples = (
     [
         vertex.co
@@ -577,7 +586,7 @@ arm_samples = (
         if 0.43 <= abs(vertex.co.x) <= 0.55
         and 0.28 <= vertex.co.z <= 0.58
     ]
-    if perform_anatomy_overrides
+    if needs_arm_samples
     else [Vector((0.0, 0.0, 0.0))]
 )
 if not arm_samples:
@@ -643,6 +652,17 @@ for vertex in mesh.data.vertices:
         replace_vertex_weights(vertex, (("mixamorig:Head", 1.0),))
         continue
     if not perform_anatomy_overrides:
+        if profile.get("rigid_hand_weights"):
+            distance_from_arm_axis = math.hypot(
+                point.y - arm_center_y,
+                point.z - arm_center_z,
+            )
+            if abs(point.x) >= 0.585 and distance_from_arm_axis <= 0.26:
+                side = "Left" if point.x >= 0.0 else "Right"
+                replace_vertex_weights(
+                    vertex,
+                    ((f"mixamorig:{side}Hand", 1.0),),
+                )
         continue
     if vertex.index in torso_component_vertices:
         replace_vertex_weights(vertex, (("mixamorig:Spine2", 1.0),))
