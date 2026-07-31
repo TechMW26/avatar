@@ -134,9 +134,9 @@ PROFILES = {
         "shoulder_weight_radius": 0.42,
         "use_transferred_body_weights": True,
         "rigid_hand_weights": True,
+        "preserve_animation_curves": True,
         "lower_jaw_only": True,
         "smooth_facial_morphs": False,
-        "use_animation_armature": True,
     },
 }
 if profile_name not in PROFILES:
@@ -365,9 +365,12 @@ if source_pose_frame is not None:
         raise RuntimeError(
             f"Animation contains unsupported bones: {missing_animation_bones}"
         )
-    animation_rig_scale = rig_span(armature) / rig_span(animation_armatures[0])
-    retarget_action_translations(embedded_action, animation_rig_scale)
-    print({"animation_rig_scale": animation_rig_scale})
+    if profile.get("preserve_animation_curves"):
+        print({"animation_curves": "preserved"})
+    else:
+        animation_rig_scale = rig_span(armature) / rig_span(animation_armatures[0])
+        retarget_action_translations(embedded_action, animation_rig_scale)
+        print({"animation_rig_scale": animation_rig_scale})
     armature.animation_data_create()
     armature.animation_data.action = embedded_action
     bpy.context.scene.frame_set(source_pose_frame)
@@ -1231,9 +1234,12 @@ if animation_path and embedded_action is None:
         raise RuntimeError(
             f"Animation contains unsupported bones: {missing_animation_bones}"
         )
-    animation_rig_scale = rig_span(armature) / rig_span(animation_armatures[0])
-    retarget_action_translations(embedded_action, animation_rig_scale)
-    print({"animation_rig_scale": animation_rig_scale})
+    if profile.get("preserve_animation_curves"):
+        print({"animation_curves": "preserved"})
+    else:
+        animation_rig_scale = rig_span(armature) / rig_span(animation_armatures[0])
+        retarget_action_translations(embedded_action, animation_rig_scale)
+        print({"animation_rig_scale": animation_rig_scale})
     armature.animation_data_create()
     armature.animation_data.action = embedded_action
     if embedded_action.slots:

@@ -1018,7 +1018,6 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
           width: "100%",
           height: "100%",
           objectFit: "cover",
-          transform: "scaleX(-1)",
           pointerEvents: "none",
           zIndex: 0,
         }}

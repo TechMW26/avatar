@@ -21,7 +21,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v34";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v35";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
