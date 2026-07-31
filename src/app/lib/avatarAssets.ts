@@ -21,7 +21,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v36";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v40";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
@@ -83,9 +83,9 @@ export interface AvatarAssetSpec {
 }
 
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
-  { path: "/models/sandipani.glb", estBytes: 71 * 1024 * 1024 },
+  { path: "/models/sandipani.glb", estBytes: 50 * 1024 * 1024 },
   { path: "/models/rani-laxmi-bai.glb", estBytes: 49 * 1024 * 1024 },
-  { path: "/models/shivaji-maharaj.glb", estBytes: 76 * 1024 * 1024 },
+  { path: "/models/shivaji-maharaj.glb", estBytes: 57 * 1024 * 1024 },
 ];
 
 const AVATAR_MODEL_PATHS = new Set([

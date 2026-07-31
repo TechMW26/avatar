@@ -118,8 +118,8 @@ export default function RemoteControlPage() {
             >
               <div className={styles.portrait}>
                 <Image
-                  src="/og-image.png"
-                  alt=""
+                  src={character.portraitPath}
+                  alt={`${character.name} portrait`}
                   fill
                   sizes="(max-width: 680px) 32vw, 220px"
                 />

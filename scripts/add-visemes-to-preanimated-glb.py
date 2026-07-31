@@ -37,7 +37,7 @@ PROFILES = {
     "sandipani": {
         "analysis_yaw_degrees": 0.0,
         "mouth_x": 0.0,
-        "mouth_z": 0.8453,
+        "mouth_z": 0.8490,
         "mouth_radius_x": 0.0300,
         "mouth_inner_x": 0.0120,
         "top_inner_z": 0.0060,
@@ -46,12 +46,13 @@ PROFILES = {
         "bottom_outer_z": 0.0350,
         "face_front_y": -0.1200,
         "face_back_y": -0.0550,
-        # Preserve five percent of the authored lip seam in neutral.
-        "lower_close": 0.95,
+        # Close the authored lower-lip seam in neutral without moving the
+        # moustache, upper lip, beard, or jaw.
+        "lower_close": 1.05,
         "upper_close": 0.0,
-        "lower_forward_close": 0.0,
+        "lower_forward_close": -0.0060,
         "upper_forward_close": 0.0,
-        "closed_offset": 0.0,
+        "closed_offset": 0.0090,
         "jaw_angle": 15.0,
         "jaw_front_y": -0.0737,
         "jaw_back_y": -0.0316,
@@ -105,7 +106,7 @@ PROFILES = {
         "source_open_scale": 1.12,
     },
     "shivaji-maharaj": {
-        "mouth_z": 0.8379,
+        "mouth_z": 0.8770,
         "mouth_radius_x": 0.0300,
         "mouth_inner_x": 0.0120,
         "top_inner_z": 0.0060,
@@ -114,11 +115,11 @@ PROFILES = {
         "bottom_outer_z": 0.0350,
         "face_front_y": -0.0711,
         "face_back_y": -0.0553,
-        "lower_close": 1.08,
-        "upper_close": 0.98,
-        "lower_forward_close": 0.0020,
-        "upper_forward_close": 0.0004,
-        "closed_offset": 0.0,
+        "lower_close": 1.05,
+        "upper_close": 0.0,
+        "lower_forward_close": -0.0015,
+        "upper_forward_close": 0.0,
+        "closed_offset": 0.0045,
         "jaw_angle": 5.0,
         "jaw_front_y": -0.0395,
         "jaw_back_y": -0.0079,
@@ -128,14 +129,20 @@ PROFILES = {
         "jaw_outer_x": 0.1000,
         "jaw_bottom_z": 0.7263,
         "jaw_fade_z": 0.7737,
+        "jaw_upper_fade_z": 0.8450,
+        "coherent_jaw_close": True,
+        "rest_jaw_lift": 0.0060,
+        "rest_jaw_forward": -0.0010,
         "source_open_only": True,
         "source_open_scale": 1.22,
-        # The source has sparse triangles from the upper lip into the
-        # moustache and cheeks. Reopening its authored source shape drags
-        # those triangles and creates the pointed face seen in production.
-        # Keep the closed upper face fixed and articulate only the lower lip.
+        # Keep the upper face fixed. Move the connected lower lip, beard and
+        # jaw as one soft region so the generated topology does not tear.
         "lower_lip_visemes": True,
-        "lower_lip_open": 0.0105,
+        "lower_lip_open": 0.0120,
+        "lower_lip_inner_x": 0.0060,
+        "lower_lip_outer_x": 0.0220,
+        "lower_lip_inner_z": 0.0010,
+        "lower_lip_outer_z": 0.0050,
     },
 }
 if profile_name not in PROFILES:
@@ -291,6 +298,31 @@ def lower_jaw_weight(point):
     )
     if point.z >= lower_lip_center_z:
         return 0.0
+    if profile.get("coherent_jaw_close"):
+        x_weight = 1.0 - smoothstep(
+            scaled("jaw_inner_x"),
+            scaled("jaw_outer_x"),
+            abs(point.x - mouth_center_x),
+        )
+        lower_weight = smoothstep(
+            minimum_z + profile["jaw_bottom_z"] * height,
+            minimum_z + profile["jaw_fade_z"] * height,
+            point.z,
+        )
+        upper_weight = 1.0 - smoothstep(
+            minimum_z + profile["jaw_upper_fade_z"] * height,
+            lower_lip_center_z,
+            point.z,
+        )
+        front_weight = 1.0 - smoothstep(
+            scaled("jaw_front_y"),
+            scaled("jaw_back_y"),
+            point.y,
+        )
+        return max(
+            0.0,
+            x_weight * lower_weight * upper_weight * front_weight,
+        )
     # The supplied source meshes have sparse triangles across the chin and
     # cheeks. A broad geometric "jaw" mask catches those triangles and tears
     # the face. Drive only the lower lip ring; the source open-mouth geometry
@@ -333,6 +365,9 @@ def closed_pose(point, lip_weight, jaw_weight):
     if lip_weight <= 0.0 and jaw_weight <= 0.0:
         return point
     was_lower_lip = point.z < mouth_center_z
+    if profile.get("coherent_jaw_close"):
+        point.z += scaled("rest_jaw_lift") * jaw_weight
+        point.y += scaled("rest_jaw_forward") * jaw_weight
     if lip_weight <= 0.0:
         return point
     seam_center = mouth_center_z + scaled("closed_offset")
@@ -357,6 +392,10 @@ def make_viseme(horizontal, openness, protrude=0.0, jaw_forward=0.0):
 
     def transform(point, lip_weight, jaw_weight):
         posed = closed_pose(point.copy(), lip_weight, jaw_weight)
+        if profile.get("coherent_jaw_close"):
+            posed.z += (point.z - posed.z) * openness * lip_weight
+            posed.z -= openness * scaled("lower_lip_open") * jaw_weight
+            return posed
         if profile.get("lower_lip_visemes"):
             posed.z -= openness * scaled("lower_lip_open") * jaw_weight
             return posed
@@ -420,7 +459,11 @@ for shape in mesh.data.shape_keys.key_blocks:
     for index, original in enumerate(points):
         shaped = analysis_rotation @ (mesh_to_world @ shape.data[index].co)
         displacement = (shaped - original).length
-        if mouth_weight(original) <= 0.000001 and displacement > locality_epsilon:
+        if (
+            mouth_weight(original) <= 0.000001
+            and lower_jaw_weight(original) <= 0.000001
+            and displacement > locality_epsilon
+        ):
             raise RuntimeError(
                 f"{shape.name} moved non-lip vertex {index} by {displacement}"
             )
