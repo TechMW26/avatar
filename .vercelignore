@@ -1,0 +1,21 @@
+# Local/build state
+.git
+.next
+.vercel
+node_modules
+.env
+.env*.local
+
+# Source-only 3D files. Production serves the active runtime bundle from
+# NEXT_PUBLIC_ASSET_BASE_URL (Vercel Blob), so do not upload duplicate GLBs.
+public/models/*.glb
+public/grass/grassLODs.glb
+public/grass/grass.jpeg
+public/grass/perlinnoise.webp
+*.fbx
+
+# Local/editor artifacts
+.DS_Store
+.tmp
+*.pem
+*.log

@@ -7,7 +7,7 @@ limited to four influences per vertex for glTF/WebGL compatibility.
 Run with Blender:
   blender --background --python scripts/prepare-meshy-character.py -- \
     <sandipani|rani-laxmi-bai|shivaji-maharaj> \
-    <source.glb> <output.glb> [reference.fbx]
+    <source.glb> <output.glb> [reference.fbx] [animation.fbx]
 """
 
 import math
@@ -17,19 +17,23 @@ import sys
 
 import bmesh
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 args = sys.argv[sys.argv.index("--") + 1 :]
-if len(args) not in (3, 4):
+if len(args) not in (3, 4, 5):
     raise SystemExit(
-        "Expected: <profile> <source.glb> <output.glb> [reference.fbx]"
+        "Expected: <profile> <source.glb> <output.glb> "
+        "[reference.fbx] [animation.fbx]"
     )
 
 profile_name, source_path, output_path = args[:3]
-reference_path = args[3] if len(args) == 4 else "public/avatar.fbx"
+reference_path = args[3] if len(args) >= 4 else "public/avatar.fbx"
+animation_path = args[4] if len(args) == 5 else None
 source_path = os.path.abspath(source_path)
 output_path = os.path.abspath(output_path)
 reference_path = os.path.abspath(reference_path)
+if animation_path:
+    animation_path = os.path.abspath(animation_path)
 
 PROFILES = {
     "sandipani": {
@@ -43,11 +47,11 @@ PROFILES = {
         "mouth_bottom_outer_z": 0.095,
         "face_front_y": -0.185,
         "face_back_y": 0.045,
-        "lower_lip_close_strength": 0.78,
+        "lower_lip_close_strength": 1.0,
         "upper_lip_close_strength": 0.0,
         "closed_target_offset": 0.018,
         "closed_seam": 0.0002,
-        "rest_jaw_close_degrees": 15.0,
+        "rest_jaw_close_degrees": 0.0,
         "rest_jaw_lift": 0.0,
         "rest_jaw_retract": 0.0,
         "jaw_front_y": -0.140,
@@ -59,22 +63,30 @@ PROFILES = {
         "jaw_bottom_z": 0.405,
         "jaw_lower_fade_z": 0.505,
         "shoulder_weight_radius": 0.32,
+        "lower_jaw_only": True,
+        "smooth_facial_morphs": False,
+        "use_animation_armature": True,
     },
     "rani-laxmi-bai": {
         "object_name": "RaniLaxmiBai",
+        "mouth_center_x": -0.083,
         "mouth_center_z": 0.728,
-        "mouth_radius_x": 0.043,
-        "mouth_inner_x": 0.032,
-        "mouth_top_inner_z": 0.012,
-        "mouth_top_outer_z": 0.043,
-        "mouth_bottom_inner_z": 0.030,
-        "mouth_bottom_outer_z": 0.065,
+        "mouth_radius_x": 0.052,
+        "mouth_inner_x": 0.020,
+        "mouth_top_inner_z": 0.006,
+        "mouth_top_outer_z": 0.014,
+        "mouth_bottom_inner_z": 0.010,
+        "mouth_bottom_outer_z": 0.045,
         "face_front_y": -0.135,
         "face_back_y": 0.025,
-        "lower_lip_close_strength": 0.80,
-        "upper_lip_close_strength": 0.80,
+        "lower_lip_close_strength": 1.0,
+        "upper_lip_close_strength": 0.0,
         "closed_target_offset": 0.0,
         "closed_seam": 0.0002,
+        # This source has no facial/jaw bone. Rotating a wide geometry mask
+        # bends its sparse cheek/chin triangles and produces the one-sided
+        # mouth seen in production. Rest closure is therefore a small,
+        # local lower-lip lift; speech reopens that same band.
         "rest_jaw_close_degrees": 0.0,
         "rest_jaw_lift": 0.0,
         "rest_jaw_retract": 0.0,
@@ -82,40 +94,47 @@ PROFILES = {
         "jaw_back_y": -0.040,
         "jaw_pivot_y": -0.015,
         "jaw_pivot_z": 0.760,
-        "jaw_radius_inner_x": 0.080,
-        "jaw_radius_outer_x": 0.145,
-        "jaw_bottom_z": 0.535,
-        "jaw_lower_fade_z": 0.610,
+        "jaw_radius_inner_x": 0.075,
+        "jaw_radius_outer_x": 0.115,
+        "jaw_bottom_z": 0.620,
+        "jaw_lower_fade_z": 0.670,
+        "jaw_upper_fade_height": 0.100,
         "shoulder_weight_radius": 0.34,
+        "lower_jaw_only": True,
+        "smooth_facial_morphs": False,
+        "source_pose_frame": 1,
     },
     "shivaji-maharaj": {
         "object_name": "ShivajiMaharaj",
-        "mouth_center_z": 0.642,
+        "mouth_center_z": 0.697,
         "mouth_radius_x": 0.078,
         "mouth_inner_x": 0.038,
         "mouth_top_inner_z": 0.012,
         "mouth_top_outer_z": 0.028,
-        "mouth_bottom_inner_z": 0.018,
-        "mouth_bottom_outer_z": 0.044,
+        "mouth_bottom_inner_z": 0.025,
+        "mouth_bottom_outer_z": 0.060,
         "face_front_y": -0.135,
         "face_back_y": -0.105,
-        "lower_lip_close_strength": 0.70,
+        "lower_lip_close_strength": 1.0,
         "upper_lip_close_strength": 0.0,
-        "closed_target_offset": 0.009,
+        "closed_target_offset": 0.014,
         "closed_seam": 0.0002,
-        "rest_jaw_close_degrees": 5.0,
+        "rest_jaw_close_degrees": 0.0,
         "rest_jaw_lift": 0.0,
         "rest_jaw_retract": 0.0,
         "jaw_front_y": -0.075,
         "jaw_back_y": -0.015,
         "jaw_pivot_y": -0.010,
-        "jaw_pivot_z": 0.665,
+        "jaw_pivot_z": 0.715,
         "jaw_radius_inner_x": 0.100,
         "jaw_radius_outer_x": 0.190,
         "jaw_bottom_z": 0.430,
         "jaw_lower_fade_z": 0.520,
         "shoulder_narrowing": 0.15,
         "shoulder_weight_radius": 0.42,
+        "lower_jaw_only": True,
+        "smooth_facial_morphs": False,
+        "use_animation_armature": True,
     },
 }
 if profile_name not in PROFILES:
@@ -141,27 +160,90 @@ def object_world_bounds(obj):
     return minimum, maximum
 
 
+def iter_action_fcurves(action):
+    """Yield curves from legacy and Blender 4.4+ layered actions."""
+    legacy_curves = getattr(action, "fcurves", None)
+    if legacy_curves is not None:
+        yield from legacy_curves
+        return
+    for layer in action.layers:
+        for strip in layer.strips:
+            for channelbag in getattr(strip, "channelbags", ()):
+                yield from channelbag.fcurves
+
+
+def rig_span(candidate):
+    head = candidate.matrix_world @ candidate.data.bones["mixamorig:Head"].head_local
+    left_foot = (
+        candidate.matrix_world
+        @ candidate.data.bones["mixamorig:LeftFoot"].head_local
+    )
+    right_foot = (
+        candidate.matrix_world
+        @ candidate.data.bones["mixamorig:RightFoot"].head_local
+    )
+    return (head - (left_foot + right_foot) * 0.5).length
+
+
+def retarget_action_translations(action, factor):
+    """Keep target bone lengths while preserving the Mixamo hip motion."""
+    for curve in iter_action_fcurves(action):
+        if (
+            "pose.bones[" in curve.data_path
+            and curve.data_path.endswith(".location")
+        ):
+            is_hips = '"mixamorig:Hips"' in curve.data_path
+            baseline = curve.keyframe_points[0].co.y if is_hips else 0.0
+            for keyframe in curve.keyframe_points:
+                if is_hips:
+                    keyframe.co.y = (keyframe.co.y - baseline) * factor
+                    keyframe.handle_left.y = (
+                        keyframe.handle_left.y - baseline
+                    ) * factor
+                    keyframe.handle_right.y = (
+                        keyframe.handle_right.y - baseline
+                    ) * factor
+                else:
+                    keyframe.co.y = 0.0
+                    keyframe.handle_left.y = 0.0
+                    keyframe.handle_right.y = 0.0
+
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
-bpy.ops.import_scene.gltf(filepath=source_path)
-target_meshes = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
+if source_path.lower().endswith(".fbx"):
+    bpy.ops.import_scene.fbx(filepath=source_path)
+else:
+    bpy.ops.import_scene.gltf(filepath=source_path)
+source_mesh_objects = [
+    obj for obj in bpy.context.scene.objects if obj.type == "MESH"
+]
+# Meshy's FBX bundle can include an eight-vertex helper cube alongside the
+# actual character. It is metadata/preview geometry, not part of the skin.
+target_meshes = [
+    obj for obj in source_mesh_objects if len(obj.data.vertices) > 100
+]
 if len(target_meshes) != 1:
     raise RuntimeError(f"Expected one Meshy mesh, found {len(target_meshes)}")
 mesh = target_meshes[0]
+for helper in source_mesh_objects:
+    if helper is not mesh:
+        bpy.data.objects.remove(helper, do_unlink=True)
 mesh.name = profile["object_name"]
 mesh.data.name = f"{profile['object_name']}Mesh"
 
 # Weld coincident reconstruction vertices before rigging. Meshy preserves
 # many texture seams as duplicated positions; weighting those duplicates
 # independently opens visible triangular cracks during arm and face motion.
-editable_mesh = bmesh.new()
-editable_mesh.from_mesh(mesh.data)
-bmesh.ops.remove_doubles(
-    editable_mesh,
-    verts=list(editable_mesh.verts),
-    dist=0.0001,
-)
-editable_mesh.to_mesh(mesh.data)
-editable_mesh.free()
+if profile.get("source_pose_frame") is None:
+    editable_mesh = bmesh.new()
+    editable_mesh.from_mesh(mesh.data)
+    bmesh.ops.remove_doubles(
+        editable_mesh,
+        verts=list(editable_mesh.verts),
+        dist=0.0001,
+    )
+    editable_mesh.to_mesh(mesh.data)
+    editable_mesh.free()
 
 for polygon in mesh.data.polygons:
     polygon.use_smooth = True
@@ -197,8 +279,97 @@ if len(armatures) != 1 or len(reference_meshes) != 1:
         f"and {len(reference_meshes)} weighted meshes"
     )
 armature = armatures[0]
+reference_armature = armature
 reference_mesh = reference_meshes[0]
-reference_min, reference_max = object_world_bounds(reference_mesh)
+embedded_action = None
+animation_objects = []
+animation_armatures = []
+imported_actions = []
+source_pose_frame = profile.get("source_pose_frame")
+facial_pose_matrix = None
+facial_pose_matrix_inverse = None
+
+if animation_path and profile.get("use_animation_armature"):
+    existing_objects = set(bpy.context.scene.objects)
+    existing_actions = set(bpy.data.actions)
+    bpy.ops.import_scene.fbx(filepath=animation_path)
+    animation_objects = [
+        obj for obj in bpy.context.scene.objects if obj not in existing_objects
+    ]
+    animation_armatures = [
+        obj for obj in animation_objects if obj.type == "ARMATURE"
+    ]
+    imported_actions = [
+        action for action in bpy.data.actions if action not in existing_actions
+    ]
+    if len(animation_armatures) != 1 or not imported_actions:
+        raise RuntimeError(
+            "Animation source must contain one armature and at least one action"
+        )
+    armature = animation_armatures[0]
+    embedded_action = max(
+        imported_actions,
+        key=lambda action: action.frame_range[1] - action.frame_range[0],
+    )
+    missing_animation_bones = sorted(
+        {bone.name for bone in reference_armature.data.bones}
+        - {bone.name for bone in armature.data.bones}
+    )
+    if missing_animation_bones:
+        raise RuntimeError(
+            f"Animation rig is missing bones: {missing_animation_bones}"
+        )
+
+    # Mixamo's animation-only FBX uses centimeter-style object scaling.
+    # Match its world-space span to the skin-transfer reference without
+    # editing its rest bones, action curves, timing, or authored pose.
+    animation_rig_scale = rig_span(reference_armature) / rig_span(armature)
+    armature.scale *= animation_rig_scale
+    print({"animation_armature_object_scale": animation_rig_scale})
+    armature.animation_data_create()
+    armature.animation_data.action = embedded_action
+    if embedded_action.slots:
+        armature.animation_data.action_slot = embedded_action.slots[0]
+
+if source_pose_frame is not None:
+    if not animation_path:
+        raise RuntimeError("A posed source requires an animation FBX")
+    if embedded_action is None:
+        existing_objects = set(bpy.context.scene.objects)
+        existing_actions = set(bpy.data.actions)
+        bpy.ops.import_scene.fbx(filepath=animation_path)
+        animation_objects = [
+            obj for obj in bpy.context.scene.objects if obj not in existing_objects
+        ]
+        animation_armatures = [
+            obj for obj in animation_objects if obj.type == "ARMATURE"
+        ]
+        imported_actions = [
+            action for action in bpy.data.actions if action not in existing_actions
+        ]
+        if len(animation_armatures) != 1 or not imported_actions:
+            raise RuntimeError(
+                "Animation source must contain one armature and at least one action"
+            )
+        embedded_action = max(
+            imported_actions,
+            key=lambda action: action.frame_range[1] - action.frame_range[0],
+        )
+    animated_bones = {bone.name for bone in animation_armatures[0].data.bones}
+    missing_animation_bones = sorted(
+        animated_bones - {bone.name for bone in armature.data.bones}
+    )
+    if missing_animation_bones:
+        raise RuntimeError(
+            f"Animation contains unsupported bones: {missing_animation_bones}"
+        )
+    animation_rig_scale = rig_span(armature) / rig_span(animation_armatures[0])
+    retarget_action_translations(embedded_action, animation_rig_scale)
+    print({"animation_rig_scale": animation_rig_scale})
+    armature.animation_data_create()
+    armature.animation_data.action = embedded_action
+    bpy.context.scene.frame_set(source_pose_frame)
+    bpy.context.view_layer.update()
 
 # Blender's FBX importer represents the reference mesh with compensating
 # parent scale/rotation. Build a transfer-only world-space copy so nearest
@@ -207,6 +378,16 @@ reference_min, reference_max = object_world_bounds(reference_mesh)
 weight_source = reference_mesh.copy()
 weight_source.data = reference_mesh.data.copy()
 bpy.context.collection.objects.link(weight_source)
+if source_pose_frame is not None:
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated_source = weight_source.evaluated_get(depsgraph)
+    posed_data = bpy.data.meshes.new_from_object(
+        evaluated_source,
+        preserve_all_data_layers=True,
+        depsgraph=depsgraph,
+    )
+    weight_source.data = posed_data
+    weight_source.modifiers.clear()
 reference_world = reference_mesh.matrix_world.copy()
 for vertex in weight_source.data.vertices:
     vertex.co = reference_world @ vertex.co
@@ -214,6 +395,7 @@ weight_source.parent = None
 weight_source.matrix_world.identity()
 weight_source.modifiers.clear()
 weight_source.name = "MixamoWeightSource"
+reference_min, reference_max = object_world_bounds(weight_source)
 
 # Match height, floor, and horizontal/depth centers before transferring
 # weights. Uniform scaling preserves the new character's proportions.
@@ -265,6 +447,10 @@ for key in (
     "rest_jaw_retract",
 ):
     aligned[key] = profile[key] * scale
+aligned["jaw_upper_fade_height"] = (
+    profile.get("jaw_upper_fade_height", 0.035) * scale
+)
+aligned["mouth_center_x"] = profile.get("mouth_center_x", 0.0) * scale
 aligned["face_front_y"] = (
     profile["face_front_y"] * scale
     + reference_center.y
@@ -383,12 +569,17 @@ def replace_vertex_weights(vertex, assignments):
             )
 
 
-arm_samples = [
-    vertex.co
-    for vertex in mesh.data.vertices
-    if 0.43 <= abs(vertex.co.x) <= 0.55
-    and 0.28 <= vertex.co.z <= 0.58
-]
+perform_anatomy_overrides = source_pose_frame is None
+arm_samples = (
+    [
+        vertex.co
+        for vertex in mesh.data.vertices
+        if 0.43 <= abs(vertex.co.x) <= 0.55
+        and 0.28 <= vertex.co.z <= 0.58
+    ]
+    if perform_anatomy_overrides
+    else [Vector((0.0, 0.0, 0.0))]
+)
 if not arm_samples:
     raise RuntimeError("Could not locate T-pose forearm samples")
 arm_center_y = statistics.median(point.y for point in arm_samples)
@@ -423,7 +614,8 @@ while unvisited:
     if (
         minimum_z >= 0.35
         and maximum_z >= 0.70
-        and maximum_x - minimum_x <= 0.60
+        and minimum_x >= -0.28
+        and maximum_x <= 0.28
     ):
         head_component_vertices.update(component)
     elif (
@@ -442,8 +634,15 @@ for vertex in mesh.data.vertices:
     if (
         vertex.index in head_component_vertices
         or (point.z >= 0.70 and abs(point.x) <= 0.24)
+        or (
+            source_pose_frame is not None
+            and point.z >= reference_min.z + reference_height * 0.80
+            and abs(point.x) <= 0.28 * scale
+        )
     ):
         replace_vertex_weights(vertex, (("mixamorig:Head", 1.0),))
+        continue
+    if not perform_anatomy_overrides:
         continue
     if vertex.index in torso_component_vertices:
         replace_vertex_weights(vertex, (("mixamorig:Spine2", 1.0),))
@@ -552,16 +751,57 @@ bpy.ops.object.vertex_group_normalize_all(
 )
 mesh.select_set(False)
 
+if source_pose_frame is not None:
+    armature_world = armature.matrix_world.copy()
+    armature_world_inverse = armature_world.inverted_safe()
+    posed_skin_matrices = {
+        bone.name: (
+            armature_world
+            @ armature.pose.bones[bone.name].matrix
+            @ bone.matrix_local.inverted_safe()
+            @ armature_world_inverse
+        )
+        for bone in armature.data.bones
+        if armature.pose.bones.get(bone.name)
+    }
+    facial_pose_matrix = posed_skin_matrices["mixamorig:Head"]
+    facial_pose_matrix_inverse = facial_pose_matrix.inverted_safe()
+    zero_matrix = Matrix(
+        (
+            (0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.0),
+        )
+    )
+    for vertex in mesh.data.vertices:
+        blended = zero_matrix.copy()
+        total = 0.0
+        for membership in vertex.groups:
+            group_name = mesh.vertex_groups[membership.group].name
+            skin_matrix = posed_skin_matrices.get(group_name)
+            if skin_matrix is None or membership.weight <= 0.001:
+                continue
+            blended += skin_matrix * membership.weight
+            total += membership.weight
+        if total > 0.001:
+            vertex.co = (blended * (1.0 / total)).inverted_safe() @ vertex.co
+
 armature_modifier = mesh.modifiers.new("Armature", "ARMATURE")
 armature_modifier.object = armature
 armature_modifier.use_vertex_groups = True
 armature_modifier.use_bone_envelopes = False
 mesh.parent = armature
-# Match the reference mesh's exact armature-local bind transform. A merely
-# equivalent world matrix is insufficient for glTF inverse bind matrices and
-# causes geometry to separate from bones as soon as an animation is applied.
-mesh.matrix_parent_inverse = reference_mesh.matrix_parent_inverse.copy()
-mesh.matrix_basis = reference_mesh.matrix_basis.copy()
+if armature is reference_armature:
+    # Match the reference mesh's exact armature-local bind transform.
+    mesh.matrix_parent_inverse = reference_mesh.matrix_parent_inverse.copy()
+    mesh.matrix_basis = reference_mesh.matrix_basis.copy()
+else:
+    # The paired animation armature is already normalized in world space.
+    # Preserve the aligned skin's world transform and let Blender derive
+    # inverse bind matrices against this exact rest skeleton.
+    mesh.matrix_parent_inverse = armature.matrix_world.inverted_safe()
+    mesh.matrix_basis.identity()
 
 # The reference geometry is no longer needed after its normalized skin
 # weights have been transferred.
@@ -573,7 +813,7 @@ def mouth_weight(point):
     x_weight = 1.0 - smoothstep(
         aligned["mouth_inner_x"],
         aligned["mouth_radius_x"],
-        abs(point.x),
+        abs(point.x - aligned["mouth_center_x"]),
     )
     vertical_offset = point.z - aligned["mouth_center_z"]
     if vertical_offset >= 0.0:
@@ -602,7 +842,7 @@ def lower_jaw_weight(point):
     x_weight = 1.0 - smoothstep(
         aligned["jaw_radius_inner_x"],
         aligned["jaw_radius_outer_x"],
-        abs(point.x),
+        abs(point.x - aligned["mouth_center_x"]),
     )
     lower_weight = smoothstep(
         aligned["jaw_bottom_z"],
@@ -610,7 +850,7 @@ def lower_jaw_weight(point):
         point.z,
     )
     upper_weight = 1.0 - smoothstep(
-        aligned["mouth_center_z"] - 0.035 * scale,
+        aligned["mouth_center_z"] - aligned["jaw_upper_fade_height"],
         aligned["mouth_center_z"],
         point.z,
     )
@@ -624,10 +864,20 @@ def lower_jaw_weight(point):
 
 def set_shape(shape, original_points, transform):
     for index, original in enumerate(original_points):
-        shape.data[index].co = transform(
-            original.copy(),
-            mouth_weight(original),
-            lower_jaw_weight(original),
+        profile_point = (
+            facial_pose_matrix @ original
+            if facial_pose_matrix is not None
+            else original.copy()
+        )
+        transformed = transform(
+            profile_point.copy(),
+            mouth_weight(profile_point),
+            lower_jaw_weight(profile_point),
+        )
+        shape.data[index].co = (
+            facial_pose_matrix_inverse @ transformed
+            if facial_pose_matrix_inverse is not None
+            else transformed
         )
 
 
@@ -679,7 +929,11 @@ def closed_pose(point, lip_weight, jaw_weight=0.0):
     # The authored open-mouth lower lip and tongue sit forward. Retract
     # them behind the upper lip in neutral so the closed seam has depth
     # instead of leaving a puckered oval or visible inner-mouth strip.
-    retract = 0.026 if was_lower_lip else 0.008
+    retract = (
+        0.0
+        if aligned.get("lower_jaw_only")
+        else (0.026 if was_lower_lip else 0.008)
+    )
     point.y += retract * scale * lip_weight
     return point
 
@@ -695,16 +949,29 @@ def make_viseme_transform(
         if lip_weight <= 0.0 and jaw_weight <= 0.0:
             return point
         posed = closed_pose(point.copy(), lip_weight, jaw_weight)
+        if (
+            aligned.get("lower_jaw_only")
+            and point.z >= aligned["mouth_center_z"]
+        ):
+            return point
         posed.z += (point.z - posed.z) * openness
-        posed.x += point.x * horizontal * lip_weight
-        posed.y -= protrude * scale * lip_weight
+        if not aligned.get("lower_jaw_only"):
+            posed.x += point.x * horizontal * lip_weight
+            posed.y -= protrude * scale * lip_weight
 
         # The source is already authored open. The openness interpolation
         # recovers that original jaw position; only a very small coherent
         # extra drop is needed for the widest vowels.
-        jaw_drop = math.radians(jaw_angle) * 0.025 * scale * jaw_weight
+        jaw_drop_scale = 0.065 if aligned.get("lower_jaw_only") else 0.025
+        jaw_drop = (
+            math.radians(jaw_angle)
+            * jaw_drop_scale
+            * scale
+            * jaw_weight
+        )
         posed.z -= jaw_drop
-        posed.y -= jaw_forward * scale * jaw_weight
+        if not aligned.get("lower_jaw_only"):
+            posed.y -= jaw_forward * scale * jaw_weight
         return posed
 
     return transform
@@ -755,6 +1022,119 @@ set_shape(
     make_viseme_transform(-0.02, 0.82, 7.5, jaw_forward=0.010),
 )
 
+if aligned.get("lower_jaw_only") and aligned.get("smooth_facial_morphs", True):
+    smoothing_vertices = {
+        index
+        for index, point in enumerate(original_points)
+        if (
+            aligned["jaw_bottom_z"] - 0.02 * scale
+            <= (facial_pose_matrix @ point).z
+            <= aligned["mouth_center_z"] + 0.035 * scale
+            and abs(
+                (facial_pose_matrix @ point).x - aligned["mouth_center_x"]
+            )
+            <= aligned["jaw_radius_outer_x"] + 0.025 * scale
+            and (facial_pose_matrix @ point).y
+            <= aligned["jaw_back_y"] + 0.025 * scale
+        )
+    }
+    pinned_mouth_vertices = {
+        index
+        for index in smoothing_vertices
+        if mouth_weight(facial_pose_matrix @ original_points[index]) >= 0.65
+    }
+    print(
+        {
+            "morph_smoothing": len(smoothing_vertices),
+            "morph_pins": len(pinned_mouth_vertices),
+        }
+    )
+    for shape in mesh.data.shape_keys.key_blocks:
+        deltas = {
+            index: shape.data[index].co - original_points[index]
+            for index in smoothing_vertices
+        }
+        for _ in range(6):
+            updated = {}
+            for index in smoothing_vertices:
+                if index in pinned_mouth_vertices:
+                    continue
+                adjacent = [
+                    neighbor
+                    for neighbor in neighbors[index]
+                    if neighbor in smoothing_vertices
+                ]
+                if not adjacent:
+                    continue
+                average = sum(
+                    (deltas[neighbor] for neighbor in adjacent),
+                    Vector((0.0, 0.0, 0.0)),
+                ) / len(adjacent)
+                updated[index] = deltas[index].lerp(average, 0.55)
+            deltas.update(updated)
+        for index, delta in deltas.items():
+            shape.data[index].co = original_points[index] + delta
+
+if aligned.get("lower_jaw_only"):
+    # Production guardrail: every facial target must remain a vertical
+    # lower-jaw deformation. This rejects the side-pull/cheek tearing that
+    # occurs when a profile is accidentally centred on the body instead of
+    # the posed mouth.
+    validation_epsilon = max(1e-7, scale * 1e-6)
+    validated_shapes = {}
+    for shape in mesh.data.shape_keys.key_blocks:
+        moved_left = 0
+        moved_right = 0
+        max_horizontal = 0.0
+        max_displacement = 0.0
+        for index, original in enumerate(original_points):
+            original_profile = (
+                facial_pose_matrix @ original
+                if facial_pose_matrix is not None
+                else original
+            )
+            shaped_profile = (
+                facial_pose_matrix @ shape.data[index].co
+                if facial_pose_matrix is not None
+                else shape.data[index].co
+            )
+            delta = shaped_profile - original_profile
+            displacement = delta.length
+            if displacement <= validation_epsilon:
+                continue
+            if original_profile.z > aligned["mouth_center_z"] + validation_epsilon:
+                raise RuntimeError(
+                    f"{shape.name} moved an upper-face vertex {index}"
+                )
+            if (
+                abs(original_profile.x - aligned["mouth_center_x"])
+                > aligned["jaw_radius_outer_x"] + validation_epsilon
+            ):
+                raise RuntimeError(
+                    f"{shape.name} moved a non-jaw vertex {index}"
+                )
+            max_horizontal = max(max_horizontal, abs(delta.x))
+            max_displacement = max(max_displacement, displacement)
+            if original_profile.x < aligned["mouth_center_x"]:
+                moved_left += 1
+            else:
+                moved_right += 1
+        if max_horizontal > validation_epsilon * 4:
+            raise RuntimeError(
+                f"{shape.name} introduced horizontal mouth skew: "
+                f"{max_horizontal}"
+            )
+        if shape.name != "Basis" and moved_left != 0 and moved_right == 0:
+            raise RuntimeError(f"{shape.name} moved only the left jaw")
+        if shape.name != "Basis" and moved_right != 0 and moved_left == 0:
+            raise RuntimeError(f"{shape.name} moved only the right jaw")
+        validated_shapes[shape.name] = {
+            "left": moved_left,
+            "right": moved_right,
+            "max": round(max_displacement, 6),
+        }
+    print({"lower_jaw_morph_validation": validated_shapes})
+
 for shape in mesh.data.shape_keys.key_blocks:
     shape.value = 0.0
     shape.slider_min = 0.0
@@ -799,7 +1179,64 @@ if unweighted or over_four or bad_weight_sums or missing_required_groups:
         f"missing deform groups {missing_required_groups}"
     )
 
+if animation_path and embedded_action is None:
+    existing_objects = set(bpy.context.scene.objects)
+    existing_actions = set(bpy.data.actions)
+    if animation_path.lower().endswith((".glb", ".gltf")):
+        bpy.ops.import_scene.gltf(filepath=animation_path)
+    else:
+        bpy.ops.import_scene.fbx(filepath=animation_path)
+    animation_objects = [
+        obj for obj in bpy.context.scene.objects if obj not in existing_objects
+    ]
+    animation_armatures = [
+        obj for obj in animation_objects if obj.type == "ARMATURE"
+    ]
+    imported_actions = [
+        action for action in bpy.data.actions if action not in existing_actions
+    ]
+    if len(animation_armatures) != 1 or not imported_actions:
+        raise RuntimeError(
+            "Animation source must contain one armature and at least one action"
+        )
+    embedded_action = max(
+        imported_actions,
+        key=lambda action: action.frame_range[1] - action.frame_range[0],
+    )
+    animated_bones = {bone.name for bone in animation_armatures[0].data.bones}
+    missing_animation_bones = sorted(
+        animated_bones - {bone.name for bone in armature.data.bones}
+    )
+    if missing_animation_bones:
+        raise RuntimeError(
+            f"Animation contains unsupported bones: {missing_animation_bones}"
+        )
+    animation_rig_scale = rig_span(armature) / rig_span(animation_armatures[0])
+    retarget_action_translations(embedded_action, animation_rig_scale)
+    print({"animation_rig_scale": animation_rig_scale})
+    armature.animation_data_create()
+    armature.animation_data.action = embedded_action
+    if embedded_action.slots:
+        armature.animation_data.action_slot = embedded_action.slots[0]
+    embedded_action.name = f"{profile_name}_idle"
+    for action in list(bpy.data.actions):
+        if action is not embedded_action:
+            bpy.data.actions.remove(action)
+    bpy.context.scene.frame_start = int(embedded_action.frame_range[0])
+    bpy.context.scene.frame_end = int(embedded_action.frame_range[1])
+elif embedded_action is not None:
+    embedded_action.name = f"{profile_name}_idle"
+    for action in list(bpy.data.actions):
+        if action is not embedded_action:
+            bpy.data.actions.remove(action)
+    bpy.context.scene.frame_start = int(embedded_action.frame_range[0])
+    bpy.context.scene.frame_end = int(embedded_action.frame_range[1])
+
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
+bone_count = len(armature.data.bones)
+for helper in list(bpy.context.scene.objects):
+    if helper.type == "MESH" and helper is not mesh:
+        bpy.data.objects.remove(helper, do_unlink=True)
 bpy.ops.object.select_all(action="DESELECT")
 mesh.select_set(True)
 armature.select_set(True)
@@ -808,7 +1245,7 @@ bpy.ops.export_scene.gltf(
     filepath=output_path,
     export_format="GLB",
     use_selection=True,
-    export_animations=False,
+    export_animations=embedded_action is not None,
     export_morph=True,
     export_morph_normal=True,
     export_skins=True,
@@ -816,15 +1253,25 @@ bpy.ops.export_scene.gltf(
     export_influence_nb=4,
     export_apply=False,
 )
+for animation_object in animation_objects:
+    bpy.data.objects.remove(animation_object, do_unlink=True)
 
 print(
     {
         "profile": profile_name,
         "output": output_path,
         "vertices": len(mesh.data.vertices),
-        "bones": len(armature.data.bones),
+        "bones": bone_count,
         "vertex_groups": len(mesh.vertex_groups),
         "shape_keys": [shape.name for shape in mesh.data.shape_keys.key_blocks],
+        "animation": (
+            {
+                "name": embedded_action.name,
+                "frame_range": tuple(embedded_action.frame_range),
+            }
+            if embedded_action
+            else None
+        ),
         "size_bytes": os.path.getsize(output_path),
         "skin_validation": {
             "unweighted": unweighted,

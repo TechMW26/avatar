@@ -1,5 +1,6 @@
 /**
- * Upload all FBX assets in `public/` to Vercel Blob and print env line.
+ * Upload the runtime 3D assets in `public/` to Vercel Blob and print the
+ * public asset-base environment variable.
  *
  * One-time setup:
  *   1. Vercel dashboard → Storage → Create Blob store, copy the read/write
@@ -8,13 +9,13 @@
  *   3. `node scripts/upload-fbx-to-blob.mjs`
  *
  * The script:
- *   - Walks `public/avatar.fbx` and `public/animations/*.fbx`.
- *   - Uploads each as `avatar.fbx` / `animations/<name>.fbx` to Blob with
+ *   - Uploads only the three active character models and FluffyGrass assets.
+ *   - Keeps their paths stable in Blob with
  *     `addRandomSuffix: false` so the URLs are stable across re-uploads.
  *   - At the end, prints a single `NEXT_PUBLIC_ASSET_BASE_URL=…` line you
  *     can paste into Vercel project env (Production, Preview, Development).
  *
- * Re-run any time you swap an animation file.
+ * Re-run any time a character model or grass asset changes.
  */
 
 import fs from 'node:fs/promises';
@@ -23,33 +24,24 @@ import { put } from '@vercel/blob';
 
 const ROOT = path.resolve(process.cwd(), 'public');
 const ASSETS = [
-  'avatar.fbx',
-  // Heavy idle/walking/waving Mixamo exports are pre-extracted to compact
-  // AnimationClip JSON via `scripts/extract-clips.mjs`. Avatar3D.tsx reads
-  // these `.clip.json` URLs directly; the source 74 MB `.fbx` files no
-  // longer need to be uploaded.
-  'animations/breathing-idle.clip.json',
-  'animations/sitting-idle.clip.json',
-  'animations/standing.clip.json',
-  'animations/stop-walking.clip.json',
-  'animations/walking.fbx',
-  'animations/waving.clip.json',
-  'animations/praying.fbx',
-  'animations/explaining.fbx',
-  'animations/yelling.fbx',
-  'animations/dismissing.fbx',
-  'animations/shooting-arrow.fbx',
-  'animations/thoughtful.fbx',
-  'animations/climbing.fbx',
-  'animations/left-turn.fbx',
-  'animations/pointing.fbx',
-  'animations/sword-fight.fbx',
-  'animations/falling-to-landing.fbx',
+  'models/sandipani.glb',
+  'models/rani-laxmi-bai.glb',
+  'models/shivaji-maharaj.glb',
+  'grass/grassLODs.glb',
+  'grass/grass.jpeg',
+  'grass/perlinnoise.webp',
 ];
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
   console.error('Missing BLOB_READ_WRITE_TOKEN. Add it to .env.local first.');
   process.exit(1);
+}
+
+function contentTypeFor(rel) {
+  if (rel.endsWith('.jpeg') || rel.endsWith('.jpg')) return 'image/jpeg';
+  if (rel.endsWith('.webp')) return 'image/webp';
+  if (rel.endsWith('.glb')) return 'model/gltf-binary';
+  return 'application/octet-stream';
 }
 
 let firstUrl = null;
@@ -60,7 +52,7 @@ for (const rel of ASSETS) {
     const result = await put(rel, buf, {
       access: 'public',
       addRandomSuffix: false,
-      contentType: 'application/octet-stream',
+      contentType: contentTypeFor(rel),
       // Cache for a year — bump ASSET_CACHE_NAME in Avatar3D.tsx to invalidate.
       cacheControlMaxAge: 60 * 60 * 24 * 365,
       allowOverwrite: true,

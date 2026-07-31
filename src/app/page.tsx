@@ -105,8 +105,8 @@ export default function Home() {
           >
             <div className={styles.cardVisual}>
               <Image
-                src="/og-image.png"
-                alt=""
+                src={character.portraitPath}
+                alt={`${character.name} in a relaxed historical portrait`}
                 fill
                 priority={index === 0}
                 sizes="(max-width: 760px) 86vw, 30vw"

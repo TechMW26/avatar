@@ -12,17 +12,13 @@ import {
   MutableRefObject,
   RefObject,
 } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { SkeletonUtils, FBXLoader, GLTFLoader } from "three-stdlib";
 import {
-  ASSET_BASE_URL,
-  ASSET_CACHE_NAME,
   assetUrl,
   ensureFreshAssetCache,
   getDeviceProfile,
-  isAssetEnabled,
-  isAssetMissing,
 } from "../lib/avatarAssets";
 import type {
   AvatarAnimationCommand,
@@ -38,51 +34,6 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.22;
 const LIP_SYNC_CLOSURE_GAIN = 1.08;
 const MAX_LIP_SYNC_INFLUENCE = 0.68;
-
-// User-provided FBX animation files (Mixamo rigs).
-// The five "full body" idle/walking/waving Mixamo exports were ~74 MB each
-// because they re-embedded the skinned mesh + 6 MB texture. We pre-extract
-// just their AnimationClips into compact JSON via
-// `scripts/extract-clips.mjs` so mobile Safari does not have to download
-// and FBX-parse ~370 MB of dead weight before the first frame can render.
-// Smaller gesture FBX files (<1 MB) stay as-is — converting them is churn.
-const ANIM_IDLE_URL = "/animations/neutral-idle.fbx";
-const ANIM_SITTING_URL = "/animations/sitting-idle.clip.json";
-const ANIM_STANDING_URL = "/animations/standing.clip.json";
-const ANIM_STOPPING_URL = "/animations/stop-walking.clip.json";
-const ANIM_WALKING_URL = "/animations/walking.fbx";
-const ANIM_WAVING_URL = "/animations/waving.clip.json";
-const ANIM_PRAYING_URL = "/animations/praying.fbx";
-const ANIM_EXPLAINING_URL = "/animations/explaining.fbx";
-const ANIM_YELLING_URL = "/animations/yelling.fbx";
-const ANIM_DISMISSING_URL = "/animations/dismissing.fbx";
-const ANIM_SHOOTING_ARROW_URL = "/animations/shooting-arrow.fbx";
-const ANIM_THOUGHTFUL_URL = "/animations/thoughtful.fbx";
-const ANIM_CLIMBING_URL = "/animations/climbing.fbx";
-const ANIM_LEFT_TURN_URL = "/animations/left-turn.fbx";
-const ANIM_POINTING_URL = "/animations/pointing.fbx";
-const ANIM_SWORD_FIGHT_URL = "/animations/sword-fight.fbx";
-const ANIM_FALLING_URL = "/animations/falling-to-landing.fbx";
-
-const ALL_ANIM_URLS = [
-  ANIM_IDLE_URL,
-  ANIM_SITTING_URL,
-  ANIM_STANDING_URL,
-  ANIM_STOPPING_URL,
-  ANIM_WALKING_URL,
-  ANIM_WAVING_URL,
-  ANIM_PRAYING_URL,
-  ANIM_EXPLAINING_URL,
-  ANIM_YELLING_URL,
-  ANIM_DISMISSING_URL,
-  ANIM_SHOOTING_ARROW_URL,
-  ANIM_THOUGHTFUL_URL,
-  ANIM_CLIMBING_URL,
-  ANIM_LEFT_TURN_URL,
-  ANIM_POINTING_URL,
-  ANIM_SWORD_FIGHT_URL,
-  ANIM_FALLING_URL,
-] as const;
 
 type AvatarAnimState = AvatarAnimationState;
 
@@ -138,13 +89,13 @@ const FACE_DEBOUNCE_MS = 350;
 const SAME_GESTURE_COOLDOWN_MS = 4_500;
 
 /* ── Stage geometry ──
-   Avatars occupy exactly the lower 90% of the viewport: feet on the
-   bottom edge and 10% clear space above the head. Both the floor line and
-   scale are derived from the live camera frustum and the model's actual
-   posed height so this remains true after resizing and on both displays. */
+   Avatars keep 2.5% safe floor space below the feet and 10% clear space
+   above the head. Both margins and scale are derived from the live camera
+   frustum so feet/grass stay visible after resizing on both displays. */
 const MODEL_NORMALIZED_HEIGHT = 2.45;
-const CLOSE_SCREEN_HEIGHT = 0.90;
-const FAR_SCREEN_HEIGHT = 0.90;
+const GROUND_SAFE_MARGIN = 0.025;
+const CLOSE_SCREEN_HEIGHT = 0.875;
+const FAR_SCREEN_HEIGHT = 0.875;
 // Sit dip — the Mixamo sit clip rotates the legs into a cross-leg position
 // but we strip the Hips translation track (cm-scale problem), so without a
 // small additional drop the seated pose looks like he's hovering.
@@ -159,7 +110,9 @@ function getVisibleHeightAtZ(camera: THREE.Camera, z: number): number {
 }
 
 function getGroundY(camera: THREE.Camera, z: number): number {
-  return camera.position.y - getVisibleHeightAtZ(camera, z) / 2;
+  const visibleHeight = getVisibleHeightAtZ(camera, z);
+  return camera.position.y - visibleHeight / 2
+    + visibleHeight * GROUND_SAFE_MARGIN;
 }
 
 function getScaleForScreenHeight(
@@ -224,6 +177,31 @@ function measurePosedModelHeight(
     : MODEL_NORMALIZED_HEIGHT;
 }
 
+/**
+ * Normalize from the evaluated animation pose, not the bind pose. Skinned
+ * mesh bounds are pose-dependent; anchoring the bind box is what left some
+ * characters more than a foot above the floor once their idle started.
+ */
+function normalizeEvaluatedPose(scene: THREE.Group): number {
+  scene.position.set(0, 0, 0);
+  scene.scale.set(1, 1, 1);
+  scene.updateMatrixWorld(true);
+  const posedBounds = getSceneLocalBounds(scene);
+  if (posedBounds.isEmpty()) return MODEL_NORMALIZED_HEIGHT;
+
+  const height = posedBounds.max.y - posedBounds.min.y;
+  const modelScale = MODEL_NORMALIZED_HEIGHT / Math.max(0.001, height);
+  const center = posedBounds.getCenter(new THREE.Vector3());
+  scene.scale.setScalar(modelScale);
+  scene.position.set(
+    -center.x * modelScale,
+    -posedBounds.min.y * modelScale,
+    -center.z * modelScale,
+  );
+  scene.updateMatrixWorld(true);
+  return MODEL_NORMALIZED_HEIGHT;
+}
+
 const STATE_TARGETS: Record<
   AvatarAnimState,
   { z: number; rotY: number; screenHeight: number; clipKey: ClipKey }
@@ -271,6 +249,44 @@ function pickClip(
   if (!animations || animations.length === 0) return null;
   const nonZero = animations.find((clip) => clip.duration > 0);
   return nonZero ?? animations[0] ?? null;
+}
+
+/**
+ * Keep the authored Mixamo idle in-place. Mixamo FBX exports commonly key
+ * `Hips.position`; even a tiny Y/root drift makes an otherwise stationary
+ * character hover above its ground marker and a non-zero end displacement
+ * creates a jump at LoopRepeat's seam. Freezing that single translation at
+ * its authored first-frame value preserves every joint rotation in the idle
+ * while keeping both feet in the same stage coordinate system.
+ */
+function makeInPlaceIdleClip(
+  source: THREE.AnimationClip | null,
+): THREE.AnimationClip | null {
+  if (!source) return null;
+  const clip = source.clone();
+  clip.name = `${source.name || "mixamo-idle"}-in-place`;
+  clip.tracks = clip.tracks.map((sourceTrack) => {
+    const track = sourceTrack.clone();
+    const separator = track.name.lastIndexOf(".");
+    const nodeName = separator >= 0 ? track.name.slice(0, separator) : "";
+    const propertyName = separator >= 0 ? track.name.slice(separator + 1) : "";
+    if (
+      propertyName === "position"
+      && stripMixamoPrefix(nodeName).toLowerCase() === "hips"
+      && track.getValueSize() >= 3
+    ) {
+      const values = track.values;
+      const stride = track.getValueSize();
+      for (let index = stride; index < values.length; index += stride) {
+        for (let axis = 0; axis < stride; axis += 1) {
+          values[index + axis] = values[axis];
+        }
+      }
+    }
+    return track;
+  });
+  clip.resetDuration();
+  return clip;
 }
 
 /**
@@ -418,33 +434,10 @@ function remapClipToAvatarRig(
   return new THREE.AnimationClip(clip.name, clip.duration, tracks);
 }
 
-/* ── FBX cache (Suspense-friendly) ──
-   We cache both the parsed FBX scene (for the avatar) and the extracted
-   clips (for animation packs whose mesh we don't want).
-
-   Asset hosting strategy:
-   - In dev (`NEXT_PUBLIC_ASSET_BASE_URL` unset) we serve straight from
-     `/public/animations/*.fbx` for fast local iteration.
-   - In production we host the FBXs on Vercel Blob (or any CDN) and set
-     `NEXT_PUBLIC_ASSET_BASE_URL=https://<hash>.public.blob.vercel-storage.com`
-     so the giant FBX files don't have to ship through git or the
-     Next.js build output (which has a 100MB hard limit per asset on
-     Vercel's serverless deployments).
-   - On the device we wrap fetch with the browser's Cache Storage API so
-     the FBX files are only downloaded once per device and subsequent
-     loads come from local disk \u2014 the kiosk is responsive even on flaky
-     connections.
-
-   Set the cache name + bump the version when shipping new asset bundles.
-
-   Both `ASSET_BASE_URL` and `ASSET_CACHE_NAME` are now defined in
-   `src/app/lib/avatarAssets.ts` so the pre-mount preloader and the
-   runtime loader read from the exact same Cache Storage bucket. */
-// Re-export aliases so the rest of this file can keep its existing
-// references untouched. These are the same constants the preloader uses;
-// changing one without the other will silently re-download every asset.
-void ASSET_BASE_URL;
-void ASSET_CACHE_NAME;
+/* ── Avatar cache (Suspense-friendly) ──
+   Production characters are GLBs with one embedded Mixamo idle. A small
+   FBX scene fallback remains for local asset inspection, but no separate
+   body-animation files are fetched or parsed. */
 
 /** Fetch through Cache Storage so the second visit is instant.
  *  Falls back to a plain fetch when Cache Storage is unavailable
@@ -476,10 +469,8 @@ async function fetchAssetCached(path: string): Promise<ArrayBuffer> {
 const fbxSceneCache = new Map<string, THREE.Group>();
 const gltfSceneCache = new Map<string, THREE.Group>();
 const gltfClipCache = new Map<string, THREE.AnimationClip[]>();
-const fbxClipCache = new Map<string, THREE.AnimationClip[]>();
 const fbxScenePromises = new Map<string, Promise<THREE.Group>>();
 const gltfScenePromises = new Map<string, Promise<THREE.Group>>();
-const fbxClipPromises = new Map<string, Promise<THREE.AnimationClip[]>>();
 
 function loadFbxScene(url: string): Promise<THREE.Group> {
   let p = fbxScenePromises.get(url);
@@ -547,82 +538,6 @@ function readEmbeddedAvatarClips(url: string): THREE.AnimationClip[] {
   throw loadAvatarScene(url);
 }
 
-function loadFbxClips(url: string): Promise<THREE.AnimationClip[]> {
-  let p = fbxClipPromises.get(url);
-  if (!p) {
-    // `.clip.json` payloads are pre-extracted AnimationClip JSON written by
-    // `scripts/extract-clips.mjs`. They skip the entire FBX download/parse
-    // path (which is what was killing the kiosk on mobile Safari).
-    if (/\.clip\.json($|\?)/i.test(url)) {
-      p = fetchAssetCached(url)
-        .then((buf) => {
-          const text = new TextDecoder().decode(buf);
-          const raw = JSON.parse(text) as unknown;
-          const arr = Array.isArray(raw) ? raw : [raw];
-          const clips = arr.map((j) =>
-            THREE.AnimationClip.parse(j as Parameters<typeof THREE.AnimationClip.parse>[0]),
-          );
-          fbxClipCache.set(url, clips);
-          return clips;
-        })
-        .catch((err) => {
-          console.error("[Avatar] clip JSON load failed:", url, err);
-          fbxClipPromises.delete(url);
-          throw err;
-        });
-      fbxClipPromises.set(url, p);
-      return p;
-    }
-
-    const loader = new FBXLoader();
-    p = fetchAssetCached(url)
-      .then((buf) => loader.parse(buf, ""))
-      .then((group) => {
-        const clips = (group.animations || []).map((c) => c.clone());
-        // Drop the heavy mesh data — we only ever needed the AnimationClips.
-        group.traverse((obj) => {
-          const mesh = obj as THREE.Mesh;
-          if (mesh.isMesh) {
-            mesh.geometry?.dispose?.();
-            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-            mats.forEach((m) => (m as THREE.Material | undefined)?.dispose?.());
-          }
-        });
-        fbxClipCache.set(url, clips);
-        return clips;
-      })
-      .catch((err) => {
-        console.error("[Avatar] FBX load failed:", url, err);
-        fbxClipPromises.delete(url);
-        throw err;
-      });
-    fbxClipPromises.set(url, p);
-  }
-  return p;
-}
-
-function useFbxClips(url: string, enabled = true): THREE.AnimationClip[] {
-  if (!enabled) return EMPTY_CLIPS;
-  // Low-tier devices skip optional gesture animations entirely. Returning
-  // an empty clip array makes `pickClip()` resolve to `null`, which
-  // downstream code already treats as "this gesture is unavailable" and
-  // simply leaves the avatar in `idle_standing`. Keeps low-end phones
-  // from spending RAM/CPU on animations they will never play.
-  const profile = getDeviceProfile();
-  if (!isAssetEnabled(url, profile)) return EMPTY_CLIPS;
-  // If the preloader 404'd this asset (stale blob bucket, typo in path,
-  // etc.) treat it as unavailable rather than throwing a Suspense fetch
-  // that would loop forever. Same downstream contract as the low-tier
-  // skip path above.
-  const pathOnly = url.replace(ASSET_BASE_URL, "") || url;
-  if (isAssetMissing(pathOnly)) return EMPTY_CLIPS;
-  const cached = fbxClipCache.get(url);
-  if (cached) return cached;
-  throw loadFbxClips(url);
-}
-
-// Shared empty-array sentinel so React's `useMemo` dependency comparison
-// stays stable across renders for skipped optional clips.
 const EMPTY_CLIPS: THREE.AnimationClip[] = [];
 
 /* ── Error boundary ── */
@@ -676,6 +591,7 @@ function AvatarModel({
 }) {
   const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
+  const groundRef = useRef<THREE.Group>(null);
   const notify = useCallback(
     (state: AvatarAnimState) => onAnimStateChangeRef.current?.(state),
     [onAnimStateChangeRef],
@@ -684,50 +600,38 @@ function AvatarModel({
   const usesEmbeddedAnimation = /\.gl(?:b|tf)($|\?)/i.test(avatarUrl);
   const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
 
-  const idleClips = useFbxClips(ANIM_IDLE_URL, !usesEmbeddedAnimation);
-  const sittingClips = useFbxClips(ANIM_SITTING_URL, !usesEmbeddedAnimation);
-  const standingClips = useFbxClips(ANIM_STANDING_URL, !usesEmbeddedAnimation);
-  const stoppingClips = useFbxClips(ANIM_STOPPING_URL, !usesEmbeddedAnimation);
-  const walkingClips = useFbxClips(ANIM_WALKING_URL, !usesEmbeddedAnimation);
-  const wavingClips = useFbxClips(ANIM_WAVING_URL, !usesEmbeddedAnimation);
-  const prayingClips = useFbxClips(ANIM_PRAYING_URL, !usesEmbeddedAnimation);
-  const explainingClips = useFbxClips(ANIM_EXPLAINING_URL, !usesEmbeddedAnimation);
-  const yellingClips = useFbxClips(ANIM_YELLING_URL, !usesEmbeddedAnimation);
-  const dismissingClips = useFbxClips(ANIM_DISMISSING_URL, !usesEmbeddedAnimation);
-  const shootingArrowClips = useFbxClips(ANIM_SHOOTING_ARROW_URL, !usesEmbeddedAnimation);
-  const thoughtfulClips = useFbxClips(ANIM_THOUGHTFUL_URL, !usesEmbeddedAnimation);
-  const climbingClips = useFbxClips(ANIM_CLIMBING_URL, !usesEmbeddedAnimation);
-  const leftTurnClips = useFbxClips(ANIM_LEFT_TURN_URL, !usesEmbeddedAnimation);
-  const pointingClips = useFbxClips(ANIM_POINTING_URL, !usesEmbeddedAnimation);
-  const swordFightClips = useFbxClips(ANIM_SWORD_FIGHT_URL, !usesEmbeddedAnimation);
-  const fallingClips = useFbxClips(ANIM_FALLING_URL, !usesEmbeddedAnimation);
-
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
+
+  const idleClip = useMemo(
+    () => makeInPlaceIdleClip(
+      embeddedClips.find((clip) => (
+        /idle|mixamo|rigify_clip/i.test(clip.name)
+      )) ?? pickClip(embeddedClips),
+    ),
+    [embeddedClips],
+  );
 
   const sourceClips = useMemo(
     () => ({
-      idle_standing: usesEmbeddedAnimation
-        ? embeddedClips.find((clip) => clip.name.includes("rigify_clip"))
-          ?? pickClip(embeddedClips)
-        : pickClip(idleClips),
-      sitting: pickClip(sittingClips),
-      standing_up: pickClip(standingClips),
-      stopping: pickClip(stoppingClips),
-      walking: pickClip(walkingClips),
-      waving: pickClip(wavingClips),
-      praying: pickClip(prayingClips),
-      explaining: pickClip(explainingClips),
-      yelling: pickClip(yellingClips),
-      dismissing: pickClip(dismissingClips),
-      shooting_arrow: pickClip(shootingArrowClips),
-      thoughtful: pickClip(thoughtfulClips),
-      climbing: pickClip(climbingClips),
-      left_turn: pickClip(leftTurnClips),
-      pointing: pickClip(pointingClips),
-      sword_fight: pickClip(swordFightClips),
-      falling: pickClip(fallingClips),
+      idle_standing: idleClip,
+      sitting: null,
+      standing_up: null,
+      stopping: null,
+      walking: null,
+      waving: null,
+      praying: null,
+      explaining: null,
+      yelling: null,
+      dismissing: null,
+      shooting_arrow: null,
+      thoughtful: null,
+      climbing: null,
+      left_turn: null,
+      pointing: null,
+      sword_fight: null,
+      falling: null,
     }),
-    [usesEmbeddedAnimation, embeddedClips, idleClips, sittingClips, standingClips, stoppingClips, walkingClips, wavingClips, prayingClips, explainingClips, yellingClips, dismissingClips, shootingArrowClips, thoughtfulClips, climbingClips, leftTurnClips, pointingClips, swordFightClips, fallingClips],
+    [idleClip],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -751,7 +655,6 @@ function AvatarModel({
     falling: undefined,
   });
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
-  const embeddedIdleActionRef = useRef<THREE.AnimationAction | null>(null);
   const animStateRef = useRef<AvatarAnimState>("idle_standing");
 
   // Face debouncing.
@@ -808,7 +711,6 @@ function AvatarModel({
   const footClampInitializedRef = useRef(false);
   const posedModelHeightRef = useRef(MODEL_NORMALIZED_HEIGHT);
   const lipSyncMeshesRef = useRef<THREE.Mesh[]>([]);
-  const breathingMeshesRef = useRef<THREE.Mesh[]>([]);
   const activeVisemeRef = useRef<(typeof AVATAR_VISEMES)[number]>("viseme_PP");
   const activeVisemeSinceRef = useRef(0);
   const lastPublishedLipFrameRef = useRef(0);
@@ -838,19 +740,10 @@ function AvatarModel({
     const avatarBoneByStripped = new Map<string, string>();
     const avatarRestQuaternionByStripped = new Map<string, THREE.Quaternion>();
     const lipSyncMeshes: THREE.Mesh[] = [];
-    const breathingMeshes: THREE.Mesh[] = [];
 
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
-        const breathingIndex = mesh.morphTargetDictionary?.breathing;
-        if (
-          breathingIndex !== undefined
-          && mesh.morphTargetInfluences
-        ) {
-          mesh.morphTargetInfluences[breathingIndex] = 0;
-          breathingMeshes.push(mesh);
-        }
         if (
           mesh.morphTargetDictionary
           && mesh.morphTargetInfluences
@@ -861,7 +754,9 @@ function AvatarModel({
           lipSyncMeshes.push(mesh);
           for (const name of AVATAR_VISEMES) {
             const index = mesh.morphTargetDictionary[name];
-            if (index !== undefined) mesh.morphTargetInfluences[index] = 0;
+            if (index !== undefined) {
+              mesh.morphTargetInfluences[index] = 0;
+            }
           }
         }
         if (
@@ -956,7 +851,6 @@ function AvatarModel({
       }
     });
     lipSyncMeshesRef.current = lipSyncMeshes;
-    breathingMeshesRef.current = breathingMeshes;
 
     /* ── Scale + ground the avatar ──
        Anchor the avatar's feet at scene-local y = 0 so the parent group's
@@ -1042,9 +936,6 @@ function AvatarModel({
         .play();
       initialAction.setEffectiveWeight(1);
       currentActionRef.current = initialAction;
-      embeddedIdleActionRef.current = usesEmbeddedAnimation
-        ? initialAction
-        : null;
       animStateRef.current = initialState;
 
       // Snap the group to the initial state's stage marks so the very first
@@ -1060,8 +951,8 @@ function AvatarModel({
       }
 
       mixer.update(0);
+      posedModelHeightRef.current = normalizeEvaluatedPose(scene);
       if (grp) {
-        posedModelHeightRef.current = measurePosedModelHeight(scene, grp);
         const target = STATE_TARGETS[initialState];
         grp.scale.setScalar(
           getScaleForScreenHeight(
@@ -1073,24 +964,10 @@ function AvatarModel({
         );
         grp.updateMatrixWorld(true);
       }
-      // Plant the first rendered pose immediately. Waiting for the
-      // throttled frame clamp made the model visibly hover during startup.
-      if (grp) {
-        grp.updateMatrixWorld(true);
-        let minFootY = Infinity;
-        const footPosition = new THREE.Vector3();
-        for (const foot of [footBonesRef.current.left, footBonesRef.current.right]) {
-          if (!foot) continue;
-          foot.getWorldPosition(footPosition);
-          minFootY = Math.min(minFootY, footPosition.y);
-        }
-        if (Number.isFinite(minFootY)) {
-          const measuredOffset = minFootY - grp.position.y;
-          footFloorOffsetRef.current = measuredOffset;
-          footClampInitializedRef.current = true;
-          grp.position.y = getGroundY(camera, grp.position.z) - measuredOffset;
-          grp.updateMatrixWorld(true);
-        }
+      const ground = groundRef.current;
+      if (grp && ground) {
+        ground.position.set(0, getGroundY(camera, grp.position.z), grp.position.z);
+        ground.scale.copy(grp.scale);
       }
       notify(initialState);
       // Tell the host the avatar is on screen so it can spin up the camera
@@ -1125,6 +1002,11 @@ function AvatarModel({
         );
         grp.updateMatrixWorld(true);
       }
+      const ground = groundRef.current;
+      if (grp && ground) {
+        ground.position.set(0, getGroundY(camera, grp.position.z), grp.position.z);
+        ground.scale.copy(grp.scale);
+      }
       notify(initialState);
       requestAnimationFrame(() => onReadyRef.current?.());
     }
@@ -1142,9 +1024,7 @@ function AvatarModel({
       mixer.uncacheRoot(scene);
       mixerRef.current = null;
       currentActionRef.current = null;
-      embeddedIdleActionRef.current = null;
       lipSyncMeshesRef.current = [];
-      breathingMeshesRef.current = [];
       actionsRef.current = {
         sitting: undefined,
         standing_up: undefined,
@@ -1274,7 +1154,11 @@ function AvatarModel({
       for (const viseme of AVATAR_VISEMES) {
         const index = dictionary[viseme];
         if (index === undefined) continue;
-        const targetInfluence = viseme === activeViseme ? activeIntensity : 0;
+        const targetInfluence = mouthOpen
+          ? viseme === activeViseme
+            ? activeIntensity
+            : 0
+          : 0;
         influences[index] += (targetInfluence - influences[index]) * mouthBlend;
       }
     }
@@ -1290,44 +1174,10 @@ function AvatarModel({
     const mixer = mixerRef.current;
     const actions = actionsRef.current;
     if (mixer) {
-      const embeddedIdle = embeddedIdleActionRef.current;
-      if (usesEmbeddedAnimation && embeddedIdle) {
-        const duration = embeddedIdle.getClip().duration;
-        if (duration > 0.001) {
-          // The supplied idle clips are not authored as seamless cycles:
-          // their final pose differs from their first pose. A hard modulo
-          // therefore snaps the skeleton at every loop boundary. Play the
-          // clip forward and backward with cosine-eased turnarounds instead.
-          // Wall-clock phase keeps the front and rear displays frame-locked.
-          const cycleDuration = duration * 2;
-          const cyclePhase = ((Date.now() / 1000) % cycleDuration) / cycleDuration;
-          const easedPingPong = 0.5 - 0.5 * Math.cos(cyclePhase * Math.PI * 2);
-          embeddedIdle.time = Math.min(
-            easedPingPong * duration,
-            Math.max(0, duration - 0.000001),
-          );
-        }
-        mixer.update(0);
-      } else {
-        mixer.update(Math.min(delta, 0.05));
-      }
-    }
-
-    /* ── Subtle synchronized chest breathing ──
-       Morph-only characters cannot inherit the Mixamo idle's ribcage
-       motion. Drive their authored inhale target from wall-clock time so
-       the front and rear displays remain phase-locked. Speech reduces the
-       amplitude because the voice animation already supplies motion. */
-    const breathPhase = (Date.now() % 4_800) / 4_800;
-    const inhale = 0.5 - 0.5 * Math.cos(breathPhase * Math.PI * 2);
-    const breathTarget = inhale * (isSpeakingRef.current ? 0.35 : 1);
-    const breathBlend = 1 - Math.exp(-delta * 3.5);
-    for (const mesh of breathingMeshesRef.current) {
-      const index = mesh.morphTargetDictionary?.breathing;
-      const influences = mesh.morphTargetInfluences;
-      if (index === undefined || !influences) continue;
-      influences[index] +=
-        (breathTarget - influences[index]) * breathBlend;
+      // Play the supplied Mixamo idle forward at its authored speed. The
+      // action is LoopRepeat and its Hips translation was made in-place
+      // above, so there is no reverse-motion ping-pong or root jump.
+      mixer.update(Math.min(delta, 0.05));
     }
 
     /* ── Smoothly drive group transform toward the current state's marks ── */
@@ -1496,6 +1346,11 @@ function AvatarModel({
           posedModelHeightRef.current,
         ),
       );
+      const ground = groundRef.current;
+      if (ground) {
+        ground.position.set(0, getGroundY(camera, grp.position.z), grp.position.z);
+        ground.scale.copy(grp.scale);
+      }
 
       const targetScale =
         getScaleForScreenHeight(
@@ -1962,12 +1817,255 @@ function AvatarModel({
   });
 
   return (
-    <group ref={groupRef}>
+    <>
+      <group ref={groundRef}>
+        <GroundPatch />
+      </group>
+      <group ref={groupRef}>
       <group
         rotation={[0, viewMode === "rear" ? Math.PI : 0, 0]}
       >
         <primitive object={scene} />
       </group>
+      </group>
+    </>
+  );
+}
+
+// FluffyGrass source geometry, blade alpha and Perlin wind approach:
+// https://github.com/thebenezer/FluffyGrass (MIT, license shipped with assets).
+const FLUFFY_GRASS_VERTEX_SHADER = /* glsl */ `
+  uniform sampler2D uNoiseTexture;
+  uniform float uTime;
+  varying vec2 vUv;
+  varying vec2 vGlobalUv;
+
+  void main() {
+    vec4 instancePosition = instanceMatrix * vec4(position, 1.0);
+    vGlobalUv = (instancePosition.xz + vec2(0.66)) / 1.32;
+    vec4 noise = texture2D(
+      uNoiseTexture,
+      vGlobalUv * 1.5 + vec2(uTime * 0.001, uTime * 0.0007)
+    );
+
+    vec2 windDirection = normalize(vec2(1.0, 0.78));
+    float tipFlex = 1.0 - uv.y;
+    float mainWave = sin(
+      42.0 * dot(windDirection, vGlobalUv)
+      + noise.g * 5.5
+      + uTime * 1.25
+    );
+    float detailWave = sin(
+      79.0 * dot(vec2(-0.45, 1.0), vGlobalUv)
+      + noise.b * 3.5
+      + uTime * 2.1
+    );
+    float gust = 0.68 + 0.32 * sin(uTime * 0.34 + noise.r * 6.283);
+    float displacement = (mainWave * 0.75 + detailWave * 0.25)
+      * 0.012 * gust * tipFlex * tipFlex;
+
+    instancePosition.xz += windDirection * displacement;
+    instancePosition.y += noise.r * 0.003 * tipFlex;
+    vUv = vec2(uv.x, 1.0 - uv.y);
+    gl_Position = projectionMatrix * modelViewMatrix * instancePosition;
+  }
+`;
+
+const FLUFFY_GRASS_FRAGMENT_SHADER = /* glsl */ `
+  uniform sampler2D uGrassAlphaTexture;
+  uniform sampler2D uNoiseTexture;
+  uniform vec3 uBaseColor;
+  uniform vec3 uTipColor1;
+  uniform vec3 uTipColor2;
+  varying vec2 vUv;
+  varying vec2 vGlobalUv;
+
+  void main() {
+    float blade = texture2D(uGrassAlphaTexture, vUv).r;
+    if (blade < 0.1) discard;
+    float variation = texture2D(uNoiseTexture, vGlobalUv * 1.5).r;
+    vec3 tipColor = mix(uTipColor1, uTipColor2, variation);
+    vec3 grassColor = mix(uBaseColor, tipColor, vUv.y);
+    grassColor *= 0.88 + blade * 0.32;
+    gl_FragColor = vec4(grassColor, 1.0);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }
+`;
+
+function GroundPatch() {
+  const grassRef = useRef<THREE.InstancedMesh>(null);
+  const grassMaterialRef = useRef<THREE.ShaderMaterial>(null);
+  const profile = useMemo(() => getDeviceProfile(), []);
+  const clumpCount =
+    profile.tier === "high" ? 280 : profile.tier === "mid" ? 170 : 96;
+  const fluffyGrassScene = readAvatarScene("/grass/grassLODs.glb");
+  const grassAlphaTexture = useLoader(
+    THREE.TextureLoader,
+    "/grass/grass.jpeg",
+  );
+  const noiseTexture = useLoader(
+    THREE.TextureLoader,
+    "/grass/perlinnoise.webp",
+  );
+  const groundTexture = useMemo(() => {
+    const size = 128;
+    const data = new Uint8Array(size * size * 4);
+    let seed = 0x51a7;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 0xffffffff;
+    };
+
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const nx = (x + 0.5 - size / 2) / (size / 2);
+        const ny = (y + 0.5 - size / 2) / (size / 2);
+        const radius = Math.sqrt(nx * nx + ny * ny);
+        const edge = 1 - THREE.MathUtils.smoothstep(radius, 0.72, 1);
+        const noise = random();
+        const green = THREE.MathUtils.clamp(
+          0.28 + (noise - 0.5) * 0.32,
+          0.15,
+          0.5,
+        );
+        const offset = (y * size + x) * 4;
+        data[offset] = Math.round(THREE.MathUtils.lerp(70, 46, green));
+        data[offset + 1] = Math.round(THREE.MathUtils.lerp(53, 69, green));
+        data[offset + 2] = Math.round(THREE.MathUtils.lerp(28, 30, green));
+        data[offset + 3] = Math.round(225 * edge);
+      }
+    }
+
+    const texture = new THREE.DataTexture(
+      data,
+      size,
+      size,
+      THREE.RGBAFormat,
+      THREE.UnsignedByteType,
+    );
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.needsUpdate = true;
+    return texture;
+  }, []);
+  const grassGeometry = useMemo(() => {
+    let sourceGeometry: THREE.BufferGeometry | null = null;
+    fluffyGrassScene.traverse((object) => {
+      if (
+        !sourceGeometry
+        && (object as THREE.Mesh).isMesh
+        && object.name.includes("LOD00")
+      ) {
+        sourceGeometry = (object as THREE.Mesh).geometry;
+      }
+    });
+    if (!sourceGeometry) {
+      throw new Error("FluffyGrass LOD00 geometry is missing.");
+    }
+    const geometry = (sourceGeometry as THREE.BufferGeometry).clone();
+    geometry.scale(0.35, 0.35, 0.35);
+    return geometry;
+  }, [fluffyGrassScene]);
+  const grassUniforms = useMemo(
+    () => ({
+      uTime: { value: 0 },
+      uGrassAlphaTexture: { value: grassAlphaTexture },
+      uNoiseTexture: { value: noiseTexture },
+      uBaseColor: { value: new THREE.Color("#313f1b") },
+      uTipColor1: { value: new THREE.Color("#9bd38d") },
+      uTipColor2: { value: new THREE.Color("#1f352a") },
+    }),
+    [grassAlphaTexture, noiseTexture],
+  );
+
+  useEffect(() => {
+    noiseTexture.wrapS = THREE.RepeatWrapping;
+    noiseTexture.wrapT = THREE.RepeatWrapping;
+    noiseTexture.needsUpdate = true;
+    grassAlphaTexture.colorSpace = THREE.NoColorSpace;
+    grassAlphaTexture.needsUpdate = true;
+  }, [grassAlphaTexture, noiseTexture]);
+
+  useEffect(() => {
+    const grass = grassRef.current;
+    if (!grass) return;
+    const transform = new THREE.Object3D();
+    let seed = 0x9e3779b9;
+    const random = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return seed / 0xffffffff;
+    };
+
+    for (let index = 0; index < clumpCount; index += 1) {
+      let rootX = 0;
+      let rootZ = 0;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const angle = random() * Math.PI * 2;
+        const radius = Math.sqrt(random()) * 0.57;
+        rootX = Math.cos(angle) * radius;
+        rootZ = Math.sin(angle) * radius;
+        const nearLeftFoot =
+          Math.abs(rootX + 0.14) < 0.105 && Math.abs(rootZ) < 0.12;
+        const nearRightFoot =
+          Math.abs(rootX - 0.14) < 0.105 && Math.abs(rootZ) < 0.12;
+        if (!nearLeftFoot && !nearRightFoot) break;
+      }
+      const scale = 0.78 + random() * 0.48;
+      transform.position.set(rootX, 0, rootZ);
+      transform.rotation.set(0, random() * Math.PI * 2, 0);
+      transform.scale.setScalar(scale);
+      transform.updateMatrix();
+      grass.setMatrixAt(index, transform.matrix);
+    }
+    grass.instanceMatrix.needsUpdate = true;
+  }, [clumpCount]);
+
+  useFrame(({ clock }) => {
+    if (grassMaterialRef.current) {
+      grassMaterialRef.current.uniforms.uTime.value = clock.elapsedTime;
+    }
+  });
+
+  useEffect(
+    () => () => {
+      groundTexture.dispose();
+      grassGeometry.dispose();
+    },
+    [grassGeometry, groundTexture],
+  );
+
+  return (
+    <group position={[0, -0.004, 0]}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} renderOrder={-1}>
+        <circleGeometry args={[0.66, 64]} />
+        <meshStandardMaterial
+          map={groundTexture}
+          transparent
+          opacity={0.94}
+          alphaTest={0.025}
+          depthWrite={false}
+          roughness={1}
+          metalness={0}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      <instancedMesh
+        ref={grassRef}
+        args={[grassGeometry, undefined, clumpCount]}
+        frustumCulled={false}
+      >
+        <shaderMaterial
+          ref={grassMaterialRef}
+          uniforms={grassUniforms}
+          vertexShader={FLUFFY_GRASS_VERTEX_SHADER}
+          fragmentShader={FLUFFY_GRASS_FRAGMENT_SHADER}
+          side={THREE.DoubleSide}
+          transparent
+          alphaTest={0.1}
+        />
+      </instancedMesh>
     </group>
   );
 }
@@ -2535,15 +2633,8 @@ function DeviceTunedCanvas({
   );
 }
 
-// Warm the FBX caches so the avatar + animations are ready by the time the
-// component mounts (avoids a Suspense fallback flicker after first paint).
-// On low-tier devices we skip the optional gesture FBXs so we don't burn
-// memory + bandwidth on animations that will never play.
+// Warm only the default avatar. Every production GLB already contains its
+// one supplied Mixamo idle, so no secondary animation pack is fetched.
 if (typeof window !== "undefined") {
   void loadAvatarScene(DEFAULT_AVATAR_URL);
-  const profile = getDeviceProfile();
-  ALL_ANIM_URLS.forEach((url) => {
-    if (!isAssetEnabled(url, profile)) return;
-    void loadFbxClips(url);
-  });
 }

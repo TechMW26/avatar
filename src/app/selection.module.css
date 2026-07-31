@@ -165,15 +165,15 @@
 
 .portrait {
   object-fit: cover;
-  object-position: center 34%;
-  transform: scale(1.08);
+  object-position: center top;
+  transform: scale(1.02);
   filter: saturate(0.88) contrast(1.05);
   transition: transform 450ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .card:hover .portrait,
 .card:focus-visible .portrait {
-  transform: scale(1.14);
+  transform: scale(1.08);
 }
 
 .visualShade {

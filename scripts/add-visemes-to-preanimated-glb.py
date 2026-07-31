@@ -6,7 +6,8 @@ existing character mesh are added.
 
 Run with Blender:
   blender --background --python scripts/add-visemes-to-preanimated-glb.py -- \
-    <sandipani|rani-laxmi-bai|shivaji-maharaj> <input.glb> <output.glb>
+    <sandipani|rani-laxmi-bai|shivaji-maharaj> <input.glb> <output.glb> \
+    [material-source.fbx]
 """
 
 import math
@@ -17,19 +18,24 @@ import bpy
 from mathutils import Matrix
 
 args = sys.argv[sys.argv.index("--") + 1 :]
-if len(args) != 3:
-    raise SystemExit("Expected: <profile> <input.glb> <output.glb>")
+if len(args) not in (3, 4):
+    raise SystemExit(
+        "Expected: <profile> <input.glb> <output.glb> [material-source.fbx]"
+    )
 
-profile_name, input_path, output_path = args
+profile_name, input_path, output_path = args[:3]
+material_source_path = args[3] if len(args) == 4 else None
 input_path = os.path.abspath(input_path)
 output_path = os.path.abspath(output_path)
+if material_source_path:
+    material_source_path = os.path.abspath(material_source_path)
 
 # Coordinates are normalized against the supplied mesh height. These are
 # facial regions only; no armature, vertex group, or skin data is modified.
 PROFILES = {
     "sandipani": {
-        "analysis_yaw_degrees": -45.0,
-        "mouth_x": -0.073,
+        "analysis_yaw_degrees": 0.0,
+        "mouth_x": 0.0,
         "mouth_z": 0.8453,
         "mouth_radius_x": 0.0300,
         "mouth_inner_x": 0.0120,
@@ -37,10 +43,12 @@ PROFILES = {
         "top_outer_z": 0.0220,
         "bottom_inner_z": 0.0120,
         "bottom_outer_z": 0.0350,
-        "face_front_y": -0.2000,
-        "face_back_y": -0.0800,
-        "lower_close": 1.0,
-        "upper_close": 0.90,
+        "face_front_y": -0.1200,
+        "face_back_y": -0.0550,
+        "lower_close": 1.30,
+        "upper_close": 1.15,
+        "lower_forward_close": 0.0020,
+        "upper_forward_close": 0.0004,
         "closed_offset": 0.0,
         "jaw_angle": 15.0,
         "jaw_front_y": -0.0737,
@@ -53,6 +61,16 @@ PROFILES = {
         "jaw_fade_z": 0.7658,
         "source_open_only": True,
         "source_open_scale": 1.22,
+        # This Meshy topology has long facial triangles that connect the
+        # mouth to the moustache and beard. Keep those authored surfaces
+        # fixed during speech and articulate only the lower lip band.
+        "lower_lip_visemes": True,
+        "lower_lip_open": 0.0180,
+        "lower_lip_center_offset_z": 0.0080,
+        "lower_lip_inner_x": 0.0100,
+        "lower_lip_outer_x": 0.0250,
+        "lower_lip_inner_z": 0.0050,
+        "lower_lip_outer_z": 0.0120,
     },
     "rani-laxmi-bai": {
         "mouth_z": 0.8832,
@@ -91,8 +109,10 @@ PROFILES = {
         "bottom_outer_z": 0.0350,
         "face_front_y": -0.0711,
         "face_back_y": -0.0553,
-        "lower_close": 1.0,
-        "upper_close": 0.90,
+        "lower_close": 1.08,
+        "upper_close": 0.98,
+        "lower_forward_close": 0.0020,
+        "upper_forward_close": 0.0004,
         "closed_offset": 0.0,
         "jaw_angle": 5.0,
         "jaw_front_y": -0.0395,
@@ -105,6 +125,12 @@ PROFILES = {
         "jaw_fade_z": 0.7737,
         "source_open_only": True,
         "source_open_scale": 1.22,
+        # The source has sparse triangles from the upper lip into the
+        # moustache and cheeks. Reopening its authored source shape drags
+        # those triangles and creates the pointed face seen in production.
+        # Keep the closed upper face fixed and articulate only the lower lip.
+        "lower_lip_visemes": True,
+        "lower_lip_open": 0.0105,
     },
 }
 if profile_name not in PROFILES:
@@ -142,6 +168,45 @@ mesh = character_meshes[0]
 armature = armatures[0]
 if mesh.data.shape_keys:
     raise RuntimeError("Supplied model already contains facial morph targets")
+
+if material_source_path:
+    existing_objects = set(bpy.context.scene.objects)
+    bpy.ops.import_scene.fbx(filepath=material_source_path)
+    imported_objects = [
+        obj for obj in bpy.context.scene.objects if obj not in existing_objects
+    ]
+    material_meshes = [obj for obj in imported_objects if obj.type == "MESH"]
+    if len(material_meshes) != 1:
+        raise RuntimeError(
+            f"Expected one material-source mesh, found {len(material_meshes)}"
+        )
+    material_mesh = material_meshes[0]
+    if (
+        len(material_mesh.data.vertices) != len(mesh.data.vertices)
+        or len(material_mesh.data.polygons) != len(mesh.data.polygons)
+    ):
+        raise RuntimeError(
+            "Material source topology does not match the animated mesh"
+        )
+    source_uv = material_mesh.data.uv_layers.active
+    target_uv = mesh.data.uv_layers.active
+    if not source_uv or not target_uv or len(source_uv.data) != len(target_uv.data):
+        raise RuntimeError(
+            "Material source UV layout does not match the animated mesh"
+        )
+    for index, source_loop in enumerate(source_uv.data):
+        target_uv.data[index].uv = source_loop.uv
+    if not material_mesh.material_slots or not material_mesh.material_slots[0].material:
+        raise RuntimeError("Material source has no usable material")
+    mesh.data.materials.clear()
+    mesh.data.materials.append(material_mesh.material_slots[0].material)
+    for polygon, source_polygon in zip(
+        mesh.data.polygons,
+        material_mesh.data.polygons,
+    ):
+        polygon.material_index = source_polygon.material_index
+    for imported in imported_objects:
+        bpy.data.objects.remove(imported, do_unlink=True)
 
 original_bones = {
     bone.name: tuple(round(value, 8) for row in bone.matrix_local for value in row)
@@ -212,16 +277,45 @@ def mouth_weight(point):
 
 
 def lower_jaw_weight(point):
-    if point.z >= mouth_center_z:
+    lower_lip_center_z = mouth_center_z + (
+        profile.get("lower_lip_center_offset_z", 0.0) * height
+    )
+    if point.z >= lower_lip_center_z:
         return 0.0
     # The supplied source meshes have sparse triangles across the chin and
     # cheeks. A broad geometric "jaw" mask catches those triangles and tears
     # the face. Drive only the lower lip ring; the source open-mouth geometry
     # already contains the correct jaw opening.
+    lower_distance = lower_lip_center_z - point.z
+    if "lower_lip_outer_z" in profile:
+        x_weight = 1.0 - smoothstep(
+            scaled("lower_lip_inner_x"),
+            scaled("lower_lip_outer_x"),
+            abs(point.x - mouth_center_x),
+        )
+        z_weight = 1.0 - smoothstep(
+            scaled("lower_lip_inner_z"),
+            scaled("lower_lip_outer_z"),
+            lower_distance,
+        )
+        front_weight = 1.0 - smoothstep(
+            scaled("face_front_y"),
+            scaled("face_back_y"),
+            point.y,
+        )
+        lower_lip_weight = smoothstep(
+            0.0,
+            max(0.0001, scaled("lower_lip_inner_z") * 0.45),
+            lower_distance,
+        )
+        return max(
+            0.0,
+            x_weight * z_weight * front_weight * lower_lip_weight,
+        )
     lower_lip_weight = smoothstep(
         0.0,
         max(0.0001, scaled("bottom_inner_z") * 0.45),
-        mouth_center_z - point.z,
+        lower_distance,
     )
     return mouth_weight(point) * lower_lip_weight
 
@@ -237,7 +331,11 @@ def closed_pose(point, lip_weight, jaw_weight):
     seam = seam_center - seam_gap if was_lower_lip else seam_center + seam_gap
     strength = profile["lower_close"] if was_lower_lip else profile["upper_close"]
     point.z += (seam - point.z) * strength * lip_weight
-    point.y += (0.0137 if was_lower_lip else 0.0042) * height * lip_weight
+    forward_close = profile.get(
+        "lower_forward_close" if was_lower_lip else "upper_forward_close",
+        0.0137 if was_lower_lip else 0.0042,
+    )
+    point.y += forward_close * height * lip_weight
     return point
 
 
@@ -250,6 +348,9 @@ def make_viseme(horizontal, openness, protrude=0.0, jaw_forward=0.0):
 
     def transform(point, lip_weight, jaw_weight):
         posed = closed_pose(point.copy(), lip_weight, jaw_weight)
+        if profile.get("lower_lip_visemes"):
+            posed.z -= openness * scaled("lower_lip_open") * jaw_weight
+            return posed
         posed.z += (point.z - posed.z) * openness
         posed.x += point.x * horizontal * lip_weight
         posed.y -= protrude * height * lip_weight

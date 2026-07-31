@@ -14,6 +14,7 @@ export interface CharacterProfile {
   accentDark: string;
   agentId: string;
   modelPath: string;
+  portraitPath: string;
   greetings: {
     default: string;
     namaste: string;
@@ -37,6 +38,7 @@ export const CHARACTERS: readonly CharacterProfile[] = [
     accentDark: "#9a3412",
     agentId: process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID_SANDIPANI || "",
     modelPath: "/models/sandipani.glb",
+    portraitPath: "/portraits/rishi-sandipani.png",
     greetings: {
       default:
         "नमस्ते! मैं ऋषि सांदीपनि का प्रतिबिंब हूँ — उज्जैन के गुरुकुल की शिक्षाओं की छाया। मैंने तुम्हें यहाँ आते देखा। बताओ, आज तुम क्या जानना चाहते हो?",
@@ -69,6 +71,7 @@ export const CHARACTERS: readonly CharacterProfile[] = [
       process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID_RANI_LAXMI_BAI
       || "agent_9801kyfjapdrf30bcmk5ddn4yerb",
     modelPath: "/models/rani-laxmi-bai.glb",
+    portraitPath: "/portraits/rani-lakshmi-bai.png",
     greetings: {
       default:
         "नमस्कार! मैं झाँसी की रानी लक्ष्मीबाई के साहस और स्वाभिमान का प्रतिबिंब हूँ। बताइए, आज किस चुनौती का सामना करना है?",
@@ -101,6 +104,7 @@ export const CHARACTERS: readonly CharacterProfile[] = [
       process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID_SHIVAJI_MAHARAJ
       || "agent_9301kyfjb9rqffnah8wrm0248x56",
     modelPath: "/models/shivaji-maharaj.glb",
+    portraitPath: "/portraits/chhatrapati-shivaji-maharaj.png",
     greetings: {
       default:
         "जय भवानी! मैं छत्रपति शिवाजी महाराज के स्वराज्य-संकल्प और नेतृत्व का प्रतिबिंब हूँ। बताइए, आज किस निर्णय या चुनौती पर विचार करना है?",

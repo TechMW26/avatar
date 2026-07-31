@@ -5,10 +5,8 @@
  *
  * Why this module exists:
  *   - iOS Safari kills tabs that allocate too much memory at once. The
- *     17 avatar/animation assets used to be `Suspense`-thrown in parallel
- *     on first paint, which on an iPhone meant ~80 MB of FBX data being
- *     downloaded + parsed simultaneously. Safari would show
- *     "A problem repeatedly occurred" and refuse to load the page.
+ *     character bundles are therefore downloaded sequentially rather than
+ *     being `Suspense`-thrown in parallel on first paint.
  *   - We now download every asset *sequentially* under user control, drop
  *     each `Response` into the same `Cache Storage` bucket that
  *     `Avatar3D.tsx` reads from at runtime, and report a single progress
@@ -16,15 +14,14 @@
  *   - `Avatar3D.tsx` then mounts only after this preload completes, so
  *     `Suspense` resolves instantly (every fetch hits the warmed cache).
  *
- * Cache key naming (`ASSET_CACHE_NAME`) MUST match the value baked into
- * `Avatar3D.tsx`. Bump both together when shipping new asset bundles.
+ * Bump `ASSET_CACHE_NAME` whenever shipping new character bundles.
  */
 
 const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v21";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v29";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
@@ -60,8 +57,12 @@ export async function ensureFreshAssetCache(): Promise<string> {
 }
 
 export function assetUrl(path: string): string {
-  if (!ASSET_BASE_URL) return path;
-  return `${ASSET_BASE_URL}/${path.replace(/^\//, "")}`;
+  const resolved = ASSET_BASE_URL
+    ? `${ASSET_BASE_URL}/${path.replace(/^\//, "")}`
+    : path;
+  return AVATAR_MODEL_PATHS.has(path)
+    ? `${resolved}?v=${encodeURIComponent(ASSET_CACHE_NAME)}`
+    : resolved;
 }
 
 /**
@@ -80,9 +81,9 @@ export interface AvatarAssetSpec {
 }
 
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
-  { path: "/models/sandipani.glb", estBytes: 64 * 1024 * 1024 },
-  { path: "/models/rani-laxmi-bai.glb", estBytes: 62 * 1024 * 1024 },
-  { path: "/models/shivaji-maharaj.glb", estBytes: 29 * 1024 * 1024 },
+  { path: "/models/sandipani.glb", estBytes: 71 * 1024 * 1024 },
+  { path: "/models/rani-laxmi-bai.glb", estBytes: 96 * 1024 * 1024 },
+  { path: "/models/shivaji-maharaj.glb", estBytes: 76 * 1024 * 1024 },
 ];
 
 const AVATAR_MODEL_PATHS = new Set([
@@ -115,35 +116,6 @@ function getRuntimeAssetCacheName(): string {
   return cachedRuntimeAssetCacheName;
 }
 
-/**
- * URLs that are *optional* — they only ever play when the AI agent
- * triggers a gesture mid-conversation. On low-tier devices we skip
- * downloading them entirely; the runtime falls back to no-op (the
- * AvatarModel `pickClip` chain returns null and the gesture system
- * silently ignores the request, leaving the avatar in `idle_standing`).
- *
- * Keep `idle`, `sitting-idle`, `standing`, `stop-walking`,
- * `walking`, and `waving` mandatory — those drive the core
- * sit→stand→walk→wave kiosk loop and the avatar would T-pose without
- * them.
- */
-const OPTIONAL_GESTURE_PATHS = new Set<string>([
-  "/animations/praying.fbx",
-  "/animations/explaining.fbx",
-  "/animations/yelling.fbx",
-  "/animations/dismissing.fbx",
-  "/animations/shooting-arrow.fbx",
-  "/animations/thoughtful.fbx",
-  "/animations/climbing.fbx",
-  "/animations/left-turn.fbx",
-  "/animations/pointing.fbx",
-  "/animations/sword-fight.fbx",
-  // The falling clip is only used as the close-out for the climbing
-  // attract sequence. Low-tier devices already skip climbing, so the
-  // fall is wasted bandwidth on those phones.
-  "/animations/falling-to-landing.fbx",
-]);
-
 export type DeviceTier = "low" | "mid" | "high";
 
 export interface DeviceProfile {
@@ -158,10 +130,6 @@ export interface DeviceProfile {
   anisotropy: number;
   /** WebGL `powerPreference` hint. */
   powerPreference: "low-power" | "high-performance" | "default";
-  /** When true, optional AI gesture FBXs are downloaded + bound. When
-   *  false, those animations are skipped entirely so we save ~6 MB +
-   *  ~10 GPU skeleton bindings on low-end devices. */
-  loadOptionalGestures: boolean;
   /** Cap on `THREE.WebGLRenderer.toneMappingExposure` adjustments
    *  (set so future code can dim further on low-end without a magic
    *  number elsewhere). */
@@ -259,9 +227,6 @@ export function getDeviceProfile(): DeviceProfile {
     // High-performance hint — picks discrete GPU on laptops, and the
     // perf-cluster on mobile SoCs.
     powerPreference: "high-performance",
-    // Keep gesture clips available on handhelds; gesture detection is
-    // already disabled there, but AI-driven body animations should still run.
-    loadOptionalGestures: true,
     toneMappingExposure: 1.1,
     // FrontSide only — avatar is a closed mesh, back-faces are never
     // visible. Cuts per-pixel fragment work roughly in half on the
@@ -284,9 +249,10 @@ export function getDeviceProfile(): DeviceProfile {
     maxTextureSize: handheld ? 768 : 1024,
     // mediump materially reduces shader ALU pressure on budget phones.
     shaderPrecision: "mediump",
-    // Keep at least one foot planted on every display. The clamp is
-    // throttled inside Avatar3D, so its cost remains modest on handhelds.
-    enableFootClamp: true,
+    // The avatar is normalized from its evaluated Mixamo idle pose and its
+    // Hips translation is frozen in-place, so chasing toe-bone pivots would
+    // reintroduce vertical bob and can bury the actual sole in the ground.
+    enableFootClamp: false,
   };
 
   cachedProfile = profile;
@@ -298,28 +264,17 @@ export function getDeviceProfile(): DeviceProfile {
 
 /** Build the asset queue for the selected pre-animated character. */
 export function getAssetQueueForProfile(
-  profile: DeviceProfile,
+  _profile: DeviceProfile,
   avatarPath = "/models/sandipani.glb",
 ): AvatarAssetSpec[] {
-  return AVATAR_ASSETS.filter((asset) => {
-    if (AVATAR_MODEL_PATHS.has(asset.path) && asset.path !== avatarPath) return false;
-    return profile.loadOptionalGestures || !OPTIONAL_GESTURE_PATHS.has(asset.path);
-  });
-}
-
-/** Whether a given asset path is allowed to be fetched on this profile. */
-export function isAssetEnabled(path: string, profile: DeviceProfile): boolean {
-  if (profile.loadOptionalGestures) return true;
-  return !OPTIONAL_GESTURE_PATHS.has(path);
+  return AVATAR_ASSETS.filter(
+    (asset) => !AVATAR_MODEL_PATHS.has(asset.path) || asset.path === avatarPath,
+  );
 }
 
 /**
- * Paths that returned a 4xx during preload. The runtime FBX/clip loader
- * checks this set and short-circuits to an empty clip array so a stale
- * deployment (e.g. blob bucket missing one file) never blocks the boot
- * gate or T-poses the avatar — the gesture system already tolerates
- * missing optional clips, and the mandatory idle clips degrade to
- * "avatar holds last pose" rather than infinite spinner.
+ * Paths that returned a 4xx during preload. Runtime loaders check this set
+ * so a stale deployment never blocks the boot gate indefinitely.
  *
  * Populated by `preloadAvatarAssets`. Use `isAssetMissing(path)` from
  * runtime code; never mutate this set directly.

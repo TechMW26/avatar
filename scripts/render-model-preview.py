@@ -15,38 +15,53 @@ if len(args) not in (2, 3, 4, 5, 6):
 
 model_path = os.path.abspath(args[0])
 output_path = os.path.abspath(args[1])
-shape_name = args[2] if len(args) >= 3 else None
+shape_name = (
+    None
+    if len(args) < 3 or args[2].lower() in {"none", "rest"}
+    else args[2]
+)
 shape_value = float(args[3]) if len(args) >= 4 else 1.0
 preview_frame = float(args[4]) if len(args) >= 5 else None
 preview_side = args[5] if len(args) == 6 else "front"
 bpy.ops.wm.read_factory_settings(use_empty=True)
-bpy.ops.import_scene.gltf(filepath=model_path)
+if model_path.lower().endswith(".fbx"):
+    bpy.ops.import_scene.fbx(filepath=model_path)
+else:
+    bpy.ops.import_scene.gltf(filepath=model_path)
 
 armatures = [
     obj for obj in bpy.context.scene.objects if obj.type == "ARMATURE"
 ]
 if armatures and bpy.data.actions:
     armature = armatures[0]
-    armature.animation_data_create()
-    armature.animation_data.action = next(
-        (
-            action
-            for action in bpy.data.actions
-            if "rigify_clip" in action.name
-        ),
-        sorted(bpy.data.actions, key=lambda action: action.name)[0],
-    )
-    start, end = armature.animation_data.action.frame_range
-    bpy.context.scene.frame_set(
-        int(min(max(start, preview_frame), end))
-        if preview_frame is not None
-        else int(min(start + 20, end))
-    )
+    if preview_frame == -1:
+        armature.data.pose_position = "REST"
+    else:
+        armature.animation_data_create()
+        armature.animation_data.action = next(
+            (
+                action
+                for action in bpy.data.actions
+                if "rigify_clip" in action.name
+            ),
+            sorted(bpy.data.actions, key=lambda action: action.name)[0],
+        )
+        start, end = armature.animation_data.action.frame_range
+        bpy.context.scene.frame_set(
+            int(min(max(start, preview_frame), end))
+            if preview_frame is not None
+            else int(min(start + 20, end))
+        )
 
 meshes = [
     obj
     for obj in bpy.context.scene.objects
-    if obj.type == "MESH" and obj.visible_get() and not obj.hide_render
+    if (
+        obj.type == "MESH"
+        and len(obj.data.vertices) > 100
+        and obj.visible_get()
+        and not obj.hide_render
+    )
 ]
 if not meshes:
     raise RuntimeError("No mesh found")
