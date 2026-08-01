@@ -16,6 +16,7 @@ import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { SkeletonUtils, FBXLoader, GLTFLoader } from "three-stdlib";
 import {
+  AVATAR_GESTURE_PATHS,
   assetUrl,
   ensureFreshAssetCache,
   getDeviceProfile,
@@ -67,6 +68,8 @@ type ClipKey =
   | "left_turn"
   | "pointing"
   | "sword_fight";
+
+type GestureClipKey = keyof typeof AVATAR_GESTURE_PATHS;
 
 type GestureName =
   | "Open_Palm"
@@ -397,9 +400,9 @@ function remapClipToAvatarRig(
 }
 
 /* ── Avatar cache (Suspense-friendly) ──
-   Production characters are GLBs with one embedded Mixamo idle. A small
-   FBX scene fallback remains for local asset inspection, but no separate
-   body-animation files are fetched or parsed. */
+   Production characters keep their supplied embedded idle. Shared gestures
+   are compact AnimationClip JSON files containing skeleton tracks only, so
+   they add interaction without replacing or duplicating any character mesh. */
 
 /** Fetch through Cache Storage so the second visit is instant.
  *  Falls back to a plain fetch when Cache Storage is unavailable
@@ -433,6 +436,8 @@ const gltfSceneCache = new Map<string, THREE.Group>();
 const gltfClipCache = new Map<string, THREE.AnimationClip[]>();
 const fbxScenePromises = new Map<string, Promise<THREE.Group>>();
 const gltfScenePromises = new Map<string, Promise<THREE.Group>>();
+let gestureClipCache: ReadonlyMap<GestureClipKey, THREE.AnimationClip> | null = null;
+let gestureClipPromise: Promise<ReadonlyMap<GestureClipKey, THREE.AnimationClip>> | null = null;
 
 function loadFbxScene(url: string): Promise<THREE.Group> {
   let p = fbxScenePromises.get(url);
@@ -500,6 +505,39 @@ function readEmbeddedAvatarClips(url: string): THREE.AnimationClip[] {
   throw loadAvatarScene(url);
 }
 
+function loadGestureClipLibrary(): Promise<ReadonlyMap<GestureClipKey, THREE.AnimationClip>> {
+  if (gestureClipPromise) return gestureClipPromise;
+  gestureClipPromise = Promise.all(
+    (Object.entries(AVATAR_GESTURE_PATHS) as Array<[GestureClipKey, string]>).map(
+      async ([key, path]) => {
+        const buffer = await fetchAssetCached(path);
+        const raw = JSON.parse(new TextDecoder().decode(buffer)) as unknown;
+        const serialized = Array.isArray(raw) ? raw : [raw];
+        const clips = serialized.map((value) => THREE.AnimationClip.parse(
+          value as Parameters<typeof THREE.AnimationClip.parse>[0],
+        ));
+        const clip = pickClip(clips);
+        if (!clip) throw new Error(`Gesture clip has no animation: ${path}`);
+        return [key, clip] as const;
+      },
+    ),
+  )
+    .then((entries) => {
+      gestureClipCache = new Map(entries);
+      return gestureClipCache;
+    })
+    .catch((error) => {
+      gestureClipPromise = null;
+      throw error;
+    });
+  return gestureClipPromise;
+}
+
+function readGestureClipLibrary(): ReadonlyMap<GestureClipKey, THREE.AnimationClip> {
+  if (gestureClipCache) return gestureClipCache;
+  throw loadGestureClipLibrary();
+}
+
 const EMPTY_CLIPS: THREE.AnimationClip[] = [];
 
 /* ── Error boundary ── */
@@ -561,6 +599,7 @@ function AvatarModel({
   const baseFbx = readAvatarScene(avatarUrl);
   const usesEmbeddedAnimation = /\.gl(?:b|tf)($|\?)/i.test(avatarUrl);
   const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
+  const gestureClips = readGestureClipLibrary();
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -580,20 +619,20 @@ function AvatarModel({
       standing_up: null,
       stopping: null,
       walking: null,
-      waving: null,
-      praying: null,
-      explaining: null,
-      yelling: null,
-      dismissing: null,
-      shooting_arrow: null,
-      thoughtful: null,
-      climbing: null,
-      left_turn: null,
-      pointing: null,
-      sword_fight: null,
-      falling: null,
+      waving: gestureClips.get("waving")?.clone() ?? null,
+      praying: gestureClips.get("praying")?.clone() ?? null,
+      explaining: gestureClips.get("explaining")?.clone() ?? null,
+      yelling: gestureClips.get("yelling")?.clone() ?? null,
+      dismissing: gestureClips.get("dismissing")?.clone() ?? null,
+      shooting_arrow: gestureClips.get("shooting_arrow")?.clone() ?? null,
+      thoughtful: gestureClips.get("thoughtful")?.clone() ?? null,
+      climbing: gestureClips.get("climbing")?.clone() ?? null,
+      left_turn: gestureClips.get("left_turn")?.clone() ?? null,
+      pointing: gestureClips.get("pointing")?.clone() ?? null,
+      sword_fight: gestureClips.get("sword_fight")?.clone() ?? null,
+      falling: gestureClips.get("falling")?.clone() ?? null,
     }),
-    [idleClip],
+    [gestureClips, idleClip],
   );
 
   const mixerRef = useRef<THREE.AnimationMixer | null>(null);
@@ -865,9 +904,9 @@ function AvatarModel({
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
       const clip = sourceClips[key];
       if (!clip) return;
-      // Pre-animated GLBs play their supplied clip exactly as authored.
-      // Retargeting is reserved for the legacy FBX avatar only.
-      const mapped = usesEmbeddedAnimation
+      // Preserve the supplied idle exactly. Gesture clips contain only
+      // Mixamo skeleton tracks and are remapped onto the current character.
+      const mapped = usesEmbeddedAnimation && key === "idle_standing"
         ? clip.clone()
         : remapClipToAvatarRig(
             clip,

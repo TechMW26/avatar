@@ -19,6 +19,7 @@
  *
  * Run:
  *   node scripts/extract-clips.mjs
+ *   node scripts/extract-clips.mjs <input.fbx> <output.clip.json> [...]
  *
  * Output: `public/animations/<name>.clip.json` next to each source FBX.
  *
@@ -76,34 +77,49 @@ const SOURCES = [
   'animations/waving.fbx',
 ];
 
-async function extract(rel) {
-  const abs = path.join(ROOT, rel);
+async function extract(inputPath, outputPath) {
+  const abs = path.isAbsolute(inputPath) ? inputPath : path.resolve(inputPath);
   const buf = await fs.readFile(abs);
   const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   const loader = new FBXLoader();
   const group = loader.parse(ab, '');
   const clips = group.animations || [];
   if (clips.length === 0) {
-    console.warn(`  ⚠ ${rel}: no animations found`);
+    console.warn(`  ⚠ ${inputPath}: no animations found`);
     return null;
   }
   // Keep all clips so callers that pick by name continue to work.
   const json = clips.map((c) => THREE.AnimationClip.toJSON(c));
-  const outRel = rel.replace(/\.fbx$/i, '.clip.json');
-  const outAbs = path.join(ROOT, outRel);
+  const outAbs = path.isAbsolute(outputPath) ? outputPath : path.resolve(outputPath);
+  await fs.mkdir(path.dirname(outAbs), { recursive: true });
   await fs.writeFile(outAbs, JSON.stringify(json));
   const srcMb = (buf.length / 1024 / 1024).toFixed(2);
   const dstKb = ((await fs.stat(outAbs)).size / 1024).toFixed(1);
-  console.log(`  ✓ ${rel} (${srcMb} MB) → ${outRel} (${dstKb} KB)  [${clips.length} clip${clips.length === 1 ? '' : 's'}]`);
-  return outRel;
+  console.log(`  ✓ ${inputPath} (${srcMb} MB) → ${outputPath} (${dstKb} KB)  [${clips.length} clip${clips.length === 1 ? '' : 's'}]`);
+  return outputPath;
 }
 
 console.log('Extracting AnimationClips from heavy FBX files…\n');
-for (const rel of SOURCES) {
+const cliArgs = process.argv.slice(2);
+if (cliArgs.length % 2 !== 0) {
+  throw new Error('CLI arguments must be <input.fbx> <output.clip.json> pairs');
+}
+const jobs = cliArgs.length
+  ? Array.from({ length: cliArgs.length / 2 }, (_, index) => ({
+      input: cliArgs[index * 2],
+      output: cliArgs[index * 2 + 1],
+    }))
+  : SOURCES.map((rel) => ({
+      input: path.join(ROOT, rel),
+      output: path.join(ROOT, rel.replace(/\.fbx$/i, '.clip.json')),
+    }));
+
+for (const job of jobs) {
   try {
-    await extract(rel);
+    await extract(job.input, job.output);
   } catch (err) {
-    console.error(`  ✗ ${rel}:`, err?.message || err);
+    console.error(`  ✗ ${job.input}:`, err?.message || err);
+    process.exitCode = 1;
   }
 }
 console.log('\nDone. Next steps:');

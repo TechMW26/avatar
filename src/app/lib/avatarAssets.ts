@@ -21,7 +21,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v40";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v41";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
@@ -62,15 +62,17 @@ export function assetUrl(path: string): string {
   const resolved = ASSET_BASE_URL
     ? `${ASSET_BASE_URL}/${path.replace(/^\//, "")}`
     : path;
-  return AVATAR_MODEL_PATHS.has(path) || path.startsWith("/grass/")
+  return AVATAR_MODEL_PATHS.has(path)
+    || path.startsWith("/animations/")
+    || path.startsWith("/grass/")
     ? `${resolved}?v=${encodeURIComponent(ASSET_CACHE_NAME)}`
     : resolved;
 }
 
 /**
  * Pre-animated character bundles pulled during boot. Each GLB contains its
- * supplied skeleton, skin, idle animation, and the facial visemes added by
- * our lip-sync-only preparation step, so no separate body clips are needed.
+ * supplied skeleton, skin, idle animation, and facial visemes. Compact
+ * skeleton-only gesture clips are shared by all three compatible Mixamo rigs.
  *
  * Estimated bytes are a fallback for progress when the server omits
  * `Content-Length` (rare, but happens behind some proxies). Keep them
@@ -82,10 +84,37 @@ export interface AvatarAssetSpec {
   estBytes: number;
 }
 
+export const AVATAR_GESTURE_PATHS = {
+  waving: "/animations/waving.clip.json",
+  praying: "/animations/praying.clip.json",
+  explaining: "/animations/explaining.clip.json",
+  yelling: "/animations/yelling.clip.json",
+  dismissing: "/animations/dismissing.clip.json",
+  shooting_arrow: "/animations/shooting-arrow.clip.json",
+  thoughtful: "/animations/thoughtful.clip.json",
+  climbing: "/animations/climbing.clip.json",
+  left_turn: "/animations/left-turn.clip.json",
+  pointing: "/animations/pointing.clip.json",
+  sword_fight: "/animations/sword-fight.clip.json",
+  falling: "/animations/falling-to-landing.clip.json",
+} as const;
+
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
   { path: "/models/sandipani.glb", estBytes: 50 * 1024 * 1024 },
   { path: "/models/rani-laxmi-bai.glb", estBytes: 49 * 1024 * 1024 },
   { path: "/models/shivaji-maharaj.glb", estBytes: 57 * 1024 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.waving, estBytes: 572 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.praying, estBytes: 97 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.explaining, estBytes: 534 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.yelling, estBytes: 1210 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.dismissing, estBytes: 354 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.shooting_arrow, estBytes: 555 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.thoughtful, estBytes: 860 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.climbing, estBytes: 418 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.left_turn, estBytes: 152 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.pointing, estBytes: 394 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.sword_fight, estBytes: 547 * 1024 },
+  { path: AVATAR_GESTURE_PATHS.falling, estBytes: 132 * 1024 },
 ];
 
 const AVATAR_MODEL_PATHS = new Set([

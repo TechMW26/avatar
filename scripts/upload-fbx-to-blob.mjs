@@ -9,7 +9,8 @@
  *   3. `node scripts/upload-fbx-to-blob.mjs`
  *
  * The script:
- *   - Uploads only the three active character models and FluffyGrass assets.
+ *   - Uploads the three active character models, FluffyGrass assets, and
+ *     compact shared gesture clips.
  *   - Keeps their paths stable in Blob with
  *     `addRandomSuffix: false` so the URLs are stable across re-uploads.
  *   - At the end, prints a single `NEXT_PUBLIC_ASSET_BASE_URL=…` line you
@@ -30,6 +31,18 @@ const KNOWN_ASSETS = [
   'grass/grassLODs.glb',
   'grass/grass.jpeg',
   'grass/perlinnoise.webp',
+  'animations/waving.clip.json',
+  'animations/praying.clip.json',
+  'animations/explaining.clip.json',
+  'animations/yelling.clip.json',
+  'animations/dismissing.clip.json',
+  'animations/shooting-arrow.clip.json',
+  'animations/thoughtful.clip.json',
+  'animations/climbing.clip.json',
+  'animations/left-turn.clip.json',
+  'animations/pointing.clip.json',
+  'animations/sword-fight.clip.json',
+  'animations/falling-to-landing.clip.json',
 ];
 const requestedAssets = process.argv.slice(2);
 const ASSETS = requestedAssets.length ? requestedAssets : KNOWN_ASSETS;
@@ -48,6 +61,7 @@ function contentTypeFor(rel) {
   if (rel.endsWith('.jpeg') || rel.endsWith('.jpg')) return 'image/jpeg';
   if (rel.endsWith('.webp')) return 'image/webp';
   if (rel.endsWith('.glb')) return 'model/gltf-binary';
+  if (rel.endsWith('.json')) return 'application/json';
   return 'application/octet-stream';
 }
 
