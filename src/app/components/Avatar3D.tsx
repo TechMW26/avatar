@@ -626,6 +626,9 @@ function AvatarModel({
   );
   const baseFbx = readAvatarScene(avatarUrl);
   const usesEmbeddedAnimation = /\.gl(?:b|tf)($|\?)/i.test(avatarUrl);
+  const hasSandipaniNeutralClosure = /(?:^|\/)sandipani(?:-lite)?\.glb(?:$|[?#])/i.test(
+    avatarUrl,
+  );
   const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
   const gestureClips = readGestureClipLibrary();
 
@@ -740,6 +743,8 @@ function AvatarModel({
   const footClampInitializedRef = useRef(false);
   const posedModelHeightRef = useRef(MODEL_NORMALIZED_HEIGHT);
   const lipSyncMeshesRef = useRef<THREE.Mesh[]>([]);
+  const neutralLipSealMeshesRef = useRef<THREE.Mesh[]>([]);
+  const mouthCavityMeshesRef = useRef<THREE.Mesh[]>([]);
   const activeVisemeRef = useRef<(typeof AVATAR_VISEMES)[number]>("viseme_PP");
   const activeVisemeSinceRef = useRef(0);
   const lastPublishedLipFrameRef = useRef(0);
@@ -769,10 +774,20 @@ function AvatarModel({
     const avatarBoneByStripped = new Map<string, string>();
     const avatarRestQuaternionByStripped = new Map<string, THREE.Quaternion>();
     const lipSyncMeshes: THREE.Mesh[] = [];
+    const neutralLipSealMeshes: THREE.Mesh[] = [];
+    const mouthCavityMeshes: THREE.Mesh[] = [];
 
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
+        if (/SandipaniIdleLipSeal/i.test(mesh.name)) {
+          neutralLipSealMeshes.push(mesh);
+          mesh.visible = true;
+        }
+        if (/SandipaniMouthCavity/i.test(mesh.name)) {
+          mouthCavityMeshes.push(mesh);
+          mesh.visible = false;
+        }
         if (
           mesh.morphTargetDictionary
           && mesh.morphTargetInfluences
@@ -784,7 +799,9 @@ function AvatarModel({
           for (const name of AVATAR_VISEMES) {
             const index = mesh.morphTargetDictionary[name];
             if (index !== undefined) {
-              mesh.morphTargetInfluences[index] = 0;
+              mesh.morphTargetInfluences[index] = (
+                hasSandipaniNeutralClosure && name === "viseme_PP"
+              ) ? 1 : 0;
             }
           }
           const cheekIndex = mesh.morphTargetDictionary[SPEECH_CHEEK_MORPH];
@@ -946,6 +963,8 @@ function AvatarModel({
       }
     });
     lipSyncMeshesRef.current = lipSyncMeshes;
+    neutralLipSealMeshesRef.current = neutralLipSealMeshes;
+    mouthCavityMeshesRef.current = mouthCavityMeshes;
 
     /* ── Scale + ground the avatar ──
        Anchor the avatar's feet at scene-local y = 0 so the parent group's
@@ -1120,6 +1139,8 @@ function AvatarModel({
       mixerRef.current = null;
       currentActionRef.current = null;
       lipSyncMeshesRef.current = [];
+      neutralLipSealMeshesRef.current = [];
+      mouthCavityMeshesRef.current = [];
       actionsRef.current = {
         sitting: undefined,
         standing_up: undefined,
@@ -1143,7 +1164,7 @@ function AvatarModel({
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
     // tear down the mixer on every parent re-render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [camera, scene, sourceClips, usesEmbeddedAnimation]);
+  }, [camera, hasSandipaniNeutralClosure, scene, sourceClips, usesEmbeddedAnimation]);
 
   // Frame-rate cap. We accumulate `delta` and only run the heavy
   // per-frame work (mixer.update + foot clamp + transform lerps) when
@@ -1255,9 +1276,13 @@ function AvatarModel({
         if (index === undefined) continue;
         const targetInfluence = mouthOpen
           ? viseme === activeViseme
-            ? activeIntensity
+            ? viseme === "viseme_PP"
+              ? 1
+              : activeIntensity
             : 0
-          : 0;
+          : hasSandipaniNeutralClosure && viseme === "viseme_PP"
+            ? 1
+            : 0;
         influences[index] += (targetInfluence - influences[index]) * mouthBlend;
       }
       const cheekIndex = dictionary[SPEECH_CHEEK_MORPH];
@@ -1266,6 +1291,12 @@ function AvatarModel({
           cheekTarget - influences[cheekIndex]
         ) * cheekBlend;
       }
+    }
+    for (const seal of neutralLipSealMeshesRef.current) {
+      seal.visible = closingLips;
+    }
+    for (const cavity of mouthCavityMeshesRef.current) {
+      cavity.visible = !closingLips;
     }
     if (onLipSyncFrameRef.current && lipNow - lastPublishedLipFrameRef.current >= 33) {
       lastPublishedLipFrameRef.current = lipNow;

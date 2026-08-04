@@ -19,7 +19,7 @@ import os
 import sys
 
 import bpy
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 
 args = sys.argv[sys.argv.index("--") + 1 :]
 if len(args) not in (3, 4):
@@ -40,7 +40,7 @@ PROFILES = {
     "sandipani": {
         "analysis_yaw_degrees": 0.0,
         "mouth_x": 0.0,
-        "mouth_z": 0.8610,
+        "mouth_z": 0.8490,
         "mouth_radius_x": 0.0300,
         "mouth_inner_x": 0.0120,
         "top_inner_z": 0.0060,
@@ -55,7 +55,7 @@ PROFILES = {
         "upper_close": 0.0,
         "lower_forward_close": -0.0015,
         "upper_forward_close": 0.0,
-        "closed_offset": -0.0010,
+        "closed_offset": 0.0040,
         "jaw_angle": 15.0,
         "jaw_front_y": -0.0737,
         "jaw_back_y": -0.0316,
@@ -72,15 +72,21 @@ PROFILES = {
         # fixed during speech and articulate only the lower lip band.
         "lower_lip_visemes": True,
         "lower_lip_open": 0.0120,
-        "lower_lip_center_offset_z": 0.0,
-        "lower_lip_inner_x": 0.0100,
-        "lower_lip_outer_x": 0.0250,
+        "lower_lip_center_offset_z": 0.0050,
+        "lower_lip_inner_x": 0.0060,
+        "lower_lip_outer_x": 0.0110,
         "lower_lip_inner_z": 0.0050,
         "lower_lip_outer_z": 0.0120,
         # The visible lip sits just behind the moustache shell. Select a
         # narrow depth band so speech never pulls beard/moustache triangles.
-        "lip_front_y": -0.0710,
-        "lip_peak_y": -0.0670,
+        "lower_lip_explicit_band": True,
+        "lower_lip_min_z": 0.8400,
+        "lower_lip_peak_min_z": 0.8460,
+        "lower_lip_peak_max_z": 0.8505,
+        "lower_lip_max_z": 0.8540,
+        "lip_front_y": -0.0750,
+        "lip_peak_front_y": -0.0720,
+        "lip_peak_back_y": -0.0660,
         "lip_back_y": -0.0620,
         "cheek_inner_x": 0.0220,
         "cheek_peak_x": 0.0430,
@@ -96,11 +102,21 @@ PROFILES = {
         # black material so speech reads as a hollow mouth, while lips,
         # moustache, beard, skin, body, bones and animation remain untouched.
         "dark_mouth_cavity": False,
-        "cavity_max_x": 0.0085,
-        "cavity_min_y": -0.0870,
-        "cavity_max_y": -0.0780,
-        "cavity_min_z": 0.8515,
-        "cavity_max_z": 0.8560,
+        "cavity_max_x": 0.0080,
+        "cavity_min_y": -0.0830,
+        "cavity_max_y": -0.0760,
+        "cavity_min_z": 0.8580,
+        "cavity_max_z": 0.8720,
+        # The scan's baked teeth share long triangles with the nose, so a
+        # material split or broader morph damages the face. These two tiny,
+        # head-weighted layers cover only the mouth opening in neutral; the
+        # lip layer is hidden by the runtime while speech visemes are active.
+        "idle_mouth_overlay": True,
+        "overlay_center_z": 0.8495,
+        "overlay_front_y": -0.0740,
+        "overlay_radius_x": 0.0110,
+        "cavity_radius_z": 0.0032,
+        "lip_radius_z": 0.0052,
     },
     "rani-laxmi-bai": {
         "mouth_z": 0.8760,
@@ -375,6 +391,128 @@ def darken_mouth_cavity():
 darkened_cavity_polygons = darken_mouth_cavity()
 
 
+facial_overlays = []
+
+
+def add_mouth_overlay(name, radius_x, radius_z, color, front_offset=0.0):
+    if not armature:
+        raise RuntimeError("Sandipani mouth overlay requires the supplied armature")
+    head_bone = next(
+        (
+            bone.name
+            for bone in armature.data.bones
+            if bone.name.lower().split(":")[-1] == "head"
+        ),
+        None,
+    )
+    if not head_bone:
+        raise RuntimeError("Sandipani mouth overlay could not find the Head bone")
+
+    center_z = minimum_z + profile["overlay_center_z"] * height
+    center_y = (profile["overlay_front_y"] + front_offset) * height
+    center_x = mouth_center_x
+    world_vertices = [Vector((center_x, center_y, center_z))]
+    if "LipSeam" in name:
+        outline = [
+            (1.00, 0.00),
+            (0.55, 0.42),
+            (0.00, 0.56),
+            (-0.55, 0.42),
+            (-1.00, 0.00),
+            (-0.55, -0.42),
+            (0.00, -0.56),
+            (0.55, -0.42),
+        ]
+    elif "IdleLipSeal" in name:
+        # Tapered, asymmetric lip silhouette (subtle cupid bow + fuller
+        # lower lip) reads as a closed human mouth instead of a flat oval.
+        outline = [
+            (1.00, 0.00),
+            (0.78, 0.28),
+            (0.42, 0.56),
+            (0.00, 0.72),
+            (-0.42, 0.56),
+            (-0.78, 0.28),
+            (-1.00, 0.00),
+            (-0.76, -0.24),
+            (-0.38, -0.50),
+            (0.00, -0.62),
+            (0.38, -0.50),
+            (0.76, -0.24),
+        ]
+    else:
+        segments = 32
+        outline = [
+            (math.cos(math.tau * index / segments), math.sin(math.tau * index / segments))
+            for index in range(segments)
+        ]
+    for normalized_x, normalized_z in outline:
+        world_vertices.append(
+            Vector(
+                (
+                    center_x + normalized_x * radius_x * height,
+                    center_y,
+                    center_z + normalized_z * radius_z * height,
+                )
+            )
+        )
+    vertices = [world_to_mesh @ point for point in world_vertices]
+    segments = len(outline)
+    faces = [
+        (0, index + 1, ((index + 1) % segments) + 1)
+        for index in range(segments)
+    ]
+    overlay_data = bpy.data.meshes.new(name)
+    overlay_data.from_pydata(vertices, [], faces)
+    overlay_data.update()
+    overlay = bpy.data.objects.new(name, overlay_data)
+    bpy.context.collection.objects.link(overlay)
+    overlay.matrix_world = mesh.matrix_world.copy()
+    overlay_world = overlay.matrix_world.copy()
+    overlay.parent = armature
+    overlay.matrix_world = overlay_world
+
+    material = bpy.data.materials.new(f"{name}Material")
+    material.diffuse_color = (*color, 1.0)
+    material.use_nodes = True
+    principled = material.node_tree.nodes.get("Principled BSDF")
+    if principled:
+        principled.inputs["Base Color"].default_value = (*color, 1.0)
+        principled.inputs["Roughness"].default_value = 0.82
+        principled.inputs["Metallic"].default_value = 0.0
+    overlay_data.materials.append(material)
+
+    armature_modifier = overlay.modifiers.new(name="Armature", type="ARMATURE")
+    armature_modifier.object = armature
+    head_group = overlay.vertex_groups.new(name=head_bone)
+    head_group.add(range(len(vertices)), 1.0, "REPLACE")
+    facial_overlays.append(overlay)
+    return overlay
+
+
+if profile.get("idle_mouth_overlay"):
+    add_mouth_overlay(
+        "SandipaniMouthCavity",
+        profile["overlay_radius_x"],
+        profile["cavity_radius_z"],
+        (0.006, 0.003, 0.003),
+    )
+    add_mouth_overlay(
+        "SandipaniIdleLipSeal",
+        profile["overlay_radius_x"] * 1.04,
+        profile["lip_radius_z"],
+        (0.055, 0.004, 0.003),
+        front_offset=-0.0030,
+    )
+    add_mouth_overlay(
+        "SandipaniIdleLipSealSeam",
+        profile["overlay_radius_x"] * 0.86,
+        0.00055,
+        (0.008, 0.002, 0.001),
+        front_offset=-0.0038,
+    )
+
+
 def scaled(key):
     return profile[key] * height
 
@@ -412,6 +550,37 @@ def lower_jaw_weight(point):
     )
     if point.z >= lower_lip_center_z:
         return 0.0
+    if profile.get("lower_lip_explicit_band"):
+        x_weight = 1.0 - smoothstep(
+            scaled("lower_lip_inner_x"),
+            scaled("lower_lip_outer_x"),
+            abs(point.x - mouth_center_x),
+        )
+        normalized_z = (point.z - minimum_z) / height
+        z_weight = smoothstep(
+            profile["lower_lip_min_z"],
+            profile["lower_lip_peak_min_z"],
+            normalized_z,
+        ) * (
+            1.0 - smoothstep(
+                profile["lower_lip_peak_max_z"],
+                profile["lower_lip_max_z"],
+                normalized_z,
+            )
+        )
+        normalized_y = point.y / height
+        front_weight = smoothstep(
+            profile["lip_front_y"],
+            profile["lip_peak_front_y"],
+            normalized_y,
+        ) * (
+            1.0 - smoothstep(
+                profile["lip_peak_back_y"],
+                profile["lip_back_y"],
+                normalized_y,
+            )
+        )
+        return max(0.0, x_weight * z_weight * front_weight)
     if profile.get("coherent_jaw_close"):
         x_weight = 1.0 - smoothstep(
             scaled("jaw_inner_x"),
@@ -523,7 +692,7 @@ def cheek_weight(point):
 
 
 def closed_pose(point, lip_weight, jaw_weight):
-    if "lip_peak_y" in profile:
+    if "lip_peak_y" in profile or profile.get("lower_lip_explicit_band"):
         lip_weight = jaw_weight
     if lip_weight <= 0.0 and jaw_weight <= 0.0:
         return point
@@ -572,7 +741,10 @@ def make_viseme(horizontal, openness, protrude=0.0, jaw_forward=0.0):
 
 
 def speech_cheek_pose(point, lip_weight, jaw_weight):
-    posed = closed_pose(point.copy(), lip_weight, jaw_weight)
+    # Cheeks are an independent additive speech target. Lip closure/opening
+    # is supplied by the active viseme, so duplicating it here would overdrive
+    # the mouth whenever both targets are blended at runtime.
+    posed = point.copy()
     weight = cheek_weight(point)
     if weight <= 0.0:
         return posed
@@ -585,21 +757,26 @@ def speech_cheek_pose(point, lip_weight, jaw_weight):
 
 def set_shape(shape, transform):
     for index, original in enumerate(points):
-        shape.data[index].co = world_to_mesh @ (
-            analysis_to_world @ transform(
-                original.copy(),
-                mouth_weight(original),
-                lower_jaw_weight(original),
-            )
+        transformed = transform(
+            original.copy(),
+            mouth_weight(original),
+            lower_jaw_weight(original),
         )
+        if (transformed - original).length_squared <= 1e-24:
+            # Preserve the exact source coordinate outside the facial mask.
+            # A matrix round-trip introduces tiny float noise that makes the
+            # glTF exporter serialize every vertex instead of sparse morphs.
+            shape.data[index].co = mesh.data.vertices[index].co
+        else:
+            shape.data[index].co = world_to_mesh @ (
+                analysis_to_world @ transformed
+            )
 
 
 basis = mesh.shape_key_add(name="Basis", from_mix=False)
-set_shape(basis, closed_pose)
 
 viseme_pp = mesh.shape_key_add(name="viseme_PP", from_mix=False)
-for index, point in enumerate(basis.data):
-    viseme_pp.data[index].co = point.co
+set_shape(viseme_pp, closed_pose)
 
 viseme_transforms = {
     "viseme_aa": make_viseme(-0.02, 0.82, jaw_forward=0.004),
@@ -715,13 +892,16 @@ if current_vertex_positions != original_vertex_positions:
     raise RuntimeError("Body base geometry changed while adding visemes")
 
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
+kept_objects = {mesh, armature, *facial_overlays}
 for scene_object in list(bpy.context.scene.objects):
-    if scene_object not in {mesh, armature}:
+    if scene_object not in kept_objects:
         bpy.data.objects.remove(scene_object, do_unlink=True)
 bpy.ops.object.select_all(action="DESELECT")
 mesh.select_set(True)
 if armature:
     armature.select_set(True)
+for overlay in facial_overlays:
+    overlay.select_set(True)
 bpy.context.view_layer.objects.active = armature or mesh
 bpy.ops.export_scene.gltf(
     filepath=output_path,
@@ -733,6 +913,15 @@ bpy.ops.export_scene.gltf(
     export_morph_tangent=False,
     export_image_format=os.environ.get("AVATAR_EXPORT_IMAGE_FORMAT", "AUTO"),
     export_image_quality=int(os.environ.get("AVATAR_EXPORT_IMAGE_QUALITY", "90")),
+    export_draco_mesh_compression_enable=(
+        os.environ.get("AVATAR_EXPORT_DRACO") == "1"
+    ),
+    export_draco_mesh_compression_level=6,
+    export_draco_position_quantization=14,
+    export_draco_normal_quantization=10,
+    export_draco_texcoord_quantization=12,
+    export_draco_color_quantization=10,
+    export_draco_generic_quantization=12,
 )
 
 print(

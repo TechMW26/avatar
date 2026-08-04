@@ -29,6 +29,16 @@ if model_path.lower().endswith(".fbx"):
 else:
     bpy.ops.import_scene.gltf(filepath=model_path)
 
+if os.environ.get("HIDE_MOUTH_OVERLAYS") == "1":
+    for scene_object in bpy.context.scene.objects:
+        if "MouthCavity" in scene_object.name or "IdleLipSeal" in scene_object.name:
+            scene_object.hide_render = True
+
+if os.environ.get("HIDE_MOUTH_CAVITY") == "1":
+    for scene_object in bpy.context.scene.objects:
+        if "MouthCavity" in scene_object.name:
+            scene_object.hide_render = True
+
 armatures = [
     obj for obj in bpy.context.scene.objects if obj.type == "ARMATURE"
 ]
