@@ -114,7 +114,16 @@ export function getCameraSelectorFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get("camera");
 }
 
-export function isDualDisplayMode(): boolean {
-  if (typeof window === "undefined") return false;
-  return new URLSearchParams(window.location.search).get("dual") === "1";
+export type DisplayCameraRole = "front" | "rear";
+
+/**
+ * Camera ownership is fixed by display role. Legacy index selectors are
+ * deliberately ignored so bookmarked URLs cannot swap the presentation and
+ * CV feeds. A device id or label remains available as an explicit override
+ * for installations whose OS enumerates cameras differently.
+ */
+export function getDisplayCameraSelector(role: DisplayCameraRole): string {
+  const requested = getCameraSelectorFromUrl()?.trim();
+  if (requested && !/^index:\d+$/i.test(requested)) return requested;
+  return role === "front" ? "index:1" : "index:0";
 }

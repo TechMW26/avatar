@@ -9,6 +9,9 @@ Run with Blender:
   blender --background --python scripts/add-visemes-to-preanimated-glb.py -- \
     <sandipani|rani-laxmi-bai|shivaji-maharaj> <input.glb> <output.glb> \
     [material-source.fbx]
+
+Set AVATAR_DECIMATE_RATIO (for example 0.38) only when producing the optional
+low-end bundle. Production bundles keep the supplied body mesh byte-for-byte.
 """
 
 import math
@@ -37,22 +40,22 @@ PROFILES = {
     "sandipani": {
         "analysis_yaw_degrees": 0.0,
         "mouth_x": 0.0,
-        "mouth_z": 0.8490,
+        "mouth_z": 0.8610,
         "mouth_radius_x": 0.0300,
         "mouth_inner_x": 0.0120,
         "top_inner_z": 0.0060,
         "top_outer_z": 0.0220,
         "bottom_inner_z": 0.0120,
         "bottom_outer_z": 0.0350,
-        "face_front_y": -0.1200,
-        "face_back_y": -0.0550,
+        "face_front_y": -0.0820,
+        "face_back_y": -0.0580,
         # Close the authored lower-lip seam in neutral without moving the
         # moustache, upper lip, beard, or jaw.
         "lower_close": 1.05,
         "upper_close": 0.0,
-        "lower_forward_close": -0.0060,
+        "lower_forward_close": -0.0015,
         "upper_forward_close": 0.0,
-        "closed_offset": 0.0090,
+        "closed_offset": -0.0010,
         "jaw_angle": 15.0,
         "jaw_front_y": -0.0737,
         "jaw_back_y": -0.0316,
@@ -68,12 +71,36 @@ PROFILES = {
         # mouth to the moustache and beard. Keep those authored surfaces
         # fixed during speech and articulate only the lower lip band.
         "lower_lip_visemes": True,
-        "lower_lip_open": 0.0180,
-        "lower_lip_center_offset_z": 0.0080,
+        "lower_lip_open": 0.0120,
+        "lower_lip_center_offset_z": 0.0,
         "lower_lip_inner_x": 0.0100,
         "lower_lip_outer_x": 0.0250,
         "lower_lip_inner_z": 0.0050,
         "lower_lip_outer_z": 0.0120,
+        # The visible lip sits just behind the moustache shell. Select a
+        # narrow depth band so speech never pulls beard/moustache triangles.
+        "lip_front_y": -0.0710,
+        "lip_peak_y": -0.0670,
+        "lip_back_y": -0.0620,
+        "cheek_inner_x": 0.0220,
+        "cheek_peak_x": 0.0430,
+        "cheek_outer_x": 0.0730,
+        "cheek_lower_z": 0.0080,
+        "cheek_peak_z": 0.0320,
+        "cheek_upper_z": 0.0700,
+        "cheek_out": 0.0022,
+        "cheek_up": 0.0018,
+        "cheek_forward": 0.0011,
+        # The supplied scan bakes a bright row of teeth into a compact set
+        # of mouth-cavity triangles. Split only those triangles onto a matte
+        # black material so speech reads as a hollow mouth, while lips,
+        # moustache, beard, skin, body, bones and animation remain untouched.
+        "dark_mouth_cavity": False,
+        "cavity_max_x": 0.0085,
+        "cavity_min_y": -0.0870,
+        "cavity_max_y": -0.0780,
+        "cavity_min_z": 0.8515,
+        "cavity_max_z": 0.8560,
     },
     "rani-laxmi-bai": {
         "mouth_z": 0.8760,
@@ -85,7 +112,7 @@ PROFILES = {
         "bottom_outer_z": 0.0140,
         "face_front_y": -0.0550,
         "face_back_y": -0.0250,
-        "lower_close": 1.05,
+        "lower_close": 1.0,
         "upper_close": 0.0,
         "lower_forward_close": -0.0015,
         "upper_forward_close": 0.0,
@@ -104,6 +131,24 @@ PROFILES = {
         # authored lower-lip band.
         "source_open_only": True,
         "source_open_scale": 1.12,
+        # This scan has sparse, asymmetric triangles around the lips. Reusing
+        # the authored open-mouth surface pinches one corner. Keep the upper
+        # lip fixed and articulate a compact, symmetric lower-lip band.
+        "lower_lip_visemes": True,
+        "lower_lip_open": 0.0140,
+        "lower_lip_inner_x": 0.0020,
+        "lower_lip_outer_x": 0.0180,
+        "lower_lip_inner_z": 0.0010,
+        "lower_lip_outer_z": 0.0120,
+        "cheek_inner_x": 0.0140,
+        "cheek_peak_x": 0.0290,
+        "cheek_outer_x": 0.0550,
+        "cheek_lower_z": 0.0060,
+        "cheek_peak_z": 0.0240,
+        "cheek_upper_z": 0.0580,
+        "cheek_out": 0.0018,
+        "cheek_up": 0.0015,
+        "cheek_forward": 0.0009,
     },
     "shivaji-maharaj": {
         "mouth_z": 0.8770,
@@ -115,7 +160,7 @@ PROFILES = {
         "bottom_outer_z": 0.0350,
         "face_front_y": -0.0711,
         "face_back_y": -0.0553,
-        "lower_close": 1.05,
+        "lower_close": 1.0,
         "upper_close": 0.0,
         "lower_forward_close": -0.0015,
         "upper_forward_close": 0.0,
@@ -129,20 +174,26 @@ PROFILES = {
         "jaw_outer_x": 0.1000,
         "jaw_bottom_z": 0.7263,
         "jaw_fade_z": 0.7737,
-        "jaw_upper_fade_z": 0.8450,
-        "coherent_jaw_close": True,
-        "rest_jaw_lift": 0.0060,
-        "rest_jaw_forward": -0.0010,
         "source_open_only": True,
         "source_open_scale": 1.22,
-        # Keep the upper face fixed. Move the connected lower lip, beard and
-        # jaw as one soft region so the generated topology does not tear.
+        # Keep the upper face, beard, neck and chest completely fixed. The
+        # previous broad jaw mask included tens of thousands of connected
+        # torso vertices and made the necklaces/chest pulse with speech.
         "lower_lip_visemes": True,
-        "lower_lip_open": 0.0120,
-        "lower_lip_inner_x": 0.0060,
-        "lower_lip_outer_x": 0.0220,
+        "lower_lip_open": 0.0240,
+        "lower_lip_inner_x": 0.0030,
+        "lower_lip_outer_x": 0.0260,
         "lower_lip_inner_z": 0.0010,
-        "lower_lip_outer_z": 0.0050,
+        "lower_lip_outer_z": 0.0120,
+        "cheek_inner_x": 0.0200,
+        "cheek_peak_x": 0.0420,
+        "cheek_outer_x": 0.0720,
+        "cheek_lower_z": 0.0080,
+        "cheek_peak_z": 0.0300,
+        "cheek_upper_z": 0.0640,
+        "cheek_out": 0.0021,
+        "cheek_up": 0.0017,
+        "cheek_forward": 0.0010,
     },
 }
 if profile_name not in PROFILES:
@@ -180,6 +231,22 @@ mesh = character_meshes[0]
 armature = armatures[0] if armatures else None
 if mesh.data.shape_keys:
     raise RuntimeError("Supplied model already contains facial morph targets")
+
+# Optional, deliberately separate low-end asset. The production path never
+# sets this variable, so the supplied character body remains untouched.
+decimate_ratio = float(os.environ.get("AVATAR_DECIMATE_RATIO", "1"))
+if decimate_ratio < 0.999:
+    if not 0.2 <= decimate_ratio <= 0.8:
+        raise RuntimeError("AVATAR_DECIMATE_RATIO must be between 0.2 and 0.8")
+    bpy.context.view_layer.objects.active = mesh
+    mesh.select_set(True)
+    modifier = mesh.modifiers.new(name="LowEndMesh", type="DECIMATE")
+    modifier.ratio = decimate_ratio
+    modifier.use_collapse_triangulate = True
+    # Decimate the bind mesh before the Armature modifier. Applying it below
+    # an evaluated pose would bake the current idle deformation into the body.
+    mesh.modifiers.move(len(mesh.modifiers) - 1, 0)
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
 
 if material_source_path:
     existing_objects = set(bpy.context.scene.objects)
@@ -261,6 +328,53 @@ if height <= 0.001:
 
 mouth_center_z = minimum_z + profile["mouth_z"] * height
 mouth_center_x = profile.get("mouth_x", 0.0) * height
+
+
+def darken_mouth_cavity():
+    if not profile.get("dark_mouth_cavity"):
+        return 0
+    selected_polygons = []
+
+    for polygon in mesh.data.polygons:
+        center = sum(
+            (points[index] for index in polygon.vertices),
+            points[polygon.vertices[0]] * 0.0,
+        ) / len(polygon.vertices)
+        normalized_x = (center.x - mouth_center_x) / height
+        normalized_y = center.y / height
+        normalized_z = (center.z - minimum_z) / height
+        if (
+            abs(normalized_x) > profile["cavity_max_x"]
+            or normalized_y < profile["cavity_min_y"]
+            or normalized_y > profile["cavity_max_y"]
+            or normalized_z < profile["cavity_min_z"]
+            or normalized_z > profile["cavity_max_z"]
+        ):
+            continue
+
+        selected_polygons.append(polygon)
+
+    if not selected_polygons:
+        raise RuntimeError("No Sandipani tooth polygons matched the cavity mask")
+
+    cavity_material = bpy.data.materials.new(name="MouthCavity")
+    cavity_material.diffuse_color = (0.002, 0.001, 0.001, 1.0)
+    cavity_material.use_nodes = True
+    principled = cavity_material.node_tree.nodes.get("Principled BSDF")
+    if principled:
+        principled.inputs["Base Color"].default_value = (0.002, 0.001, 0.001, 1.0)
+        principled.inputs["Roughness"].default_value = 0.92
+        principled.inputs["Metallic"].default_value = 0.0
+    mesh.data.materials.append(cavity_material)
+    cavity_index = len(mesh.data.materials) - 1
+    for polygon in selected_polygons:
+        polygon.material_index = cavity_index
+    return len(selected_polygons)
+
+
+darkened_cavity_polygons = darken_mouth_cavity()
+
+
 def scaled(key):
     return profile[key] * height
 
@@ -339,11 +453,24 @@ def lower_jaw_weight(point):
             scaled("lower_lip_outer_z"),
             lower_distance,
         )
-        front_weight = 1.0 - smoothstep(
-            scaled("face_front_y"),
-            scaled("face_back_y"),
-            point.y,
-        )
+        if "lip_peak_y" in profile:
+            front_weight = smoothstep(
+                scaled("lip_front_y"),
+                scaled("lip_peak_y"),
+                point.y,
+            ) * (
+                1.0 - smoothstep(
+                    scaled("lip_peak_y"),
+                    scaled("lip_back_y"),
+                    point.y,
+                )
+            )
+        else:
+            front_weight = 1.0 - smoothstep(
+                scaled("face_front_y"),
+                scaled("face_back_y"),
+                point.y,
+            )
         lower_lip_weight = smoothstep(
             0.0,
             max(0.0001, scaled("lower_lip_inner_z") * 0.45),
@@ -361,7 +488,43 @@ def lower_jaw_weight(point):
     return mouth_weight(point) * lower_lip_weight
 
 
+def cheek_weight(point):
+    """Compact bilateral cheek mask; excludes lips, nose, eyes and torso."""
+    horizontal = abs(point.x - mouth_center_x)
+    x_weight = smoothstep(
+        scaled("cheek_inner_x"),
+        scaled("cheek_peak_x"),
+        horizontal,
+    ) * (
+        1.0 - smoothstep(
+            scaled("cheek_peak_x"),
+            scaled("cheek_outer_x"),
+            horizontal,
+        )
+    )
+    vertical = point.z - mouth_center_z
+    z_weight = smoothstep(
+        scaled("cheek_lower_z"),
+        scaled("cheek_peak_z"),
+        vertical,
+    ) * (
+        1.0 - smoothstep(
+            scaled("cheek_peak_z"),
+            scaled("cheek_upper_z"),
+            vertical,
+        )
+    )
+    front_weight = 1.0 - smoothstep(
+        scaled("face_front_y"),
+        scaled("face_back_y"),
+        point.y,
+    )
+    return max(0.0, x_weight * z_weight * front_weight)
+
+
 def closed_pose(point, lip_weight, jaw_weight):
+    if "lip_peak_y" in profile:
+        lip_weight = jaw_weight
     if lip_weight <= 0.0 and jaw_weight <= 0.0:
         return point
     was_lower_lip = point.z < mouth_center_z
@@ -408,6 +571,18 @@ def make_viseme(horizontal, openness, protrude=0.0, jaw_forward=0.0):
     return transform
 
 
+def speech_cheek_pose(point, lip_weight, jaw_weight):
+    posed = closed_pose(point.copy(), lip_weight, jaw_weight)
+    weight = cheek_weight(point)
+    if weight <= 0.0:
+        return posed
+    side = -1.0 if point.x < mouth_center_x else 1.0
+    posed.x += side * scaled("cheek_out") * weight
+    posed.z += scaled("cheek_up") * weight
+    posed.y -= scaled("cheek_forward") * weight
+    return posed
+
+
 def set_shape(shape, transform):
     for index, original in enumerate(points):
         shape.data[index].co = world_to_mesh @ (
@@ -445,23 +620,37 @@ for name, transform in viseme_transforms.items():
     shape = mesh.shape_key_add(name=name, from_mix=False)
     set_shape(shape, transform)
 
+speech_cheek = mesh.shape_key_add(name="speech_CheekRaise", from_mix=False)
+set_shape(speech_cheek, speech_cheek_pose)
+
 for shape in mesh.data.shape_keys.key_blocks:
     shape.value = 0.0
     shape.slider_min = 0.0
     shape.slider_max = 1.0
 
-# Reject accidental cheek, chin, nose, or full-head deformation. Every
-# generated shape must be identical to the supplied mesh outside the soft
-# lip mask, and even lip displacement is bounded.
+# Reject accidental cheek, chin, nose, neck, chest, or full-head deformation.
+# Validate target deltas against the exported closed-mouth Basis, rather than
+# trusting the procedural weight mask itself: a bad mask is exactly what can
+# make a morph appear valid while still moving torso vertices.
 locality_epsilon = height * 0.000001
 maximum_lip_displacement = height * 0.065
+maximum_morph_vertices = 5_000
+anatomical_min_z = mouth_center_z - height * 0.055
+anatomical_max_z = mouth_center_z + height * 0.030
+anatomical_max_x = height * 0.060
 for shape in mesh.data.shape_keys.key_blocks:
+    affected_vertices = 0
+    is_cheek_shape = shape.name == "speech_CheekRaise"
     for index, original in enumerate(points):
         shaped = analysis_rotation @ (mesh_to_world @ shape.data[index].co)
         displacement = (shaped - original).length
+        allowed_weight = max(
+            mouth_weight(original),
+            lower_jaw_weight(original),
+            cheek_weight(original) if is_cheek_shape else 0.0,
+        )
         if (
-            mouth_weight(original) <= 0.000001
-            and lower_jaw_weight(original) <= 0.000001
+            allowed_weight <= 0.000001
             and displacement > locality_epsilon
         ):
             raise RuntimeError(
@@ -472,6 +661,36 @@ for shape in mesh.data.shape_keys.key_blocks:
                 f"{shape.name} exceeded safe lip displacement at vertex {index}: "
                 f"{displacement}"
             )
+        if shape != basis:
+            basis_point = analysis_rotation @ (
+                mesh_to_world @ basis.data[index].co
+            )
+            morph_displacement = (shaped - basis_point).length
+            if morph_displacement > locality_epsilon:
+                affected_vertices += 1
+                if is_cheek_shape:
+                    outside_region = (
+                        original.z < mouth_center_z + scaled("cheek_lower_z")
+                        or original.z > mouth_center_z + scaled("cheek_upper_z")
+                        or abs(original.x - mouth_center_x) > scaled("cheek_outer_x")
+                    )
+                else:
+                    outside_region = (
+                        original.z < anatomical_min_z
+                        or original.z > anatomical_max_z
+                        or abs(original.x - mouth_center_x) > anatomical_max_x
+                    )
+                if outside_region:
+                    raise RuntimeError(
+                        f"{shape.name} moved vertex {index} outside the "
+                        f"anatomical facial region by {morph_displacement}"
+                    )
+    target_vertex_limit = 12_000 if is_cheek_shape else maximum_morph_vertices
+    if shape != basis and affected_vertices > target_vertex_limit:
+        raise RuntimeError(
+            f"{shape.name} moved {affected_vertices} vertices; expected a "
+            f"face-local morph below {target_vertex_limit} vertices"
+        )
 
 current_bones = {
     bone.name: tuple(round(value, 8) for row in bone.matrix_local for value in row)
@@ -512,6 +731,8 @@ bpy.ops.export_scene.gltf(
     export_morph=True,
     export_morph_normal=False,
     export_morph_tangent=False,
+    export_image_format=os.environ.get("AVATAR_EXPORT_IMAGE_FORMAT", "AUTO"),
+    export_image_quality=int(os.environ.get("AVATAR_EXPORT_IMAGE_QUALITY", "90")),
 )
 
 print(
@@ -522,6 +743,7 @@ print(
         "bones_preserved": len(original_bones),
         "weights_preserved": current_weights == original_weights,
         "animations_preserved": original_actions,
+        "darkened_cavity_polygons": darkened_cavity_polygons,
         "visemes": [shape.name for shape in mesh.data.shape_keys.key_blocks],
     }
 )

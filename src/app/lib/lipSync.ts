@@ -37,7 +37,7 @@ interface VisemeCue {
 }
 
 const SILENCE_THRESHOLD = 0.018;
-const MAX_FALLBACK_INTENSITY = 0.52;
+const MAX_FALLBACK_INTENSITY = 0.68;
 const ALIGNMENT_PLAYBACK_LEAD_MS = 45;
 const ALIGNMENT_GRACE_MS = 120;
 const MIN_CUE_DURATION_MS = 32;
@@ -73,60 +73,60 @@ function cueForCharacter(
   const next = nextCharacter.normalize("NFC").toLowerCase();
 
   if (!character || CLOSED_OR_SILENT_PATTERN.test(character)) {
-    return { viseme: "viseme_PP", intensity: 0.34 };
+    return { viseme: "viseme_PP", intensity: 0.38 };
   }
   if (CLOSED_LIP_CHARS.has(character)) {
-    return { viseme: "viseme_PP", intensity: 0.5 };
+    return { viseme: "viseme_PP", intensity: 0.74 };
   }
   if (LABIODENTAL_CHARS.has(character)) {
-    return { viseme: "viseme_FF", intensity: 0.3 };
+    return { viseme: "viseme_FF", intensity: 0.46 };
   }
   if (
     TH_CHARS.has(character)
     || (character === "t" && next === "h")
   ) {
-    return { viseme: "viseme_TH", intensity: 0.28 };
+    return { viseme: "viseme_TH", intensity: 0.42 };
   }
   if (CH_CHARS.has(character)) {
-    return { viseme: "viseme_CH", intensity: 0.3 };
+    return { viseme: "viseme_CH", intensity: 0.48 };
   }
   if (DENTAL_CHARS.has(character)) {
-    return { viseme: "viseme_DD", intensity: 0.26 };
+    return { viseme: "viseme_DD", intensity: 0.42 };
   }
   if (VELAR_CHARS.has(character)) {
-    return { viseme: "viseme_kk", intensity: 0.28 };
+    return { viseme: "viseme_kk", intensity: 0.45 };
   }
   if (SIBILANT_CHARS.has(character)) {
-    return { viseme: "viseme_SS", intensity: 0.26 };
+    return { viseme: "viseme_SS", intensity: 0.42 };
   }
   if (NASAL_CHARS.has(character)) {
-    return { viseme: "viseme_nn", intensity: 0.24 };
+    return { viseme: "viseme_nn", intensity: 0.4 };
   }
   if (RHOTIC_CHARS.has(character) || RR_CHARS.has(character)) {
-    return { viseme: "viseme_RR", intensity: 0.26 };
+    return { viseme: "viseme_RR", intensity: 0.42 };
   }
   if (E_CHARS.has(character)) {
-    return { viseme: "viseme_E", intensity: 0.4 };
+    return { viseme: "viseme_E", intensity: 0.58 };
   }
   if (I_CHARS.has(character)) {
-    return { viseme: "viseme_I", intensity: 0.36 };
+    return { viseme: "viseme_I", intensity: 0.54 };
   }
   if (O_CHARS.has(character)) {
-    return { viseme: "viseme_O", intensity: 0.45 };
+    return { viseme: "viseme_O", intensity: 0.64 };
   }
   if (U_CHARS.has(character)) {
-    return { viseme: "viseme_U", intensity: 0.38 };
+    return { viseme: "viseme_U", intensity: 0.57 };
   }
   if (AA_CHARS.has(character)) {
-    return { viseme: "viseme_aa", intensity: 0.46 };
+    return { viseme: "viseme_aa", intensity: 0.66 };
   }
   if (character === "ह" || character === "h") {
-    return { viseme: "viseme_aa", intensity: 0.3 };
+    return { viseme: "viseme_aa", intensity: 0.48 };
   }
   if (character === "ं" || character === "ँ") {
-    return { viseme: "viseme_PP", intensity: 0.4 };
+    return { viseme: "viseme_PP", intensity: 0.6 };
   }
-  return { viseme: "viseme_DD", intensity: 0.2 };
+  return { viseme: "viseme_DD", intensity: 0.34 };
 }
 
 /**
@@ -182,7 +182,7 @@ export class PronunciationLipSync {
     if (this.cues.length > 0 || now <= this.queuedUntil + ALIGNMENT_GRACE_MS) {
       return {
         viseme: "viseme_PP",
-        intensity: 0.34,
+        intensity: 0.38,
         sentAt: Date.now(),
       };
     }
@@ -255,7 +255,7 @@ export function classifyViseme(
     // only as a bounded fallback when alignment data is unavailable.
     intensity: Math.min(
       MAX_FALLBACK_INTENSITY,
-      Math.max(0.14, 0.12 + Math.pow(spectralVolume / 0.55, 0.85) * 0.4),
+      Math.max(0.2, 0.17 + Math.pow(spectralVolume / 0.55, 0.85) * 0.52),
     ),
   };
 }

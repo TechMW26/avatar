@@ -13,8 +13,7 @@ import {
   type PreloadProgress,
 } from "../lib/avatarAssets";
 import {
-  getCameraSelectorFromUrl,
-  isDualDisplayMode,
+  getDisplayCameraSelector,
 } from "../lib/cameraDevices";
 import {
   useFrontDisplaySync,
@@ -266,17 +265,16 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   // browser will queue them after the user's first interaction with the
   // page (or, on most platforms, immediately).
   const [bootStage, setBootStage] = useState<"loading" | "ready">("loading");
-  const [modelReady, setModelReady] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [preloadProgress, setPreloadProgress] = useState<PreloadProgress | null>(null);
   const bootInFlightRef = useRef(false);
-  // In dual-display mode the rear window owns the CV camera and publishes
-  // detections here. The front window opens only the presentation camera.
-  // Standalone browser use keeps the original single-camera behavior.
-  const [dualDisplay, setDualDisplay] = useState(() => isDualDisplayMode());
-  const [cameraSelector, setCameraSelector] = useState(() => getCameraSelectorFromUrl());
-  const localVision = useVisionDetection({ enabled: !dualDisplay });
-  const remoteVision = useRemoteVision(dualDisplay);
+  // The rear page permanently owns the CV camera; this page permanently owns
+  // the presentation camera. The rear display is opened independently at the
+  // stable `/talk/back` URL and publishes detections here.
+  const dualDisplay = true;
+  const cameraSelector = getDisplayCameraSelector("front");
+  const localVision = useVisionDetection({ enabled: false });
+  const remoteVision = useRemoteVision(true);
   const frontCamera = useCameraFeed({
     enabled: dualDisplay,
     cameraSelector,
@@ -970,41 +968,6 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     void runPreload();
   }, [runPreload]);
 
-  // Browser development launcher: once the front avatar is actually ready,
-  // open the synchronized rear display and convert this page into the dual
-  // front role. Electron already owns both BrowserWindows, so it bypasses
-  // this popup path entirely.
-  useEffect(() => {
-    if (!modelReady || typeof window === "undefined") return;
-    const electronWindow = window as Window & { kiosk?: unknown };
-    if (electronWindow.kiosk) return;
-
-    const rearUrl = new URL("/talk/back", window.location.origin);
-    rearUrl.searchParams.set("dual", "1");
-    rearUrl.searchParams.set("camera", "index:1");
-    rearUrl.searchParams.set("character", character.slug);
-    const rearWindow = window.open(
-      rearUrl.toString(),
-      "rishi-rear-display",
-      `popup=yes,width=${window.screen.availWidth},height=${window.screen.availHeight}`,
-    );
-    if (!rearWindow) return;
-
-    if (!dualDisplay) {
-      const frontUrl = new URL(window.location.href);
-      frontUrl.searchParams.set("dual", "1");
-      frontUrl.searchParams.set("camera", "index:0");
-      frontUrl.searchParams.set("character", character.slug);
-      window.history.replaceState(null, "", frontUrl);
-      setCameraSelector("index:0");
-      setDualDisplay(true);
-    }
-
-    return () => rearWindow.close();
-    // Opening is intentionally tied to the first completed model mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [character.slug, modelReady]);
-
   return (
     <div className="h-screen flex flex-col" style={{ background: "transparent", position: "relative", overflow: "hidden" }}>
       {/* Live camera feed as full-screen background (also used for face/gesture detection) */}
@@ -1191,7 +1154,6 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
             viewMode="front"
             cameraVideoRef={dualDisplay ? frontCamera.videoRef : vision.videoRef}
             onAnimationStateChange={publishAvatarState}
-            onReady={() => setModelReady(true)}
           />
         ) : null}
       </div>
@@ -1489,11 +1451,6 @@ export default function TalkPage() {
       window.localStorage.removeItem(CHARACTER_STORAGE_KEY);
       void updateRemoteCharacter(null, "display-refresh").finally(() => {
         const selectionUrl = new URL("/", window.location.origin);
-        const current = new URL(window.location.href);
-        const dual = current.searchParams.get("dual");
-        const camera = current.searchParams.get("camera");
-        if (dual) selectionUrl.searchParams.set("dual", dual);
-        if (camera) selectionUrl.searchParams.set("camera", camera);
         window.location.replace(selectionUrl);
       });
       return;
@@ -1510,11 +1467,6 @@ export default function TalkPage() {
     if (!remoteControl.state.character) {
       window.localStorage.removeItem(CHARACTER_STORAGE_KEY);
       const selectionUrl = new URL("/", window.location.origin);
-      const current = new URL(window.location.href);
-      const dual = current.searchParams.get("dual");
-      const camera = current.searchParams.get("camera");
-      if (dual) selectionUrl.searchParams.set("dual", dual);
-      if (camera) selectionUrl.searchParams.set("camera", camera);
       window.location.replace(selectionUrl);
       return;
     }
@@ -1523,12 +1475,7 @@ export default function TalkPage() {
       const selected = getCharacter(remoteControl.state.character);
       window.localStorage.setItem(CHARACTER_STORAGE_KEY, selected.slug);
       const talkUrl = new URL("/talk", window.location.origin);
-      const current = new URL(window.location.href);
       talkUrl.searchParams.set("character", selected.slug);
-      const dual = current.searchParams.get("dual");
-      const camera = current.searchParams.get("camera");
-      if (dual) talkUrl.searchParams.set("dual", dual);
-      if (camera) talkUrl.searchParams.set("camera", camera);
       window.location.replace(talkUrl);
     }
   }, [character, remoteControl.state]);

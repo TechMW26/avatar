@@ -16,14 +16,8 @@ import styles from "./selection.module.css";
 function navigateToCharacter(character: CharacterProfile) {
   window.localStorage.setItem(CHARACTER_STORAGE_KEY, character.slug);
 
-  const current = new URL(window.location.href);
   const talkUrl = new URL("/talk", window.location.origin);
   talkUrl.searchParams.set("character", character.slug);
-
-  const dual = current.searchParams.get("dual");
-  const camera = current.searchParams.get("camera");
-  if (dual) talkUrl.searchParams.set("dual", dual);
-  if (camera) talkUrl.searchParams.set("camera", camera);
 
   window.location.assign(talkUrl);
 }

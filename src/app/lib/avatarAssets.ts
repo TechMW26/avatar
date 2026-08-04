@@ -21,7 +21,8 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v41";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v47";
+const ASSET_CACHE_PREFIX = "rishi-avatar-fbx-v";
 
 let cachedRuntimeAssetCacheName: string | null = null;
 let cachePrunePromise: Promise<void> | null = null;
@@ -42,7 +43,7 @@ export async function ensureFreshAssetCache(): Promise<string> {
       try {
         const keys = await caches.keys();
         const stale = keys.filter(
-          (k) => k === ASSET_CACHE_NAME || (k.startsWith(`${ASSET_CACHE_NAME}-`) && k !== activeName),
+          (key) => key.startsWith(ASSET_CACHE_PREFIX) && key !== activeName,
         );
         if (stale.length) {
           await Promise.all(stale.map((k) => caches.delete(k)));
@@ -100,9 +101,12 @@ export const AVATAR_GESTURE_PATHS = {
 } as const;
 
 export const AVATAR_ASSETS: AvatarAssetSpec[] = [
-  { path: "/models/sandipani.glb", estBytes: 50 * 1024 * 1024 },
+  { path: "/models/sandipani.glb", estBytes: 31 * 1024 * 1024 },
   { path: "/models/rani-laxmi-bai.glb", estBytes: 49 * 1024 * 1024 },
   { path: "/models/shivaji-maharaj.glb", estBytes: 57 * 1024 * 1024 },
+  { path: "/models/sandipani-lite.glb", estBytes: 8 * 1024 * 1024 },
+  { path: "/models/rani-laxmi-bai-lite.glb", estBytes: 11 * 1024 * 1024 },
+  { path: "/models/shivaji-maharaj-lite.glb", estBytes: 13 * 1024 * 1024 },
   { path: AVATAR_GESTURE_PATHS.waving, estBytes: 572 * 1024 },
   { path: AVATAR_GESTURE_PATHS.praying, estBytes: 97 * 1024 },
   { path: AVATAR_GESTURE_PATHS.explaining, estBytes: 534 * 1024 },
@@ -121,6 +125,9 @@ const AVATAR_MODEL_PATHS = new Set([
   "/models/sandipani.glb",
   "/models/rani-laxmi-bai.glb",
   "/models/shivaji-maharaj.glb",
+  "/models/sandipani-lite.glb",
+  "/models/rani-laxmi-bai-lite.glb",
+  "/models/shivaji-maharaj-lite.glb",
 ]);
 
 function hashString(input: string): string {
@@ -153,6 +160,8 @@ export interface DeviceProfile {
   tier: DeviceTier;
   /** WebGL `dpr` cap passed to `<Canvas>` — e.g. `[1, 1.5]` on iOS. */
   maxDpr: number;
+  /** Lowest DPR selected by the sustained-load controller. */
+  minDpr: number;
   /** Whether MSAA can be enabled on the WebGL context. */
   antialias: boolean;
   /** Whether the renderer should compute shadow maps. */
@@ -176,7 +185,7 @@ export interface DeviceProfile {
    *  the lighting is mostly directional + ambient. */
   enableNormalMap: boolean;
   /** Number of directional/point lights to render. Each light adds a
-   *  uniform fetch + lighting calc per fragment, so dropping from 5 to 2
+   *  uniform fetch + lighting calc per fragment, so dropping from 3 to 2
    *  on mid and 1 on low gives a measurable mobile-GPU win. */
   maxLights: number;
   /** Render frame cap. 60 fps on high, 30 fps on mid, 24 fps on low.
@@ -210,96 +219,70 @@ function isHandheldDevice(): boolean {
   return isiPadOsPretendingMac || /android|iphone|ipad|ipod|mobile|tablet/i.test(ua);
 }
 
-/**
- * Returns a single, fixed render profile used for **every** device.
- *
- * Rationale:
- *   We previously bucketed devices into low / mid / high based on
- *   `deviceMemory`, GPU vendor strings, iOS UA sniffs, etc. The
- *   bucketing was unreliable (Mali-G5x, Adreno 6xx, iPad Pros all
- *   ended up downgraded) and produced visibly different quality on
- *   identical hardware. Worse, every "lower the quality" lever (DPR,
- *   texture downsample, anisotropy=1) made the avatar look pixelated
- *   on retina screens *without* materially improving frame rate —
- *   because the bottleneck on this scene is per-fragment cost, not
- *   pixel count.
- *
- *   The profile below picks the cheapest *per-fragment* settings
- *   (no MSAA, no shadows, no env reflections, no normal map, fewer
- *   lights, no ground shadow disc, FrontSide only) while keeping
- *   *visual* quality high (DPR up to 2, anisotropy 4, full-resolution
- *   diffuse textures, ACES tone mapping, sRGB output). This runs
- *   smoothly on a 2-year-old budget Android *and* looks crisp on an
- *   iPhone Pro at retina DPR.
- */
 export function getDeviceProfile(): DeviceProfile {
   if (cachedProfile) return cachedProfile;
 
   const handheld = isHandheldDevice();
+  const runtimeNavigator = typeof navigator !== "undefined" ? navigator : null;
+  const memory = (
+    runtimeNavigator as (Navigator & { deviceMemory?: number }) | null
+  )?.deviceMemory;
+  const cores = runtimeNavigator?.hardwareConcurrency || (handheld ? 4 : 8);
+  const tier: DeviceTier = (memory !== undefined && memory <= 2) || cores <= 2
+    ? "low"
+    : handheld || (memory !== undefined && memory <= 4) || cores <= 4
+      ? "mid"
+      : "high";
 
   const profile: DeviceProfile = {
-    // Tier is pinned to "high" so the few `tier === "high"` checks
-    // sprinkled in the renderer (e.g. shader precision = "highp",
-    // stencil buffer enabled) preserve visual quality. The actual
-    // performance levers below are what matters.
-    tier: "high",
-    // Handhelds use true 1x DPR; desktops can afford a modest bump.
-    maxDpr: handheld ? 1 : 1.3,
-    // No MSAA — biggest single mobile-GPU memory tax. We rely on
-    // high DPR for edge crispness instead (1px at 2x ≈ 0.5px,
-    // visually equivalent to 2x MSAA at 1x DPR).
-    antialias: false,
-    // No shadow maps — they require an extra render pass, depth
-    // texture upload, and per-fragment shadow sample. Avatar reads
-    // fine with the soft ground disc removed.
+    tier,
+    minDpr: tier === "low" ? 0.65 : tier === "mid" ? 0.85 : 1,
+    maxDpr: tier === "low" ? 0.85 : tier === "mid" ? 1.1 : 1.5,
+    antialias: tier === "high",
     shadows: false,
-    // Lowest anisotropy keeps texture sampling cost minimal.
-    anisotropy: 1,
-    // High-performance hint — picks discrete GPU on laptops, and the
-    // perf-cluster on mobile SoCs.
-    powerPreference: "high-performance",
-    toneMappingExposure: 1.1,
-    // FrontSide only — avatar is a closed mesh, back-faces are never
-    // visible. Cuts per-pixel fragment work roughly in half on the
-    // skinned mesh.
-    doubleSide: false,
-    // No normal map — TBN matrix + normal-map sample is one of the
-    // priciest per-fragment ops. Lighting still reads correctly with
-    // diffuse + ambient + a single directional.
-    enableNormalMap: false,
-    // Single directional + ambient keeps skin readable while minimizing
-    // per-fragment lighting cost.
-    maxLights: 1,
-    // Force 30 fps pacing for stable thermals and lower battery drain.
-    targetFps: 30,
-    // No environment reflections — PBR cubemap sampling is expensive
-    // and the avatar's robe/skin are matte enough that reflections
-    // add nothing visible.
-    enableEnvReflections: false,
-    // Handhelds use a tighter texture budget to reduce upload and VRAM.
-    maxTextureSize: handheld ? 768 : 1024,
-    // mediump materially reduces shader ALU pressure on budget phones.
-    shaderPrecision: "mediump",
-    // The avatar is normalized from its evaluated Mixamo idle pose and its
-    // Hips translation is frozen in-place, so chasing toe-bone pivots would
-    // reintroduce vertical bob and can bury the actual sole in the ground.
+    anisotropy: tier === "low" ? 1 : tier === "mid" ? 2 : 4,
+    powerPreference: tier === "low" ? "low-power" : "high-performance",
+    toneMappingExposure: tier === "high" ? 1.02 : 1.06,
+    doubleSide: tier === "high",
+    enableNormalMap: tier !== "low",
+    maxLights: tier === "low" ? 1 : tier === "mid" ? 2 : 3,
+    targetFps: tier === "low" ? 24 : tier === "mid" ? 30 : 60,
+    enableEnvReflections: tier === "high",
+    maxTextureSize: tier === "low" ? 512 : tier === "mid" ? 1024 : 2048,
+    shaderPrecision: tier === "high" ? "highp" : "mediump",
     enableFootClamp: false,
   };
 
   cachedProfile = profile;
   if (typeof console !== "undefined") {
-    console.log("[avatarAssets] using uniform render profile:", profile);
+    console.log("[avatarAssets] using adaptive render profile:", profile);
   }
   return profile;
 }
 
+const LOW_END_AVATARS: Record<string, string> = {
+  "/models/sandipani.glb": "/models/sandipani-lite.glb",
+  "/models/rani-laxmi-bai.glb": "/models/rani-laxmi-bai-lite.glb",
+  "/models/shivaji-maharaj.glb": "/models/shivaji-maharaj-lite.glb",
+};
+
+export function getOptimizedAvatarPath(
+  avatarPath: string,
+  profile: DeviceProfile = getDeviceProfile(),
+): string {
+  return profile.tier !== "high"
+    ? LOW_END_AVATARS[avatarPath] ?? avatarPath
+    : avatarPath;
+}
+
 /** Build the asset queue for the selected pre-animated character. */
 export function getAssetQueueForProfile(
-  _profile: DeviceProfile,
+  profile: DeviceProfile,
   avatarPath = "/models/sandipani.glb",
 ): AvatarAssetSpec[] {
+  const resolvedAvatarPath = getOptimizedAvatarPath(avatarPath, profile);
   return AVATAR_ASSETS.filter(
-    (asset) => !AVATAR_MODEL_PATHS.has(asset.path) || asset.path === avatarPath,
+    (asset) => !AVATAR_MODEL_PATHS.has(asset.path) || asset.path === resolvedAvatarPath,
   );
 }
 

@@ -9,8 +9,8 @@
  *   3. `node scripts/upload-fbx-to-blob.mjs`
  *
  * The script:
- *   - Uploads the three active character models, FluffyGrass assets, and
- *     compact shared gesture clips.
+ *   - Uploads the three full-detail characters, their low-end variants,
+ *     FluffyGrass assets, and compact shared gesture clips.
  *   - Keeps their paths stable in Blob with
  *     `addRandomSuffix: false` so the URLs are stable across re-uploads.
  *   - At the end, prints a single `NEXT_PUBLIC_ASSET_BASE_URL=…` line you
@@ -28,6 +28,9 @@ const KNOWN_ASSETS = [
   'models/sandipani.glb',
   'models/rani-laxmi-bai.glb',
   'models/shivaji-maharaj.glb',
+  'models/sandipani-lite.glb',
+  'models/rani-laxmi-bai-lite.glb',
+  'models/shivaji-maharaj-lite.glb',
   'grass/grassLODs.glb',
   'grass/grass.jpeg',
   'grass/perlinnoise.webp',

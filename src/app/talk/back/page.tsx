@@ -4,7 +4,7 @@
 import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
 import { useVisionDetection } from "../../hooks/useVisionDetection";
-import { getCameraSelectorFromUrl } from "../../lib/cameraDevices";
+import { getDisplayCameraSelector } from "../../lib/cameraDevices";
 import { preloadAvatarAssets } from "../../lib/avatarAssets";
 import { useRearDisplaySync } from "../../lib/displaySync";
 import {
@@ -14,15 +14,12 @@ import {
   isCharacterSlug,
   type CharacterProfile,
 } from "../../lib/characters";
-import {
-  updateRemoteCharacter,
-  useRemoteControlState,
-} from "../../hooks/useRemoteControl";
+import { useRemoteControlState } from "../../hooks/useRemoteControl";
 
 const Avatar3D = dynamic(() => import("../../components/Avatar3D"), { ssr: false });
 
 export default function BackDisplayPage() {
-  const cameraSelector = getCameraSelectorFromUrl();
+  const cameraSelector = getDisplayCameraSelector("rear");
   const vision = useVisionDetection({
     enabled: true,
     cameraSelector,
@@ -35,16 +32,6 @@ export default function BackDisplayPage() {
   const remoteControl = useRemoteControlState();
 
   useEffect(() => {
-    const navigationEntry = performance.getEntriesByType("navigation")[0] as
-      | PerformanceNavigationTiming
-      | undefined;
-    if (navigationEntry?.type === "reload") {
-      window.localStorage.removeItem(CHARACTER_STORAGE_KEY);
-      setCharacter(null);
-      void updateRemoteCharacter(null, "display-refresh");
-      return;
-    }
-
     const selected = getOptionalCharacterFromLocation();
     setCharacter(selected);
 

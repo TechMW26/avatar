@@ -20,6 +20,7 @@ import {
   assetUrl,
   ensureFreshAssetCache,
   getDeviceProfile,
+  getOptimizedAvatarPath,
 } from "../lib/avatarAssets";
 import type {
   AvatarAnimationCommand,
@@ -32,9 +33,26 @@ import {
 } from "../lib/lipSync";
 
 const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
-const LIP_SYNC_OPEN_GAIN = 1.22;
-const LIP_SYNC_CLOSURE_GAIN = 1.08;
-const MAX_LIP_SYNC_INFLUENCE = 0.68;
+const LIP_SYNC_OPEN_GAIN = 1.28;
+const LIP_SYNC_CLOSURE_GAIN = 1.16;
+const MAX_LIP_SYNC_INFLUENCE = 0.84;
+const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
+const CHEEK_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
+  viseme_PP: 0,
+  viseme_FF: 0.18,
+  viseme_TH: 0.2,
+  viseme_DD: 0.2,
+  viseme_kk: 0.2,
+  viseme_CH: 0.28,
+  viseme_SS: 0.24,
+  viseme_nn: 0.18,
+  viseme_RR: 0.24,
+  viseme_aa: 0.42,
+  viseme_E: 0.46,
+  viseme_I: 0.48,
+  viseme_O: 0.3,
+  viseme_U: 0.26,
+};
 
 type AvatarAnimState = AvatarAnimationState;
 
@@ -97,6 +115,10 @@ const SAME_GESTURE_COOLDOWN_MS = 4_500;
    frustum so feet/grass stay visible after resizing on both displays. */
 const MODEL_NORMALIZED_HEIGHT = 2.45;
 const GROUND_SAFE_MARGIN = 0.025;
+// The semicircle recedes from the camera, so its visible front edge projects
+// slightly above the mathematical viewport floor. Overscan the patch below
+// the frame to keep grass flush with the physical screen edge at every ratio.
+const GROUND_VIEWPORT_BLEED = 0.055;
 const CLOSE_SCREEN_HEIGHT = 0.875;
 const FAR_SCREEN_HEIGHT = 0.875;
 // Sit dip — the Mixamo sit clip rotates the legs into a cross-leg position
@@ -116,6 +138,12 @@ function getGroundY(camera: THREE.Camera, z: number): number {
   const visibleHeight = getVisibleHeightAtZ(camera, z);
   return camera.position.y - visibleHeight / 2
     + visibleHeight * GROUND_SAFE_MARGIN;
+}
+
+function getViewportBottomY(camera: THREE.Camera, z: number): number {
+  const visibleHeight = getVisibleHeightAtZ(camera, z);
+  return camera.position.y - visibleHeight / 2
+    - visibleHeight * GROUND_VIEWPORT_BLEED;
 }
 
 function getScaleForScreenHeight(
@@ -759,6 +787,10 @@ function AvatarModel({
               mesh.morphTargetInfluences[index] = 0;
             }
           }
+          const cheekIndex = mesh.morphTargetDictionary[SPEECH_CHEEK_MORPH];
+          if (cheekIndex !== undefined) {
+            mesh.morphTargetInfluences[cheekIndex] = 0;
+          }
         }
         if (
           (mesh as THREE.SkinnedMesh).isSkinnedMesh
@@ -770,18 +802,52 @@ function AvatarModel({
         mats.forEach((mat, materialIndex) => {
           const source = mat as THREE.MeshStandardMaterial;
           const hasMorphTargets = Boolean((mesh as THREE.Mesh).morphTargetInfluences?.length);
-          const m = new THREE.MeshLambertMaterial({
+          const common = {
             name: source.name,
             color: source.color?.clone?.() ?? new THREE.Color(0xffffff),
             map: source.map ?? null,
-            emissive: new THREE.Color(0x000000),
             transparent: source.transparent ?? false,
             opacity: source.opacity ?? 1,
             alphaTest: source.alphaTest ?? 0,
             side: source.side ?? THREE.FrontSide,
             fog: source.fog ?? true,
-          });
-          const fastMaterial = m as THREE.MeshLambertMaterial & {
+          };
+          const m = matProfile.tier === "low"
+            ? new THREE.MeshLambertMaterial({
+                ...common,
+                emissive: new THREE.Color(0x000000),
+              })
+            : matProfile.tier === "high"
+            ? new THREE.MeshPhysicalMaterial({
+                ...common,
+                emissive: new THREE.Color(0x000000),
+                metalness: 0,
+                roughness: 0.44,
+                clearcoat: 0.08,
+                clearcoatRoughness: 0.72,
+                ior: 1.4,
+                specularIntensity: 0.42,
+                // The baked albedo contains the model's real fine skin and
+                // cloth detail. Reusing it as a very subtle height map adds
+                // pores, creases and weave without another large texture.
+                bumpMap: matProfile.enableNormalMap ? source.map ?? null : null,
+                bumpScale: 0.032,
+                normalMap: matProfile.enableNormalMap ? source.normalMap : null,
+                normalScale: new THREE.Vector2(0.3, 0.3),
+                envMapIntensity: matProfile.enableEnvReflections ? 0.26 : 0,
+              })
+            : new THREE.MeshStandardMaterial({
+                ...common,
+                emissive: new THREE.Color(0x000000),
+                metalness: 0,
+                roughness: 0.52,
+                bumpMap: matProfile.enableNormalMap ? source.map ?? null : null,
+                bumpScale: 0.016,
+                normalMap: matProfile.enableNormalMap ? source.normalMap : null,
+                normalScale: new THREE.Vector2(0.16, 0.16),
+                envMapIntensity: matProfile.enableEnvReflections ? 0.14 : 0,
+              });
+          const fastMaterial = m as (THREE.MeshLambertMaterial | THREE.MeshStandardMaterial) & {
             skinning: boolean;
             morphTargets?: boolean;
           };
@@ -791,6 +857,33 @@ function AvatarModel({
           m.depthTest = source.depthTest;
           m.vertexColors = source.vertexColors;
           m.toneMapped = source.toneMapped;
+          if (m.map && matProfile.tier !== "low") {
+            const textureBias = matProfile.tier === "high" ? "-0.42" : "-0.24";
+            const contrast = matProfile.tier === "high" ? "1.11" : "1.07";
+            const grain = matProfile.tier === "high" ? "0.026" : "0.014";
+            m.onBeforeCompile = (shader) => {
+              shader.fragmentShader = shader.fragmentShader.replace(
+                "#include <map_fragment>",
+                `
+#ifdef USE_MAP
+  vec4 sampledDiffuseColor = texture2D(map, vMapUv, ${textureBias});
+  float surfaceGrain = fract(
+    sin(dot(floor(vMapUv * 2048.0), vec2(12.9898, 78.233))) * 43758.5453
+  );
+  sampledDiffuseColor.rgb = clamp(
+    (sampledDiffuseColor.rgb - 0.5) * ${contrast} + 0.5
+      + (surfaceGrain - 0.5) * ${grain},
+    0.0,
+    1.0
+  );
+  diffuseColor *= sampledDiffuseColor;
+#endif
+                `,
+              );
+            };
+            m.customProgramCacheKey = () =>
+              `avatar-surface-v2-${matProfile.tier}`;
+          }
           mats[materialIndex] = m;
           source.dispose?.();
 
@@ -800,8 +893,10 @@ function AvatarModel({
             // GPUs whose max is often 4 or 8 anyway. Source from the
             // device profile so low/mid tiers get 1–2 instead.
             m.map.anisotropy = matProfile.anisotropy;
-            m.map.generateMipmaps = false;
-            m.map.minFilter = THREE.LinearFilter;
+            m.map.generateMipmaps = matProfile.tier !== "low";
+            m.map.minFilter = matProfile.tier === "low"
+              ? THREE.LinearFilter
+              : THREE.LinearMipmapLinearFilter;
             m.map.magFilter = THREE.LinearFilter;
             // Downsample oversized diffuse textures on mobile. The
             // Meshy-baked skin maps ship as 2048² or 4096² which is
@@ -823,8 +918,7 @@ function AvatarModel({
           // Meshy clothing is a thin, single-shell surface. Large shoulder
           // poses can expose its reverse side even with correct skinning,
           // so keep GLB character materials double-sided.
-          const isMeshyCharacter = /\.gl(?:b|tf)(?:$|\?)/i.test(avatarUrl);
-          m.side = isMeshyCharacter || matProfile.doubleSide
+          m.side = matProfile.doubleSide
             ? THREE.DoubleSide
             : THREE.FrontSide;
           m.needsUpdate = true;
@@ -967,7 +1061,7 @@ function AvatarModel({
       }
       const ground = groundRef.current;
       if (grp && ground) {
-        ground.position.set(0, getGroundY(camera, grp.position.z), grp.position.z);
+        ground.position.set(0, getViewportBottomY(camera, grp.position.z), grp.position.z);
         ground.scale.copy(grp.scale);
       }
       notify(initialState);
@@ -1005,7 +1099,7 @@ function AvatarModel({
       }
       const ground = groundRef.current;
       if (grp && ground) {
-        ground.position.set(0, getGroundY(camera, grp.position.z), grp.position.z);
+        ground.position.set(0, getViewportBottomY(camera, grp.position.z), grp.position.z);
         ground.scale.copy(grp.scale);
       }
       notify(initialState);
@@ -1077,7 +1171,7 @@ function AvatarModel({
   const footClampTickRef = useRef(0);
   useFrame((_, delta) => {
     const baseFrameMs = targetFrameMs;
-    const maxFrameMs = 1000 / 30; // never drop below 30fps pacing
+    const maxFrameMs = 1000 / 15;
     const observedMs = delta * 1000;
     if (observedMs > adaptiveFrameMsRef.current * 1.6) {
       overBudgetStreakRef.current += 1;
@@ -1103,11 +1197,11 @@ function AvatarModel({
     frameAccumRef.current = 0;
     delta = stepDelta;
 
-    /* ── Audio-driven visemes ──
-       The front display classifies ElevenLabs' live output spectrum. The
-       rear display consumes the same timestamped frame over BroadcastChannel.
-       Every target returns to zero when speech stops, so the authored
-       closed-mouth Basis is always the resting pose. */
+    /* ── Timed speech animation ──
+       ElevenLabs character alignment drives phoneme-like visemes; spectrum
+       classification is only the bounded fallback. The rear consumes the
+       same timestamped frame. Vowel/consonant-specific cheek activation adds
+       co-articulation while every target still returns to the neutral Basis. */
     const lipNow = performance.now();
     const remoteFrame = getLipSyncFrameRef.current?.() ?? null;
     const classified = remoteFrame
@@ -1148,6 +1242,10 @@ function AvatarModel({
       : 0;
     const closingLips = !mouthOpen || activeViseme === "viseme_PP";
     const mouthBlend = 1 - Math.exp(-delta * (closingLips ? 42 : 18));
+    const cheekTarget = mouthOpen
+      ? Math.min(0.38, activeIntensity * CHEEK_VISEME_GAIN[activeViseme])
+      : 0;
+    const cheekBlend = 1 - Math.exp(-delta * (mouthOpen ? 12 : 24));
     for (const mesh of lipSyncMeshesRef.current) {
       const dictionary = mesh.morphTargetDictionary;
       const influences = mesh.morphTargetInfluences;
@@ -1161,6 +1259,12 @@ function AvatarModel({
             : 0
           : 0;
         influences[index] += (targetInfluence - influences[index]) * mouthBlend;
+      }
+      const cheekIndex = dictionary[SPEECH_CHEEK_MORPH];
+      if (cheekIndex !== undefined) {
+        influences[cheekIndex] += (
+          cheekTarget - influences[cheekIndex]
+        ) * cheekBlend;
       }
     }
     if (onLipSyncFrameRef.current && lipNow - lastPublishedLipFrameRef.current >= 33) {
@@ -1348,7 +1452,7 @@ function AvatarModel({
       );
       const ground = groundRef.current;
       if (ground) {
-        ground.position.set(0, getGroundY(camera, grp.position.z), grp.position.z);
+        ground.position.set(0, getViewportBottomY(camera, grp.position.z), grp.position.z);
         ground.scale.copy(grp.scale);
       }
 
@@ -1837,12 +1941,14 @@ function AvatarModel({
 const FLUFFY_GRASS_VERTEX_SHADER = /* glsl */ `
   uniform sampler2D uNoiseTexture;
   uniform float uTime;
+  uniform float uPatchRadius;
   varying vec2 vUv;
   varying vec2 vGlobalUv;
 
   void main() {
     vec4 instancePosition = instanceMatrix * vec4(position, 1.0);
-    vGlobalUv = (instancePosition.xz + vec2(0.66)) / 1.32;
+    vGlobalUv = (instancePosition.xz + vec2(uPatchRadius))
+      / max(0.001, 2.0 * uPatchRadius);
     vec4 noise = texture2D(
       uNoiseTexture,
       vGlobalUv * 1.5 + vec2(uTime * 0.001, uTime * 0.0007)
@@ -1894,11 +2000,16 @@ const FLUFFY_GRASS_FRAGMENT_SHADER = /* glsl */ `
 `;
 
 function GroundPatch() {
+  const patchRef = useRef<THREE.Group>(null);
+  const groundDiscRef = useRef<THREE.Mesh>(null);
   const grassRef = useRef<THREE.InstancedMesh>(null);
   const grassMaterialRef = useRef<THREE.ShaderMaterial>(null);
+  const lastPatchRadiusRef = useRef(0);
+  const patchWorldPositionRef = useRef(new THREE.Vector3());
+  const patchWorldScaleRef = useRef(new THREE.Vector3(1, 1, 1));
   const profile = useMemo(() => getDeviceProfile(), []);
   const clumpCount =
-    profile.tier === "high" ? 280 : profile.tier === "mid" ? 170 : 96;
+    profile.tier === "high" ? 1200 : profile.tier === "mid" ? 700 : 360;
   const fluffyGrassScene = readAvatarScene("/grass/grassLODs.glb");
   const grassAlphaTexture = useLoader(
     THREE.TextureLoader,
@@ -1950,6 +2061,36 @@ function GroundPatch() {
     texture.needsUpdate = true;
     return texture;
   }, []);
+  const contactShadowTexture = useMemo(() => {
+    const size = 96;
+    const data = new Uint8Array(size * size * 4);
+
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const nx = (x + 0.5 - size / 2) / (size / 2);
+        const ny = (y + 0.5 - size / 2) / (size / 2);
+        const radius = Math.sqrt(nx * nx + ny * ny);
+        const falloff = 1 - THREE.MathUtils.smoothstep(radius, 0.08, 1);
+        const offset = (y * size + x) * 4;
+        data[offset] = 0;
+        data[offset + 1] = 0;
+        data[offset + 2] = 0;
+        data[offset + 3] = Math.round(158 * Math.pow(falloff, 1.55));
+      }
+    }
+
+    const texture = new THREE.DataTexture(
+      data,
+      size,
+      size,
+      THREE.RGBAFormat,
+      THREE.UnsignedByteType,
+    );
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.needsUpdate = true;
+    return texture;
+  }, []);
   const grassGeometry = useMemo(() => {
     let sourceGeometry: THREE.BufferGeometry | null = null;
     fluffyGrassScene.traverse((object) => {
@@ -1971,6 +2112,7 @@ function GroundPatch() {
   const grassUniforms = useMemo(
     () => ({
       uTime: { value: 0 },
+      uPatchRadius: { value: 1 },
       uGrassAlphaTexture: { value: grassAlphaTexture },
       uNoiseTexture: { value: noiseTexture },
       uBaseColor: { value: new THREE.Color("#313f1b") },
@@ -1979,6 +2121,24 @@ function GroundPatch() {
     }),
     [grassAlphaTexture, noiseTexture],
   );
+  const normalizedClumps = useMemo(() => {
+    let seed = 0x9e3779b9;
+    const random = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return seed / 0xffffffff;
+    };
+
+    return Array.from({ length: clumpCount }, () => {
+      const angle = random() * Math.PI;
+      const radius = Math.sqrt(random()) * 0.97;
+      return {
+        x: Math.cos(angle) * radius,
+        z: -Math.sin(angle) * radius,
+        rotation: random() * Math.PI * 2,
+        scale: 0.78 + random() * 0.48,
+      };
+    });
+  }, [clumpCount]);
 
   useEffect(() => {
     noiseTexture.wrapS = THREE.RepeatWrapping;
@@ -1991,55 +2151,79 @@ function GroundPatch() {
   useEffect(() => {
     const grass = grassRef.current;
     if (!grass) return;
-    const transform = new THREE.Object3D();
-    let seed = 0x9e3779b9;
-    const random = () => {
-      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
-      return seed / 0xffffffff;
-    };
+    grass.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  }, []);
 
-    for (let index = 0; index < clumpCount; index += 1) {
-      let rootX = 0;
-      let rootZ = 0;
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const angle = random() * Math.PI * 2;
-        const radius = Math.sqrt(random()) * 0.57;
-        rootX = Math.cos(angle) * radius;
-        rootZ = Math.sin(angle) * radius;
-        const nearLeftFoot =
-          Math.abs(rootX + 0.14) < 0.105 && Math.abs(rootZ) < 0.12;
-        const nearRightFoot =
-          Math.abs(rootX - 0.14) < 0.105 && Math.abs(rootZ) < 0.12;
-        if (!nearLeftFoot && !nearRightFoot) break;
-      }
-      const scale = 0.78 + random() * 0.48;
+  const updateGrassLayout = useCallback((patchRadius: number) => {
+    const grass = grassRef.current;
+    if (!grass) return;
+    const transform = new THREE.Object3D();
+    normalizedClumps.forEach((clump, index) => {
+      const rootX = clump.x * patchRadius;
+      let rootZ = clump.z * patchRadius;
+      const nearLeftFoot =
+        Math.abs(rootX + 0.14) < 0.105 && Math.abs(rootZ) < 0.12;
+      const nearRightFoot =
+        Math.abs(rootX - 0.14) < 0.105 && Math.abs(rootZ) < 0.12;
+      if (nearLeftFoot || nearRightFoot) rootZ = -0.14;
       transform.position.set(rootX, 0, rootZ);
-      transform.rotation.set(0, random() * Math.PI * 2, 0);
-      transform.scale.setScalar(scale);
+      transform.rotation.set(0, clump.rotation, 0);
+      transform.scale.setScalar(clump.scale);
       transform.updateMatrix();
       grass.setMatrixAt(index, transform.matrix);
-    }
+    });
     grass.instanceMatrix.needsUpdate = true;
-  }, [clumpCount]);
+  }, [normalizedClumps]);
 
-  useFrame(({ clock }) => {
+  useEffect(() => {
+    updateGrassLayout(1);
+  }, [updateGrassLayout]);
+
+  useFrame(({ camera, clock, size }) => {
     if (grassMaterialRef.current) {
       grassMaterialRef.current.uniforms.uTime.value = clock.elapsedTime;
+    }
+
+    const patch = patchRef.current;
+    if (!patch || size.height <= 0) return;
+    patch.getWorldPosition(patchWorldPositionRef.current);
+    patch.getWorldScale(patchWorldScaleRef.current);
+    const screenAspect = size.width / size.height;
+    const worldRadius =
+      getVisibleHeightAtZ(camera, patchWorldPositionRef.current.z)
+      * screenAspect
+      * 0.5;
+    const localRadius = worldRadius / Math.max(0.001, patchWorldScaleRef.current.x);
+
+    if (Math.abs(localRadius - lastPatchRadiusRef.current) > 0.005) {
+      lastPatchRadiusRef.current = localRadius;
+      groundDiscRef.current?.scale.set(localRadius, localRadius, 1);
+      if (grassMaterialRef.current) {
+        grassMaterialRef.current.uniforms.uPatchRadius.value = localRadius;
+      }
+      updateGrassLayout(localRadius);
     }
   });
 
   useEffect(
     () => () => {
       groundTexture.dispose();
+      contactShadowTexture.dispose();
       grassGeometry.dispose();
     },
-    [grassGeometry, groundTexture],
+    [contactShadowTexture, grassGeometry, groundTexture],
   );
 
   return (
-    <group position={[0, -0.004, 0]}>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} renderOrder={-1}>
-        <circleGeometry args={[0.66, 64]} />
+    <group ref={patchRef} position={[0, -0.004, 0]}>
+      <mesh
+        ref={groundDiscRef}
+        rotation={[-Math.PI / 2, 0, 0]}
+        renderOrder={-1}
+      >
+        {/* The diameter lies along the screen bottom and the arc extends
+            behind the avatar. Runtime scaling keeps it exactly viewport-wide. */}
+        <circleGeometry args={[1, 96, 0, Math.PI]} />
         <meshStandardMaterial
           map={groundTexture}
           transparent
@@ -2049,6 +2233,22 @@ function GroundPatch() {
           roughness={1}
           metalness={0}
           side={THREE.DoubleSide}
+        />
+      </mesh>
+      <mesh
+        position={[0, 0.0015, -0.025]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        scale={[0.48, 0.19, 1]}
+        renderOrder={0}
+      >
+        <circleGeometry args={[1, 64]} />
+        <meshBasicMaterial
+          map={contactShadowTexture}
+          transparent
+          opacity={0.78}
+          alphaTest={0.01}
+          depthWrite={false}
+          toneMapped={false}
         />
       </mesh>
       <instancedMesh
@@ -2149,10 +2349,11 @@ function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }
 
 /**
  * Light setup tuned per device tier. Each extra light adds a per-fragment
- * lighting calculation, so on phones we collapse the 5-light cinematic
+ * lighting calculation, so on phones we collapse the 3-light cinematic
  * setup down to 1 (low) or 2 (mid) lights and bump ambient to compensate
- * for the lost fill. Visually almost identical for a talking-head shot,
- * but cuts shader work substantially on tile-based mobile GPUs.
+ * for the lost fill. The high tier keeps a warm rim to separate hair and
+ * facial contours from the live camera background while low tiers cut
+ * shader work substantially on tile-based mobile GPUs.
  */
 function SceneLights({
   cameraVideoRef,
@@ -2161,7 +2362,7 @@ function SceneLights({
 }) {
   const profile = useMemo(() => getDeviceProfile(), []);
   const max = profile.maxLights;
-  const baseAmbient = max >= 5 ? 0.7 : max >= 2 ? 0.85 : 1.0;
+  const baseAmbient = max >= 3 ? 0.52 : max >= 2 ? 0.68 : 0.86;
   const ambientRef = useRef<THREE.AmbientLight>(null);
   const keyRef = useRef<THREE.DirectionalLight>(null);
   const fillRef = useRef<THREE.DirectionalLight>(null);
@@ -2171,9 +2372,9 @@ function SceneLights({
   const nextSampleAtRef = useRef(0);
   const targetRef = useRef({
     ambient: baseAmbient,
-    key: 1,
-    fill: 0.35,
-    rim: 0.15,
+    key: 1.1,
+    fill: 0.3,
+    rim: 0.22,
     point: 0.3,
     keyX: 2,
     color: new THREE.Color(1, 0.94, 0.87),
@@ -2239,16 +2440,16 @@ function SceneLights({
         );
         const average = (red + green + blue) / Math.max(1, samples * 3);
         const target = targetRef.current;
-        target.ambient = baseAmbient * (0.58 + exposure * 0.62);
-        target.key = 0.55 + exposure * 0.95;
-        target.fill = 0.2 + exposure * 0.3;
-        target.rim = 0.08 + exposure * 0.12;
+        target.ambient = baseAmbient * (0.62 + exposure * 0.55);
+        target.key = 0.72 + exposure * 1.05;
+        target.fill = 0.18 + exposure * 0.28;
+        target.rim = 0.14 + exposure * 0.2;
         target.point = 0.14 + exposure * 0.3;
 
-        // The video is mirrored in CSS, so swap its measured left/right
-        // brightness when positioning the key light in model space.
-        const displayedLeft = rawRight;
-        const displayedRight = rawLeft;
+        // Camera feeds use true direction, so the sampled bright side maps
+        // directly to the matching side of the avatar.
+        const displayedLeft = rawLeft;
+        const displayedRight = rawRight;
         const balance =
           (displayedRight - displayedLeft) /
           Math.max(0.001, displayedRight + displayedLeft);
@@ -2296,36 +2497,36 @@ function SceneLights({
     <>
       <ambientLight ref={ambientRef} intensity={baseAmbient} />
       {/* Key light — always on. */}
-      <directionalLight ref={keyRef} position={[2, 3, 3]} intensity={1.0} />
+      <directionalLight ref={keyRef} position={[2.8, 3.4, 3.6]} intensity={1.1} />
       {max >= 2 && (
         <directionalLight
           ref={fillRef}
-          position={[-1.5, 2, 1]}
-          intensity={0.35}
+          position={[-2.2, 1.7, 2.4]}
+          intensity={0.3}
           color="#ffeedd"
         />
       )}
-      {max >= 5 && (
-        <>
-          <directionalLight
-            ref={rimRef}
-            position={[-2, 1, -1]}
-            intensity={0.15}
-            color="#FF9933"
-          />
+      {max >= 3 && (
+        <directionalLight
+          ref={rimRef}
+          position={[-2.4, 2.2, -2.2]}
+          intensity={0.22}
+          color="#FFB469"
+        />
+      )}
+      {max >= 4 && (
           <pointLight
             ref={pointRef}
             position={[0, 0.3, 0.9]}
             intensity={0.3}
             color="#ffe4c9"
           />
-        </>
       )}
     </>
   );
 }
 
-function DynamicDprController({ maxDpr }: { maxDpr: number }) {
+function DynamicDprController({ minDpr, maxDpr }: { minDpr: number; maxDpr: number }) {
   const { setDpr } = useThree();
   const emaFrameMsRef = useRef(16.7);
   const overMsRef = useRef(0);
@@ -2334,9 +2535,9 @@ function DynamicDprController({ maxDpr }: { maxDpr: number }) {
 
   useEffect(() => {
     const deviceDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-    const initial = Math.max(1, Math.min(maxDpr, deviceDpr));
+    const initial = Math.max(minDpr, Math.min(maxDpr, deviceDpr));
     setDpr(initial);
-  }, [maxDpr, setDpr]);
+  }, [minDpr, maxDpr, setDpr]);
 
   useFrame((_, delta) => {
     const frameMs = Math.max(1, Math.min(200, delta * 1000));
@@ -2359,7 +2560,7 @@ function DynamicDprController({ maxDpr }: { maxDpr: number }) {
         lowQualityRef.current = true;
         overMsRef.current = 0;
         underMsRef.current = 0;
-        setDpr(1);
+        setDpr(minDpr);
       }
       return;
     }
@@ -2371,7 +2572,7 @@ function DynamicDprController({ maxDpr }: { maxDpr: number }) {
     }
     if (underMsRef.current >= RECOVERY_HOLD_MS) {
       const deviceDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-      const restored = Math.max(1, Math.min(maxDpr, deviceDpr));
+      const restored = Math.max(minDpr, Math.min(maxDpr, deviceDpr));
       lowQualityRef.current = false;
       overMsRef.current = 0;
       underMsRef.current = 0;
@@ -2435,6 +2636,10 @@ export default function Avatar3D({
   viewMode = "front",
   cameraVideoRef,
 }: Avatar3DProps) {
+  const runtimeAvatarUrl = useMemo(
+    () => getOptimizedAvatarPath(avatarUrl, getDeviceProfile()),
+    [avatarUrl],
+  );
   const gestureRef = useRef<GestureName>(null);
   const isSpeakingRef = useRef(isSpeaking);
   const getAudioDataRef = useRef(getAudioData);
@@ -2522,7 +2727,7 @@ export default function Avatar3D({
             <SceneLights cameraVideoRef={cameraVideoRef} />
             <CameraAnimator targetZRef={cameraTargetRef} />
             <AvatarModel
-              avatarUrl={avatarUrl}
+              avatarUrl={runtimeAvatarUrl}
               isSpeakingRef={isSpeakingRef}
               getAudioDataRef={getAudioDataRef}
               getLipSyncFrameRef={getLipSyncFrameRef}
@@ -2550,8 +2755,8 @@ export default function Avatar3D({
  * per-tier without re-creating the GL context on every parent render.
  *
  * Profile dimensions used here:
- *   - `maxDpr` → `dpr={[1, profile.maxDpr]}` so retina displays still
- *     get an upgrade where the GPU can afford it.
+ *   - `minDpr` / `maxDpr` bound resolution scaling so retina displays get
+ *     detail where affordable while weak GPUs can fall below native DPR.
  *   - `antialias` → only enabled on `high` tier non-iOS devices; MSAA
  *     is the single biggest cause of mobile-Safari OOM.
  *   - `shadows` → likewise off everywhere except `high`. We have no
@@ -2599,7 +2804,7 @@ function DeviceTunedCanvas({
         failIfMajorPerformanceCaveat: false,
         precision: profile.shaderPrecision,
       }}
-      dpr={[1, profile.maxDpr]}
+      dpr={[profile.minDpr, profile.maxDpr]}
       shadows={profile.shadows}
       // Skip object sorting — the scene has only the avatar;
       // the GPU's depth test handles correct occlusion. Sorting costs
@@ -2627,7 +2832,7 @@ function DeviceTunedCanvas({
         zIndex: 1,
       }}
     >
-      <DynamicDprController maxDpr={profile.maxDpr} />
+      <DynamicDprController minDpr={profile.minDpr} maxDpr={profile.maxDpr} />
       {children}
     </Canvas>
   );
@@ -2636,5 +2841,5 @@ function DeviceTunedCanvas({
 // Warm only the default avatar. Every production GLB already contains its
 // one supplied Mixamo idle, so no secondary animation pack is fetched.
 if (typeof window !== "undefined") {
-  void loadAvatarScene(DEFAULT_AVATAR_URL);
+  void loadAvatarScene(getOptimizedAvatarPath(DEFAULT_AVATAR_URL));
 }
