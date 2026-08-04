@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { GestureInfo, VisionState } from "../hooks/useVisionDetection";
+import { isCharacterSlug, type CharacterSlug } from "./characters";
 import type { LipSyncFrame } from "./lipSync";
 
 const DISPLAY_CHANNEL_NAME = "rishi-dual-display-v1";
@@ -52,7 +53,12 @@ export interface VisionSnapshot {
 
 type DisplayMessage =
   | { type: "vision"; payload: VisionSnapshot }
-  | { type: "avatar"; command: AvatarAnimationCommand; isSpeaking: boolean }
+  | {
+      type: "avatar";
+      command: AvatarAnimationCommand;
+      isSpeaking: boolean;
+      character: CharacterSlug;
+    }
   | { type: "lipsync"; frame: LipSyncFrame | null }
   | { type: "sync-request" };
 
@@ -140,7 +146,11 @@ export function useRemoteVision(enabled: boolean) {
   return { ...snapshot, videoRef, cleanup };
 }
 
-export function useFrontDisplaySync(enabled: boolean, isSpeaking: boolean) {
+export function useFrontDisplaySync(
+  enabled: boolean,
+  isSpeaking: boolean,
+  character: CharacterSlug,
+) {
   const channelRef = useRef<BroadcastChannel | null>(null);
   const commandRef = useRef<AvatarAnimationCommand>({
     state: "idle_standing",
@@ -149,6 +159,7 @@ export function useFrontDisplaySync(enabled: boolean, isSpeaking: boolean) {
   });
   const sequenceRef = useRef(0);
   const speakingRef = useRef(isSpeaking);
+  const characterRef = useRef(character);
 
   const publishCurrent = useCallback(() => {
     if (!enabled) return;
@@ -156,6 +167,7 @@ export function useFrontDisplaySync(enabled: boolean, isSpeaking: boolean) {
       type: "avatar",
       command: commandRef.current,
       isSpeaking: speakingRef.current,
+      character: characterRef.current,
     } satisfies DisplayMessage);
   }, [enabled]);
 
@@ -180,6 +192,11 @@ export function useFrontDisplaySync(enabled: boolean, isSpeaking: boolean) {
     speakingRef.current = isSpeaking;
     publishCurrent();
   }, [isSpeaking, publishCurrent]);
+
+  useEffect(() => {
+    characterRef.current = character;
+    publishCurrent();
+  }, [character, publishCurrent]);
 
   const publishAvatarState = useCallback((state: AvatarAnimationState) => {
     sequenceRef.current += 1;
@@ -211,6 +228,7 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
     sequence: 0,
   });
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [character, setCharacter] = useState<CharacterSlug | null>(null);
   const lipSyncFrameRef = useRef<LipSyncFrame | null>(null);
 
   useEffect(() => {
@@ -224,7 +242,11 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
         return;
       }
       if (event.data?.type === "avatar") {
-        const { command, isSpeaking: nextSpeaking } = event.data;
+        const {
+          command,
+          isSpeaking: nextSpeaking,
+          character: nextCharacter,
+        } = event.data;
         setAvatarCommand((current) => (
           current.sequence === command.sequence
           && current.startedAt === command.startedAt
@@ -232,6 +254,7 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
             : command
         ));
         setIsSpeaking(nextSpeaking);
+        if (isCharacterSlug(nextCharacter)) setCharacter(nextCharacter);
         if (!nextSpeaking) lipSyncFrameRef.current = null;
       }
     };
@@ -255,5 +278,5 @@ export function useRearDisplaySync(enabled: boolean, vision: VisionState) {
 
   const getLipSyncFrame = useCallback(() => lipSyncFrameRef.current, []);
 
-  return { avatarCommand, isSpeaking, getLipSyncFrame };
+  return { avatarCommand, isSpeaking, character, getLipSyncFrame };
 }

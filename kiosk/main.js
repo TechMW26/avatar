@@ -179,7 +179,10 @@ function createWindow() {
 
   dualDisplayEnabled = Boolean(backDisplay && backDisplay.id !== frontDisplay.id);
   mainWindow = createKioskWindow(frontDisplay);
-  if (dualDisplayEnabled) {
+  // The rear display is normally opened once by the operator at the stable
+  // `/talk/back` URL. Never create a surprise window when a character starts.
+  // Set this explicit kiosk-only flag to retain the legacy auto-launch mode.
+  if (dualDisplayEnabled && process.env.ALGAETREE_AUTO_OPEN_BACK === "1") {
     backWindow = createKioskWindow(backDisplay);
   }
 

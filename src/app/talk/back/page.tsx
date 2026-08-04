@@ -24,7 +24,12 @@ export default function BackDisplayPage() {
     enabled: true,
     cameraSelector,
   });
-  const { avatarCommand, isSpeaking, getLipSyncFrame } = useRearDisplaySync(true, vision);
+  const {
+    avatarCommand,
+    isSpeaking,
+    character: syncedCharacter,
+    getLipSyncFrame,
+  } = useRearDisplaySync(true, vision);
   const [avatarReady, setAvatarReady] = useState(false);
   const [preloadRatio, setPreloadRatio] = useState(0);
   const [preloadError, setPreloadError] = useState<string | null>(null);
@@ -54,6 +59,13 @@ export default function BackDisplayPage() {
     window.localStorage.setItem(CHARACTER_STORAGE_KEY, selected.slug);
     setCharacter(selected);
   }, [remoteControl.state]);
+
+  useEffect(() => {
+    if (!syncedCharacter) return;
+    const selected = getCharacter(syncedCharacter);
+    window.localStorage.setItem(CHARACTER_STORAGE_KEY, selected.slug);
+    setCharacter(selected);
+  }, [syncedCharacter]);
 
   useEffect(() => {
     document.title = character

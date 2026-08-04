@@ -684,6 +684,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const { publishAvatarState, publishLipSyncFrame } = useFrontDisplaySync(
     dualDisplay,
     isSpeaking,
+    character.slug,
   );
 
   const currentGestureName = vision.currentGestures.length > 0
