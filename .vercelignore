@@ -6,9 +6,8 @@ node_modules
 .env
 .env*.local
 
-# Source-only 3D files. Production serves the active runtime bundle from
-# NEXT_PUBLIC_ASSET_BASE_URL (Vercel Blob), so do not upload duplicate GLBs.
-public/models/*.glb
+# Grass remains on the configured asset CDN. Character bundles are shipped
+# with the deployment so production always uses the exact reviewed models.
 public/grass/grassLODs.glb
 public/grass/grass.jpeg
 public/grass/perlinnoise.webp

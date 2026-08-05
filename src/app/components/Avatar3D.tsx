@@ -36,6 +36,7 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
+const SANDIPANI_IDLE_LIP_CLOSURE = 0.62;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
 const CHEEK_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 0,
@@ -110,17 +111,17 @@ const FACE_DEBOUNCE_MS = 350;
 const SAME_GESTURE_COOLDOWN_MS = 4_500;
 
 /* ── Stage geometry ──
-   Avatars keep 2.5% safe floor space below the feet and 10% clear space
-   above the head. Both margins and scale are derived from the live camera
-   frustum so feet/grass stay visible after resizing on both displays. */
+   The animated foot bones are locked to the viewport floor while the grass
+   overscans beneath it. Scale stays frustum-derived so the avatar fills the
+   display consistently after resizing on either screen. */
 const MODEL_NORMALIZED_HEIGHT = 2.45;
-const GROUND_SAFE_MARGIN = 0.025;
+const GROUND_SAFE_MARGIN = 0;
 // The semicircle recedes from the camera, so its visible front edge projects
 // slightly above the mathematical viewport floor. Overscan the patch below
 // the frame to keep grass flush with the physical screen edge at every ratio.
 const GROUND_VIEWPORT_BLEED = 0.055;
-const CLOSE_SCREEN_HEIGHT = 0.875;
-const FAR_SCREEN_HEIGHT = 0.875;
+const CLOSE_SCREEN_HEIGHT = 0.925;
+const FAR_SCREEN_HEIGHT = 0.925;
 // Sit dip — the Mixamo sit clip rotates the legs into a cross-leg position
 // but we strip the Hips translation track (cm-scale problem), so without a
 // small additional drop the seated pose looks like he's hovering.
@@ -626,11 +627,11 @@ function AvatarModel({
   );
   const baseFbx = readAvatarScene(avatarUrl);
   const usesEmbeddedAnimation = /\.gl(?:b|tf)($|\?)/i.test(avatarUrl);
-  const hasSandipaniNeutralClosure = /(?:^|\/)sandipani(?:-lite)?\.glb(?:$|[?#])/i.test(
-    avatarUrl,
-  );
   const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
   const gestureClips = readGestureClipLibrary();
+  const idleLipClosure = /\/sandipani(?:-lite)?\.glb(?:$|\?)/i.test(avatarUrl)
+    ? SANDIPANI_IDLE_LIP_CLOSURE
+    : 0;
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -743,11 +744,6 @@ function AvatarModel({
   const footClampInitializedRef = useRef(false);
   const posedModelHeightRef = useRef(MODEL_NORMALIZED_HEIGHT);
   const lipSyncMeshesRef = useRef<THREE.Mesh[]>([]);
-  const neutralLipSealMeshesRef = useRef<THREE.Mesh[]>([]);
-  const mouthCavityMeshesRef = useRef<THREE.Mesh[]>([]);
-  const runtimeNeutralSealRef = useRef<THREE.Group | null>(null);
-  const runtimeNeutralSealHeadRef = useRef<THREE.Object3D | null>(null);
-  const runtimeNeutralSealOffsetRef = useRef(new THREE.Matrix4());
   const activeVisemeRef = useRef<(typeof AVATAR_VISEMES)[number]>("viseme_PP");
   const activeVisemeSinceRef = useRef(0);
   const lastPublishedLipFrameRef = useRef(0);
@@ -777,22 +773,16 @@ function AvatarModel({
     const avatarBoneByStripped = new Map<string, string>();
     const avatarRestQuaternionByStripped = new Map<string, THREE.Quaternion>();
     const lipSyncMeshes: THREE.Mesh[] = [];
-    const neutralLipSealMeshes: THREE.Mesh[] = [];
-    const mouthCavityMeshes: THREE.Mesh[] = [];
-    let runtimeNeutralSeal: THREE.Group | null = null;
 
     scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
-        if (/SandipaniIdleLipSeal/i.test(mesh.name)) {
-          neutralLipSealMeshes.push(mesh);
-          mesh.visible = true;
-          mesh.renderOrder = 100;
-        }
-        if (/SandipaniMouthCavity/i.test(mesh.name)) {
-          mouthCavityMeshes.push(mesh);
+        if (/Sandipani(?:IdleLipSeal|MouthCavity)/i.test(mesh.name)) {
+          // Legacy synthetic mouth layers are intentionally disabled. The
+          // current model's authored face is closed at Basis and its native
+          // viseme targets provide the complete speech deformation.
           mesh.visible = false;
-          mesh.renderOrder = 99;
+          return;
         }
         if (
           mesh.morphTargetDictionary
@@ -805,9 +795,9 @@ function AvatarModel({
           for (const name of AVATAR_VISEMES) {
             const index = mesh.morphTargetDictionary[name];
             if (index !== undefined) {
-              mesh.morphTargetInfluences[index] = (
-                hasSandipaniNeutralClosure && name === "viseme_PP"
-              ) ? 1 : 0;
+              mesh.morphTargetInfluences[index] = name === "viseme_PP"
+                ? idleLipClosure
+                : 0;
             }
           }
           const cheekIndex = mesh.morphTargetDictionary[SPEECH_CHEEK_MORPH];
@@ -832,13 +822,7 @@ function AvatarModel({
             transparent: source.transparent ?? false,
             opacity: source.opacity ?? 1,
             alphaTest: source.alphaTest ?? 0,
-            // The facial seal is a paper-thin head-bound surface. Blender's
-            // glTF axis conversion can reverse its apparent winding, so keep
-            // both faces renderable; otherwise the neutral lips disappear in
-            // Three.js even though they are present in the exported model.
-            side: /Sandipani(?:IdleLipSeal|MouthCavity)/i.test(mesh.name)
-              ? THREE.DoubleSide
-              : source.side ?? THREE.FrontSide,
+            side: source.side ?? THREE.FrontSide,
             fog: source.fog ?? true,
           };
           const m = matProfile.tier === "low"
@@ -884,23 +868,6 @@ function AvatarModel({
           fastMaterial.morphTargets = hasMorphTargets;
           m.depthWrite = source.depthWrite;
           m.depthTest = source.depthTest;
-          if (/Sandipani(?:IdleLipSeal|MouthCavity)/i.test(mesh.name)) {
-            // These head-bound surfaces intentionally replace the authored
-            // open-mouth pixels. Draw them over the source face instead of
-            // allowing tiny exporter depth differences to hide them.
-            m.depthTest = false;
-            m.depthWrite = false;
-            m.map = null;
-            if (/IdleLipSealUpper/i.test(mesh.name)) {
-              m.color.set(0x180504);
-            } else if (/IdleLipSealLower/i.test(mesh.name)) {
-              m.color.set(0x200605);
-            } else if (/IdleLipSealSeam/i.test(mesh.name)) {
-              m.color.set(0x120302);
-            } else if (/MouthCavity/i.test(mesh.name)) {
-              m.color.set(0x080101);
-            }
-          }
           m.vertexColors = source.vertexColors;
           m.toneMapped = source.toneMapped;
           if (m.map && matProfile.tier !== "low") {
@@ -964,8 +931,7 @@ function AvatarModel({
           // Meshy clothing is a thin, single-shell surface. Large shoulder
           // poses can expose its reverse side even with correct skinning,
           // so keep GLB character materials double-sided.
-          m.side = /Sandipani(?:IdleLipSeal|MouthCavity)/i.test(mesh.name)
-            || matProfile.doubleSide
+          m.side = matProfile.doubleSide
             ? THREE.DoubleSide
             : THREE.FrontSide;
           m.needsUpdate = true;
@@ -993,8 +959,6 @@ function AvatarModel({
       }
     });
     lipSyncMeshesRef.current = lipSyncMeshes;
-    neutralLipSealMeshesRef.current = neutralLipSealMeshes;
-    mouthCavityMeshesRef.current = mouthCavityMeshes;
 
     /* ── Scale + ground the avatar ──
        Anchor the avatar's feet at scene-local y = 0 so the parent group's
@@ -1155,103 +1119,6 @@ function AvatarModel({
       requestAnimationFrame(() => onReadyRef.current?.());
     }
 
-    const avatarHeadBoneName = avatarBoneByStripped.get("Head");
-    const avatarHeadBone = avatarHeadBoneName
-      ? scene.getObjectByName(avatarHeadBoneName)
-      : null;
-    if (hasSandipaniNeutralClosure && avatarHeadBone) {
-      // The supplied scan has an authored round opening and no jaw bone.
-      // A tiny head-bound neutral layer covers that opening only while the
-      // avatar is silent; speech hides it and exposes the viseme surface.
-      // Keeping this separate from the body mesh avoids touching skinning,
-      // bones, or the embedded Mixamo animation.
-      const seal = new THREE.Group();
-      seal.name = "SandipaniRuntimeNeutralMouth";
-      const addLayer = (
-        name: string,
-        color: number,
-        width: number,
-        height: number,
-        y: number,
-        z: number,
-      ) => {
-        const geometry = new THREE.CircleGeometry(0.5, 32);
-        const material = /MouthMask/i.test(name)
-          ? new THREE.ShaderMaterial({
-              transparent: true,
-              depthTest: false,
-              depthWrite: false,
-              side: THREE.DoubleSide,
-              toneMapped: false,
-              vertexShader: `
-                varying vec2 vUv;
-                void main() {
-                  vUv = uv;
-                  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-                }
-              `,
-              fragmentShader: `
-                varying vec2 vUv;
-                float hash(vec2 p) {
-                  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-                }
-                void main() {
-                  vec2 centered = (vUv - 0.5) * 2.0;
-                  float alpha = 1.0 - smoothstep(0.24, 1.0, length(centered));
-                  float grain = (hash(floor(vUv * 52.0)) - 0.5) * 0.10;
-                  float strand = sin(vUv.x * 96.0 + vUv.y * 13.0) * 0.018;
-                  vec3 beard = vec3(0.42, 0.39, 0.34) + grain + strand;
-                  gl_FragColor = vec4(beard, alpha);
-                }
-              `,
-            })
-          : new THREE.MeshBasicMaterial({
-              color,
-              depthTest: false,
-              depthWrite: false,
-              transparent: true,
-              opacity: 1,
-              side: THREE.DoubleSide,
-              toneMapped: false,
-            });
-        const layer = new THREE.Mesh(geometry, material);
-        layer.name = name;
-        layer.position.set(0, y, z);
-        layer.scale.set(width, height, 1);
-        layer.renderOrder = 110;
-        layer.frustumCulled = false;
-        seal.add(layer);
-        neutralLipSealMeshes.push(layer);
-      };
-      addLayer("SandipaniRuntimeMouthMask", 0x6e6759, 0.106, 0.064, 0, 0);
-      addLayer("SandipaniRuntimeUpperLip", 0x5a1814, 0.068, 0.010, 0.003, 0.002);
-      addLayer("SandipaniRuntimeLowerLip", 0x67201a, 0.067, 0.009, -0.005, 0.003);
-      addLayer("SandipaniRuntimeLipSeam", 0x120302, 0.064, 0.002, -0.001, 0.004);
-      scene.add(seal);
-      // `scene` normalizes a meter-scale FBX by applying a large root scale.
-      // Convert the desired normalized mouth point back into that local
-      // coordinate system before binding the layer to the head motion.
-      seal.position.copy(
-        new THREE.Vector3(0, 1.985, 0.32)
-          .sub(scene.position)
-          .divide(scene.scale),
-      );
-      seal.scale.set(
-        1 / scene.scale.x,
-        1 / scene.scale.y,
-        1 / scene.scale.z,
-      );
-      scene.updateMatrixWorld(true);
-      seal.updateMatrixWorld(true);
-      runtimeNeutralSealOffsetRef.current.copy(
-        avatarHeadBone.matrixWorld.clone().invert().multiply(seal.matrixWorld),
-      );
-      runtimeNeutralSealRef.current = seal;
-      runtimeNeutralSealHeadRef.current = avatarHeadBone;
-      runtimeNeutralSeal = seal;
-      neutralLipSealMeshesRef.current = neutralLipSealMeshes;
-    }
-
     console.log("[Avatar] ready", {
       bones: avatarBoneByStripped.size,
       actions: Object.entries(nextActions)
@@ -1266,19 +1133,6 @@ function AvatarModel({
       mixerRef.current = null;
       currentActionRef.current = null;
       lipSyncMeshesRef.current = [];
-      neutralLipSealMeshesRef.current = [];
-      mouthCavityMeshesRef.current = [];
-      runtimeNeutralSealRef.current = null;
-      runtimeNeutralSealHeadRef.current = null;
-      if (runtimeNeutralSeal) {
-        runtimeNeutralSeal.traverse((object) => {
-          const mesh = object as THREE.Mesh;
-          if (!mesh.isMesh) return;
-          mesh.geometry.dispose();
-          (mesh.material as THREE.Material).dispose();
-        });
-        runtimeNeutralSeal.removeFromParent();
-      }
       actionsRef.current = {
         sitting: undefined,
         standing_up: undefined,
@@ -1302,7 +1156,7 @@ function AvatarModel({
     // `notify` is stable (refs only); intentionally NOT a dep so we don't
     // tear down the mixer on every parent re-render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [camera, hasSandipaniNeutralClosure, scene, sourceClips, usesEmbeddedAnimation]);
+  }, [camera, scene, sourceClips, usesEmbeddedAnimation]);
 
   // Frame-rate cap. We accumulate `delta` and only run the heavy
   // per-frame work (mixer.update + foot clamp + transform lerps) when
@@ -1418,8 +1272,8 @@ function AvatarModel({
               ? 1
               : activeIntensity
             : 0
-          : hasSandipaniNeutralClosure && viseme === "viseme_PP"
-            ? 1
+          : viseme === "viseme_PP"
+            ? idleLipClosure
             : 0;
         influences[index] += (targetInfluence - influences[index]) * mouthBlend;
       }
@@ -1429,12 +1283,6 @@ function AvatarModel({
           cheekTarget - influences[cheekIndex]
         ) * cheekBlend;
       }
-    }
-    for (const seal of neutralLipSealMeshesRef.current) {
-      seal.visible = closingLips && viewMode === "front";
-    }
-    for (const cavity of mouthCavityMeshesRef.current) {
-      cavity.visible = !closingLips && viewMode === "front";
     }
     if (onLipSyncFrameRef.current && lipNow - lastPublishedLipFrameRef.current >= 33) {
       lastPublishedLipFrameRef.current = lipNow;
@@ -1452,20 +1300,6 @@ function AvatarModel({
       // Embedded character clips are not retargeted or rewritten.
       mixer.update(Math.min(delta, 0.05));
     }
-    const runtimeSeal = runtimeNeutralSealRef.current;
-    const runtimeSealHead = runtimeNeutralSealHeadRef.current;
-    if (runtimeSeal && runtimeSealHead) {
-      scene.updateMatrixWorld(true);
-      const sealMatrix = scene.matrixWorld.clone().invert()
-        .multiply(runtimeSealHead.matrixWorld)
-        .multiply(runtimeNeutralSealOffsetRef.current);
-      sealMatrix.decompose(
-        runtimeSeal.position,
-        runtimeSeal.quaternion,
-        runtimeSeal.scale,
-      );
-    }
-
     /* ── Smoothly drive group transform toward the current state's marks ── */
     const grp = groupRef.current;
     const state = animStateRef.current;
@@ -1616,8 +1450,8 @@ function AvatarModel({
       grp.rotation.y += drot * rotLerp;
 
       // Derive scale from the live camera frustum and the initial posed
-      // bounds. Every state occupies exactly 90% of the screen height,
-      // leaving a strict 10% gap above the head.
+      // bounds. The avatar fills 92.5% of the screen while the planted-foot
+      // clamp keeps the extra height from introducing bottom clipping.
       const zProgress =
         (grp.position.z - BACK_Z) / (FRONT_Z - BACK_Z);
       const t = Math.max(0, Math.min(1, zProgress));

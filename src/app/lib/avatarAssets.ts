@@ -21,7 +21,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v55";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v58";
 const ASSET_CACHE_PREFIX = "rishi-avatar-fbx-v";
 
 let cachedRuntimeAssetCacheName: string | null = null;
@@ -60,7 +60,10 @@ export async function ensureFreshAssetCache(): Promise<string> {
 export function assetUrl(path: string): string {
   if (/^https?:\/\//i.test(path)) return path;
 
-  const resolved = ASSET_BASE_URL
+  // Character bundles ship with the deployment. Keeping these same-origin
+  // prevents a stale Blob object from silently serving an older avatar after
+  // a model correction. Grass and gesture assets can still use the CDN base.
+  const resolved = ASSET_BASE_URL && !AVATAR_MODEL_PATHS.has(path)
     ? `${ASSET_BASE_URL}/${path.replace(/^\//, "")}`
     : path;
   return AVATAR_MODEL_PATHS.has(path)
@@ -250,7 +253,7 @@ export function getDeviceProfile(): DeviceProfile {
     enableEnvReflections: tier === "high",
     maxTextureSize: tier === "low" ? 512 : tier === "mid" ? 1024 : 2048,
     shaderPrecision: tier === "high" ? "highp" : "mediump",
-    enableFootClamp: false,
+    enableFootClamp: true,
   };
 
   cachedProfile = profile;

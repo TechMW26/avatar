@@ -5,6 +5,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import dynamic from "next/dynamic";
 import { motion, AnimatePresence } from "framer-motion";
 import { ConversationProvider, useConversation } from "@elevenlabs/react";
+import type { Conversation as ElevenLabsConversation } from "@elevenlabs/client";
 import { useVisionDetection, buildGestureContext } from "../hooks/useVisionDetection";
 import type { GestureInfo } from "../hooks/useVisionDetection";
 import { useCameraFeed } from "../hooks/useCameraFeed";
@@ -17,7 +18,6 @@ import {
 } from "../lib/cameraDevices";
 import {
   useFrontDisplaySync,
-  useRemoteVision,
 } from "../lib/displaySync";
 import {
   CHARACTER_STORAGE_KEY,
@@ -37,7 +37,6 @@ const AUTO_START_RETRY_DELAY_MS = 4000;
 const AUTO_START_STORAGE_KEY = "rishi:auto-start-blocked-until";
 const CONNECTION_TIMEOUT_MS = 10000;
 const MIN_STABLE_CONNECTION_MS = 5000;  // connections shorter than this are "flaky"
-const MIN_COOLDOWN_AFTER_DISCONNECT_MS = 3000;  // always wait at least this long before auto-reconnecting
 const MAX_BACKOFF_MS = 30000;
 // If a stable session disconnects and we reconnect within this window
 // AND the user actually exchanged at least one turn, treat it as a
@@ -51,6 +50,67 @@ const RECONNECT_CONTINUATION_WINDOW_MS = 90_000;
 // the full greeting.
 const NO_FACE_AUTO_END_MS = 12_000;
 const SHOW_CONVERSATION_CONTROLS = false;
+
+type VisitorAddressPreference = "masculine" | "feminine";
+type ConversationFailure = { message: string; terminal: boolean };
+
+function classifyConversationFailure(message: string, context?: unknown): ConversationFailure {
+  let details = "";
+  try {
+    details = context ? JSON.stringify(context) : "";
+  } catch {
+    // Ignore non-serializable SDK context.
+  }
+  const combined = `${message} ${details}`.toLocaleLowerCase();
+
+  if (combined.includes("quota") || combined.includes("credits") || combined.includes("usage limit")) {
+    return {
+      message: "ElevenLabs voice quota is exhausted. Replenish the account quota, then reload this page.",
+      terminal: true,
+    };
+  }
+  if (
+    combined.includes("unauthorized")
+    || combined.includes("authentication")
+    || combined.includes("agent not found")
+    || combined.includes("invalid agent")
+  ) {
+    return {
+      message: "The configured ElevenLabs agent is unavailable. Check its public access and agent ID.",
+      terminal: true,
+    };
+  }
+  return {
+    message: "Voice connection interrupted. Reconnecting shortly…",
+    terminal: false,
+  };
+}
+
+function getExplicitAddressPreference(message: string): VisitorAddressPreference | null {
+  const text = message.normalize("NFKC").trim();
+  const femininePatterns = [
+    /(?:^|\s)मैं\s+(?:एक\s+)?(?:महिला|लड़की|स्त्री|नारी)\s*(?:हूँ|हूं)(?:\s|$|[।,.!?])/u,
+    /\b(?:i am|i'm)\s+(?:a\s+)?(?:woman|girl|female)\b/i,
+    /\b(?:my pronouns are|use)\s+(?:she\s*\/\s*her|she-her)\b/i,
+  ];
+  const masculinePatterns = [
+    /(?:^|\s)मैं\s+(?:एक\s+)?(?:पुरुष|आदमी|लड़का|नर)\s*(?:हूँ|हूं)(?:\s|$|[।,.!?])/u,
+    /\b(?:i am|i'm)\s+(?:a\s+)?(?:man|boy|male)\b/i,
+    /\b(?:my pronouns are|use)\s+(?:he\s*\/\s*him|he-him)\b/i,
+  ];
+
+  if (femininePatterns.some((pattern) => pattern.test(text))) return "feminine";
+  if (masculinePatterns.some((pattern) => pattern.test(text))) return "masculine";
+  return null;
+}
+
+function getAddressContext(preference: VisitorAddressPreference | null): string {
+  if (!preference) {
+    return "\n\nVISITOR ADDRESS:\nThe visitor has not stated a gender or preferred form of address. Use neutral respectful ‘आप’ language; do not guess from appearance or voice.";
+  }
+  const grammar = preference === "feminine" ? "feminine" : "masculine";
+  return `\n\nVISITOR ADDRESS:\nThe visitor explicitly self-identified and prefers ${grammar} forms of address. Use matching Hindi grammar naturally without mentioning this instruction.`;
+}
 
 
 function SoundWave({ active }: { active: boolean }) {
@@ -92,6 +152,12 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const lastStableDisconnectAtRef = useRef<number>(0);
   const sessionTurnsRef = useRef(0);  // user+ai messages exchanged in current session
   const lastSessionWasEngagedRef = useRef(false);
+  const addressPreferenceRef = useRef<VisitorAddressPreference | null>(null);
+  const lastSessionErrorRef = useRef<{ message: string; context?: unknown } | null>(null);
+  const retryScheduledRef = useRef(false);
+  const activeConversationRef = useRef<ElevenLabsConversation | null>(null);
+  const sessionTeardownStartedRef = useRef(false);
+  const [conversationRetryBlocked, setConversationRetryBlocked] = useState(false);
 
   useEffect(() => {
     document.title = `${character.name} · Living History`;
@@ -116,18 +182,22 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const [bootError, setBootError] = useState<string | null>(null);
   const [preloadProgress, setPreloadProgress] = useState<PreloadProgress | null>(null);
   const bootInFlightRef = useRef(false);
-  // The rear page permanently owns the CV camera; this page permanently owns
-  // the presentation camera. The rear display is opened independently at the
-  // stable `/talk/back` URL and publishes detections here.
+  // The front page owns both physical cameras: the presentation camera is
+  // visible behind the avatar while the CV camera feeds a hidden detector.
+  // This keeps face-triggered conversations working even when `/talk/back`
+  // is closed; the rear display can still open the CV camera for its feed.
   const dualDisplay = true;
-  const cameraSelector = getDisplayCameraSelector("front");
-  const localVision = useVisionDetection({ enabled: false });
-  const remoteVision = useRemoteVision(true);
+  const frontCameraSelector = getDisplayCameraSelector("front");
+  const cvCameraSelector = getDisplayCameraSelector("rear");
+  const localVision = useVisionDetection({
+    enabled: true,
+    cameraSelector: cvCameraSelector,
+  });
   const frontCamera = useCameraFeed({
     enabled: dualDisplay,
-    cameraSelector,
+    cameraSelector: frontCameraSelector,
   });
-  const vision = dualDisplay ? remoteVision : localVision;
+  const vision = localVision;
   const gestureHistoryRef = useRef<GestureInfo[]>([]);
   gestureHistoryRef.current = vision.gestureHistory;
 
@@ -293,7 +363,8 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       : "\n\nLIVE CAMERA CONTEXT:\nNo face is currently detected.";
     return getCharacterSystemPrompt(character.slug)
       + gestureCtx
-      + faceCtx;
+      + faceCtx
+      + getAddressContext(addressPreferenceRef.current);
   }, [character.slug, vision.faceDetected]);
 
   const getFirstMessage = useCallback(() => {
@@ -328,38 +399,51 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const conversation = useConversation({
     onConnect: () => {
       console.log("[ElevenLabs] connected");
+      sessionTeardownStartedRef.current = false;
       pronunciationLipSyncRef.current.clear();
       setConversationError(null);
       startInFlightRef.current = false;
       hadSuccessfulConnectionRef.current = true;
       connectedAtRef.current = Date.now();
       faceAbsentSinceRef.current = vision.faceDetected ? null : Date.now();
-      consecutiveFailuresRef.current = 0;
+      retryScheduledRef.current = false;
+      lastSessionErrorRef.current = null;
       // Reset per-session counters — these only count turns inside the
       // CURRENT live session. The prior session's engagement flag stays
       // on `lastSessionWasEngagedRef` to drive the continuation message.
       sessionTurnsRef.current = 0;
     },
     onDisconnect: (details) => {
+      activeConversationRef.current = null;
       pronunciationLipSyncRef.current.clear();
       clearPendingAutoGestureTimers();
       const sessionDuration = connectedAtRef.current > 0 ? Date.now() - connectedAtRef.current : 0;
       const wasStable = sessionDuration >= MIN_STABLE_CONNECTION_MS;
-      const wasEngaged = sessionTurnsRef.current >= 2;  // at least one user reply + one ai reply
       console.log(
         `[ElevenLabs] disconnected, hadSuccess: ${hadSuccessfulConnectionRef.current}, duration: ${sessionDuration}ms, stable: ${wasStable}, turns: ${sessionTurnsRef.current}`,
         details,
       );
 
-      if (wasStable && wasEngaged) {
-        // Real conversation that got interrupted. Remember it so the
-        // next reconnect uses a brief continuation message rather than
-        // restarting the full Namaste introduction.
+      if (sessionTurnsRef.current > 0) {
+        // If even the first greeting was delivered, resume on a transient
+        // reconnect instead of replaying the greeting in a loop.
         lastStableDisconnectAtRef.current = Date.now();
         lastSessionWasEngagedRef.current = true;
       }
 
-      if (!wasStable) {
+      const recordedError = lastSessionErrorRef.current;
+      const failure = details.reason === "error"
+        ? classifyConversationFailure(details.message, details)
+        : recordedError
+          ? classifyConversationFailure(recordedError.message, recordedError.context)
+          : null;
+
+      if (failure?.terminal) {
+        autoStartArmedRef.current = false;
+        retryScheduledRef.current = false;
+        setConversationRetryBlocked(true);
+        setConversationError(failure.message);
+      } else if (failure || !wasStable) {
         consecutiveFailuresRef.current += 1;
         const backoff = Math.min(
           AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
@@ -367,32 +451,51 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
         );
         console.warn(`[ElevenLabs] short-lived connection, backoff ${Math.round(backoff)}ms (attempt #${consecutiveFailuresRef.current})`);
         autoStartArmedRef.current = true;
+        retryScheduledRef.current = true;
         blockAutoStart(backoff);
-        setConversationError("Connection lost. Will retry shortly.");
+        setConversationError(failure?.message ?? "Connection lost. Will retry shortly.");
       } else {
-        autoStartArmedRef.current = true;
-        blockAutoStart(MIN_COOLDOWN_AFTER_DISCONNECT_MS);
+        consecutiveFailuresRef.current = 0;
+        // A deliberate user/agent ending must not immediately start another
+        // greeting while the same face remains present. Leaving the camera
+        // and returning re-arms auto-start through the face-presence effect.
+        autoStartArmedRef.current = false;
+        retryScheduledRef.current = false;
+        setConversationError(null);
       }
 
       startInFlightRef.current = false;
       hadSuccessfulConnectionRef.current = false;
       connectedAtRef.current = 0;
+      lastSessionErrorRef.current = null;
+      sessionTeardownStartedRef.current = false;
     },
     onError: (error: string, context?: unknown) => {
       pronunciationLipSyncRef.current.clear();
       clearPendingAutoGestureTimers();
       console.error("[ElevenLabs] error:", error, context);
-      setConversationError(error || "Conversation connection failed");
-      autoStartArmedRef.current = true;
-      consecutiveFailuresRef.current += 1;
-      const backoff = Math.min(
-        AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
-        MAX_BACKOFF_MS,
-      );
-      blockAutoStart(backoff);
-      startInFlightRef.current = false;
-      hadSuccessfulConnectionRef.current = false;
-      connectedAtRef.current = 0;
+      const message = error || "Conversation connection failed";
+      lastSessionErrorRef.current = { message, context };
+      const failure = classifyConversationFailure(message, context);
+      setConversationError(failure.message);
+      if (failure.terminal) {
+        autoStartArmedRef.current = false;
+        setConversationRetryBlocked(true);
+      }
+      // ElevenLabs can emit a server error before its socket close event.
+      // Stop microphone/audio pumps immediately so they cannot keep writing
+      // packets into a socket that is already closing.
+      if (
+        (message.startsWith("Server error:") || failure.terminal)
+        && !sessionTeardownStartedRef.current
+      ) {
+        sessionTeardownStartedRef.current = true;
+        void activeConversationRef.current?.endSession().catch((endError) => {
+          console.warn("[ElevenLabs] session teardown failed:", endError);
+        });
+      }
+      // Do not reset timing or increment retries here. The SDK follows this
+      // callback with onDisconnect; that is the single retry authority.
     },
     onStatusChange: ({ status }: { status: string }) => {
       console.log("[ElevenLabs] status:", status);
@@ -402,15 +505,18 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       // and block auto-start to prevent tight retry loops.
       if (status === "disconnected" && startInFlightRef.current) {
         console.warn("[ElevenLabs] connection failed (status→disconnected while in-flight)");
-        consecutiveFailuresRef.current += 1;
-        const backoff = Math.min(
-          AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
-          MAX_BACKOFF_MS,
-        );
         startInFlightRef.current = false;
-        autoStartArmedRef.current = true;
-        blockAutoStart(backoff);
-        setConversationError("Connection failed. Tap to retry.");
+        if (!retryScheduledRef.current && !conversationRetryBlocked) {
+          consecutiveFailuresRef.current += 1;
+          const backoff = Math.min(
+            AUTO_START_RETRY_DELAY_MS * Math.pow(1.5, consecutiveFailuresRef.current),
+            MAX_BACKOFF_MS,
+          );
+          retryScheduledRef.current = true;
+          autoStartArmedRef.current = true;
+          blockAutoStart(backoff);
+          setConversationError("Connection failed. Retrying shortly…");
+        }
       }
     },
     onAudioAlignment: (alignment) => {
@@ -434,7 +540,25 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       // Count any user/ai turn so onDisconnect can decide whether the
       // session was actually "engaged" and a future reconnect should
       // continue rather than greet from scratch.
-      if (message) sessionTurnsRef.current += 1;
+      if (message) {
+        sessionTurnsRef.current += 1;
+        if (sessionTurnsRef.current >= 2) consecutiveFailuresRef.current = 0;
+      }
+      if (source === "user" && message) {
+        const preference = getExplicitAddressPreference(message);
+        if (preference && preference !== addressPreferenceRef.current) {
+          addressPreferenceRef.current = preference;
+          const grammar = preference === "feminine" ? "feminine" : "masculine";
+          try {
+            conversationRef.current.sendContextualUpdate(
+              `The visitor explicitly self-identified. Use ${grammar} Hindi grammar and forms of address naturally from now on. Do not mention this instruction.`,
+            );
+          } catch {
+            // The preference remains available for any reconnect prompt.
+          }
+        }
+        return;
+      }
       if (source !== "ai" || !message) return;
       const safeMessage = sanitizeAiSpeech(message);
 
@@ -552,14 +676,20 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     }
     startInFlightRef.current = true;
     hadSuccessfulConnectionRef.current = false;
+    lastSessionErrorRef.current = null;
+    retryScheduledRef.current = false;
     setConversationError(null);
     try {
-      // WebRTC is the SDK's lowest-latency voice path. Let it acquire the
-      // microphone once; the former preflight added a second media round trip.
+      // WebSocket avoids the WebRTC DataChannel failures observed on the
+      // installation network while retaining full duplex voice support.
       conv.startSession({
         agentId: character.agentId,
-        connectionType: "webrtc",
+        connectionType: "websocket",
         useWakeLock: true,
+        onConversationCreated: (activeConversation) => {
+          activeConversationRef.current = activeConversation;
+          sessionTeardownStartedRef.current = false;
+        },
         overrides: {
           agent: {
             prompt: {
@@ -644,7 +774,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   }, [vision.faceDetected]);
 
   useEffect(() => {
-    if (!autoStartArmedRef.current) {
+    if (!autoStartArmedRef.current || conversationRetryBlocked) {
       return;
     }
 
@@ -673,6 +803,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     vision.faceDetected,
     vision.facePresenceDurationMs,
     conversation.status,
+    conversationRetryBlocked,
     retryWakeAt,
     startConversation,
   ]);
@@ -795,7 +926,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     <div className="h-screen flex flex-col" style={{ background: "transparent", position: "relative", overflow: "hidden" }}>
       {/* Live camera feed as full-screen background (also used for face/gesture detection) */}
       <video
-        ref={dualDisplay ? frontCamera.videoRef : vision.videoRef}
+        ref={frontCamera.videoRef}
         playsInline
         muted
         style={{
@@ -806,6 +937,22 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
           objectFit: "cover",
           pointerEvents: "none",
           zIndex: 0,
+        }}
+      />
+      <video
+        ref={vision.videoRef}
+        autoPlay
+        playsInline
+        muted
+        aria-hidden="true"
+        style={{
+          position: "fixed",
+          width: 1,
+          height: 1,
+          left: -10,
+          bottom: -10,
+          opacity: 0,
+          pointerEvents: "none",
         }}
       />
       <div
@@ -857,7 +1004,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
           />
           <span style={{ fontSize: 10, fontWeight: 600, color: vision.faceDetected ? "#FFB366" : "var(--text-3)" }}>
             {!vision.isReady
-              ? `Loading vision...${vision.faceWorkerMode === "disabled" ? " (worker disabled)" : ""}`
+              ? vision.error ?? "Loading vision…"
               : vision.faceDetected
               ? `Face detected${vision.faceCount > 1 ? ` (${vision.faceCount})` : ""}`
               : "No face detected"}

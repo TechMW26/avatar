@@ -125,5 +125,5 @@ export type DisplayCameraRole = "front" | "rear";
 export function getDisplayCameraSelector(role: DisplayCameraRole): string {
   const requested = getCameraSelectorFromUrl()?.trim();
   if (requested && !/^index:\d+$/i.test(requested)) return requested;
-  return role === "front" ? "index:1" : "index:0";
+  return role === "front" ? "index:0" : "index:1";
 }

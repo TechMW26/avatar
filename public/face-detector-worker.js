@@ -9,7 +9,9 @@ async function initFaceDetector(payload) {
     minDetectionConfidence = 0.5,
   } = payload || {};
 
-  const mp = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32");
+  // Keep the worker module same-origin so restrictive CSP, ad blockers, or a
+  // transient CDN module failure cannot disable face detection.
+  const mp = await import("/mediapipe/vision_bundle.mjs");
   const vision = await mp.FilesetResolver.forVisionTasks(wasmRoot);
 
   // CPU delegate is the most reliable in workers across browsers.

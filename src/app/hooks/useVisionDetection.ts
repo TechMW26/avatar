@@ -47,7 +47,7 @@ export interface VisionState {
   userSmile: number;
   /** Whether a phone/cell phone is detected in the frame */
   phoneDetected: boolean;
-  /** Detected gender of the user ("male" | "female" | "unknown") */
+  /** Kept for display-sync compatibility; appearance is never used to infer gender. */
   userGender: "male" | "female" | "unknown";
   /** Ref to attach to a <video> element */
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -61,8 +61,8 @@ export interface VisionState {
   cleanup: () => void;
 }
 
-const VISION_CDN =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/wasm";
+const VISION_WASM_ROOT = "/mediapipe/wasm";
+const FACE_DETECTOR_MODEL_PATH = "/mediapipe/models/blaze_face_short_range.tflite";
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const GESTURE_MIN_CONFIDENCE = 0.65;
@@ -79,14 +79,18 @@ const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
 const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
 const FACE_LOSS_GRACE_MS = 700; // short grace window smooths mobile jitter
 const FACE_WORKER_STALE_MS = 1200;
+const FACE_WORKER_HUNG_MS = 3_000;
+const FACE_WORKER_INIT_TIMEOUT_MS = 12_000;
+const FACE_WORKER_RETRY_BASE_MS = 5_000;
+const FACE_WORKER_RETRY_MAX_MS = 30_000;
+const VISION_RETRY_BASE_MS = 3_000;
+const VISION_RETRY_MAX_MS = 20_000;
 const NAMASTE_ACQUIRE_FRAMES = 3;
 const NAMASTE_HOLD_MS = 900;
 const NAMASTE_RETRIGGER_MS = 6500;
 const FACE_WORKER_MODE_KEY = "rishi:vision:face-worker-mode";
 const FACE_WORKER_FAIL_COUNT_KEY = "rishi:vision:face-worker-fail-count";
 const FACE_WORKER_DISABLE_UNTIL_KEY = "rishi:vision:face-worker-disable-until";
-const FACE_WORKER_FAILS_BEFORE_DISABLE = 2;
-const FACE_WORKER_DISABLE_MS = 24 * 60 * 60 * 1000;
 
 function isMacOrWindowsDesktop(): boolean {
   if (typeof navigator === "undefined") return false;
@@ -130,7 +134,9 @@ export function useVisionDetection(options?: {
   const faceWorkerInFlightRef = useRef(false);
   const faceWorkerCountRef = useRef(0);
   const faceWorkerLastTsRef = useRef(0);
+  const faceWorkerRequestStartedAtRef = useRef(0);
   const faceWorkerEnabledRef = useRef(false);
+  const restartFaceWorkerRef = useRef<() => void>(() => {});
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
   const gestureRecognizerRef = useRef<GestureRecognizer | null>(null);
   const objectDetectorRef = useRef<ObjectDetector | null>(null);
@@ -164,10 +170,10 @@ export function useVisionDetection(options?: {
   // Phone detection
   const [phoneDetected, setPhoneDetected] = useState(false);
 
-  // Gender detection (from face landmarks geometry)
-  const [userGender, setUserGender] = useState<"male" | "female" | "unknown">("unknown");
-  const genderVotesRef = useRef<number[]>([]); // history of votes: +1=male, -1=female
-  const genderLockedRef = useRef(false); // once confident, lock the result
+  // A face cannot reliably determine gender identity. Keep the legacy field
+  // neutral for display-sync compatibility and use explicit conversational
+  // self-identification for forms of address instead.
+  const userGender = "unknown" as const;
 
   // Gesture tracking
   const [currentGestures, setCurrentGestures] = useState<GestureInfo[]>([]);
@@ -182,47 +188,28 @@ export function useVisionDetection(options?: {
 
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [faceWorkerMode, setFaceWorkerMode] = useState<"worker" | "main-thread" | "disabled">("disabled");
+  const [faceWorkerMode, setFaceWorkerMode] = useState<"worker" | "main-thread" | "disabled">(
+    enabled ? "main-thread" : "disabled",
+  );
 
   // Initialize MediaPipe models and camera
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
+    let initRetryTimer = 0;
+    let initAttempt = 0;
+    let initInProgress = false;
+    let initGeneration = 0;
+    let faceWorkerRetryTimer = 0;
+    let faceWorkerAttempt = 0;
+    let faceWorkerStarting = false;
 
-    // ── Reset vision state via URL param (clears stuck worker disable) ──
-    if (typeof window !== "undefined" && typeof URLSearchParams !== "undefined") {
-      const params = new URLSearchParams(window.location.search);
-      if (params.has("reset-vision")) {
-        console.log("[useVisionDetection] resetting vision worker state via URL param");
-        window.localStorage.removeItem(FACE_WORKER_MODE_KEY);
-        window.localStorage.removeItem(FACE_WORKER_FAIL_COUNT_KEY);
-        window.localStorage.removeItem(FACE_WORKER_DISABLE_UNTIL_KEY);
-        // Clean URL without reload
-        const url = new URL(window.location.href);
-        url.searchParams.delete("reset-vision");
-        window.history.replaceState(null, "", url);
-      }
-    }
-
-    const readStoredNumber = (key: string): number => {
-      if (typeof window === "undefined") return 0;
-      const raw = window.localStorage.getItem(key);
-      const parsed = Number(raw || 0);
-      return Number.isFinite(parsed) ? parsed : 0;
-    };
-    const writeStoredNumber = (key: string, value: number) => {
-      if (typeof window === "undefined") return;
-      window.localStorage.setItem(key, String(value));
-    };
-    const setWorkerMode = (mode: "auto" | "fallback") => {
-      if (typeof window === "undefined") return;
-      window.localStorage.setItem(FACE_WORKER_MODE_KEY, mode);
-    };
-    const getWorkerMode = (): "auto" | "fallback" => {
-      if (typeof window === "undefined") return "auto";
-      const raw = window.localStorage.getItem(FACE_WORKER_MODE_KEY);
-      return raw === "fallback" ? "fallback" : "auto";
-    };
+    // Older releases permanently disabled the worker after two transient
+    // failures. Clear that legacy state: the local detector is now the
+    // reliable baseline and worker recovery is automatic.
+    window.localStorage.removeItem(FACE_WORKER_MODE_KEY);
+    window.localStorage.removeItem(FACE_WORKER_FAIL_COUNT_KEY);
+    window.localStorage.removeItem(FACE_WORKER_DISABLE_UNTIL_KEY);
 
     // Suppress noisy TensorFlow Lite INFO messages that MediaPipe logs via console.error
     const origError = console.error;
@@ -231,121 +218,175 @@ export function useVisionDetection(options?: {
       origError.apply(console, args);
     };
 
+    const stopFaceWorker = () => {
+      const worker = faceWorkerRef.current;
+      faceWorkerRef.current = null;
+      faceWorkerReadyRef.current = false;
+      faceWorkerEnabledRef.current = false;
+      faceWorkerInFlightRef.current = false;
+      faceWorkerRequestStartedAtRef.current = 0;
+      faceWorkerLastTsRef.current = 0;
+      try { worker?.terminate(); } catch {}
+    };
+
+    const scheduleFaceWorkerRetry = () => {
+      if (cancelled || faceWorkerRetryTimer || typeof Worker === "undefined") return;
+      const delay = Math.min(
+        FACE_WORKER_RETRY_BASE_MS * 2 ** Math.min(faceWorkerAttempt, 3),
+        FACE_WORKER_RETRY_MAX_MS,
+      );
+      faceWorkerRetryTimer = window.setTimeout(() => {
+        faceWorkerRetryTimer = 0;
+        void startFaceWorker();
+      }, delay);
+    };
+
+    const handleFaceWorkerFailure = (worker: Worker, reason: string) => {
+      if (faceWorkerRef.current !== worker) return;
+      console.warn(`[useVisionDetection] face worker unavailable (${reason}); using main-thread detector`);
+      stopFaceWorker();
+      if (!cancelled) {
+        setFaceWorkerMode("main-thread");
+        scheduleFaceWorkerRetry();
+      }
+    };
+
+    const startFaceWorker = async (): Promise<void> => {
+      if (
+        cancelled
+        || faceWorkerStarting
+        || faceWorkerReadyRef.current
+        || typeof Worker === "undefined"
+        || typeof createImageBitmap === "undefined"
+      ) {
+        return;
+      }
+
+      faceWorkerStarting = true;
+      stopFaceWorker();
+      let worker: Worker | null = null;
+
+      try {
+        const activeWorker = new Worker("/face-detector-worker.js", { type: "module" });
+        worker = activeWorker;
+        faceWorkerRef.current = activeWorker;
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const finish = (failure?: Error) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeout);
+            if (failure) reject(failure);
+            else resolve();
+          };
+          const timeout = window.setTimeout(
+            () => finish(new Error("initialization timed out")),
+            FACE_WORKER_INIT_TIMEOUT_MS,
+          );
+
+          activeWorker.onmessage = (event: MessageEvent<{
+            type: string;
+            stage?: string;
+            count?: number;
+            ts?: number;
+            message?: string;
+          }>) => {
+            const msg = event.data;
+            if (!msg || typeof msg !== "object" || faceWorkerRef.current !== activeWorker) return;
+            if (msg.type === "ready") {
+              faceWorkerReadyRef.current = true;
+              faceWorkerEnabledRef.current = true;
+              faceWorkerAttempt = 0;
+              setFaceWorkerMode("worker");
+              finish();
+              return;
+            }
+            if (msg.type === "result") {
+              faceWorkerInFlightRef.current = false;
+              faceWorkerRequestStartedAtRef.current = 0;
+              faceWorkerCountRef.current = Number(msg.count ?? 0);
+              faceWorkerLastTsRef.current = Number(msg.ts ?? performance.now());
+              return;
+            }
+            if (msg.type === "error") {
+              const message = msg.message || `${msg.stage || "runtime"} error`;
+              if (!faceWorkerReadyRef.current) finish(new Error(message));
+              else handleFaceWorkerFailure(activeWorker, message);
+            }
+          };
+          activeWorker.onerror = (event) => {
+            const message = event.message || "script error";
+            if (!faceWorkerReadyRef.current) finish(new Error(message));
+            else handleFaceWorkerFailure(activeWorker, message);
+          };
+          activeWorker.onmessageerror = () => {
+            if (!faceWorkerReadyRef.current) finish(new Error("message error"));
+            else handleFaceWorkerFailure(activeWorker, "message error");
+          };
+          activeWorker.postMessage({
+            type: "init",
+            wasmRoot: VISION_WASM_ROOT,
+            modelAssetPath: FACE_DETECTOR_MODEL_PATH,
+            minDetectionConfidence: 0.5,
+          });
+        });
+        console.log("[useVisionDetection] face worker ready (offloaded mode)");
+      } catch (workerError) {
+        faceWorkerAttempt += 1;
+        const reason = workerError instanceof Error ? workerError.message : "initialization failed";
+        if (worker) handleFaceWorkerFailure(worker, reason);
+        else {
+          console.warn(`[useVisionDetection] face worker unavailable (${reason}); using main-thread detector`);
+          setFaceWorkerMode("main-thread");
+          scheduleFaceWorkerRetry();
+        }
+      } finally {
+        faceWorkerStarting = false;
+      }
+    };
+
+    restartFaceWorkerRef.current = () => {
+      const worker = faceWorkerRef.current;
+      if (worker) handleFaceWorkerFailure(worker, "stalled");
+      else scheduleFaceWorkerRetry();
+    };
+
+    void startFaceWorker();
+
+    const disposeMainResources = () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+      faceDetectorRef.current?.close();
+      faceDetectorRef.current = null;
+      gestureRecognizerRef.current?.close();
+      gestureRecognizerRef.current = null;
+      faceLandmarkerRef.current?.close();
+      faceLandmarkerRef.current = null;
+      objectDetectorRef.current?.close();
+      objectDetectorRef.current = null;
+    };
+
+    const scheduleVisionRetry = () => {
+      if (cancelled || initRetryTimer) return;
+      const delay = Math.min(
+        VISION_RETRY_BASE_MS * 2 ** Math.min(initAttempt, 3),
+        VISION_RETRY_MAX_MS,
+      );
+      initRetryTimer = window.setTimeout(() => {
+        initRetryTimer = 0;
+        void init();
+      }, delay);
+    };
+
     async function init() {
+      if (cancelled || initInProgress || faceDetectorRef.current) return;
+      initInProgress = true;
+      const generation = ++initGeneration;
       try {
         const isDesktopGesturePlatform = isMacOrWindowsDesktop();
         const isMobileDevice = !isDesktopGesturePlatform;
         isMobileRef.current = isMobileDevice;
-
-        // Spin up a dedicated worker for face inference. Keep a fallback
-        // detector on the main thread if worker init fails.
-        const faceWorkerTask = (async (): Promise<boolean> => {
-          const disableUntil = readStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY);
-          const mode = getWorkerMode();
-          if (mode === "fallback" || Date.now() < disableUntil) {
-            const remainingMin = disableUntil > Date.now()
-              ? Math.ceil((disableUntil - Date.now()) / 60000)
-              : 0;
-            console.log("[useVisionDetection] face worker skipped: mode=", mode, "disabled for", remainingMin, "more min. Use ?reset-vision to clear.");
-            setFaceWorkerMode(mode === "fallback" ? "disabled" : "main-thread");
-            return false;
-          }
-          if (typeof Worker === "undefined" || typeof createImageBitmap === "undefined") {
-            return false;
-          }
-          try {
-            const worker = new Worker("/face-detector-worker.js", { type: "module" });
-            faceWorkerRef.current = worker;
-            const ready = await new Promise<boolean>((resolve) => {
-              let settled = false;
-              const finish = (value: boolean) => {
-                if (settled) return;
-                settled = true;
-                window.clearTimeout(timeout);
-                resolve(value);
-              };
-              const timeout = window.setTimeout(() => finish(false), 4_000);
-              worker.onmessage = (event: MessageEvent<{ type: string; stage?: string; count?: number; ts?: number }>) => {
-                const msg = event.data;
-                if (!msg || typeof msg !== "object") return;
-                if (msg.type === "ready") {
-                  faceWorkerReadyRef.current = true;
-                  faceWorkerEnabledRef.current = true;
-                  setFaceWorkerMode("worker");
-                  console.log("[useVisionDetection] face worker ready (offloaded mode)");
-                  writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, 0);
-                  writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, 0);
-                  setWorkerMode("auto");
-                  finish(true);
-                  return;
-                }
-                if (msg.type === "result") {
-                  faceWorkerInFlightRef.current = false;
-                  faceWorkerCountRef.current = Number(msg.count ?? 0);
-                  faceWorkerLastTsRef.current = Number(msg.ts ?? performance.now());
-                  return;
-                }
-                if (msg.type === "error") {
-                  faceWorkerInFlightRef.current = false;
-                  faceWorkerReadyRef.current = false;
-                  faceWorkerEnabledRef.current = false;
-                  // Init failure should not sit until timeout. Detection
-                  // failure must also immediately hand over to the always
-                  // available main-thread detector.
-                  if (msg.stage === "init") {
-                    finish(false);
-                  } else {
-                    try { worker.terminate(); } catch {}
-                    if (faceWorkerRef.current === worker) {
-                      faceWorkerRef.current = null;
-                    }
-                  }
-                }
-              };
-              worker.onerror = () => {
-                faceWorkerReadyRef.current = false;
-                faceWorkerEnabledRef.current = false;
-                finish(false);
-              };
-              worker.postMessage({
-                type: "init",
-                wasmRoot: VISION_CDN,
-                modelAssetPath:
-                  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
-                minDetectionConfidence: 0.5,
-              });
-            });
-            if (!ready) {
-              const failCount = readStoredNumber(FACE_WORKER_FAIL_COUNT_KEY) + 1;
-              writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, failCount);
-              if (failCount >= FACE_WORKER_FAILS_BEFORE_DISABLE) {
-                writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, Date.now() + FACE_WORKER_DISABLE_MS);
-                setWorkerMode("fallback");
-                setFaceWorkerMode("disabled");
-                console.warn("[useVisionDetection] face worker disabled for 24h after", failCount, "failures. Use ?reset-vision to clear.");
-              } else {
-                setFaceWorkerMode("main-thread");
-                console.warn("[useVisionDetection] face worker init failed (attempt", failCount, "), using main-thread fallback");
-              }
-              try { worker.terminate(); } catch {}
-              faceWorkerRef.current = null;
-              faceWorkerReadyRef.current = false;
-              faceWorkerEnabledRef.current = false;
-            }
-            return ready;
-          } catch {
-            const failCount = readStoredNumber(FACE_WORKER_FAIL_COUNT_KEY) + 1;
-            writeStoredNumber(FACE_WORKER_FAIL_COUNT_KEY, failCount);
-            if (failCount >= FACE_WORKER_FAILS_BEFORE_DISABLE) {
-              writeStoredNumber(FACE_WORKER_DISABLE_UNTIL_KEY, Date.now() + FACE_WORKER_DISABLE_MS);
-              setWorkerMode("fallback");
-            }
-            faceWorkerRef.current = null;
-            faceWorkerReadyRef.current = false;
-            faceWorkerEnabledRef.current = false;
-            return false;
-          }
-        })();
 
         // 1) Warm camera and 2) load MediaPipe models concurrently so
         // startup doesn't pay both latencies serially on mobile.
@@ -389,17 +430,26 @@ export function useVisionDetection(options?: {
           constraints.push({ video: true, audio: false });
 
           let usedConstraint = -1;
+          let lastCameraError: unknown = null;
           for (let i = 0; i < constraints.length; i++) {
             try {
               stream = await navigator.mediaDevices.getUserMedia(constraints[i]);
               usedConstraint = i;
               break;
             } catch (err) {
+              lastCameraError = err;
               console.log(`[useVisionDetection] constraint ${i} failed:`, err instanceof Error ? err.message : err);
+              if (
+                err instanceof DOMException
+                && (err.name === "NotAllowedError" || err.name === "SecurityError")
+              ) {
+                throw err;
+              }
             }
           }
 
           if (!stream) {
+            if (lastCameraError instanceof Error) throw lastCameraError;
             throw new Error("No camera found. Please connect a camera and grant permission.");
           }
 
@@ -430,7 +480,7 @@ export function useVisionDetection(options?: {
         })();
 
         const modelTask = (async () => {
-          const vision = await FilesetResolver.forVisionTasks(VISION_CDN);
+          const vision = await FilesetResolver.forVisionTasks(VISION_WASM_ROOT);
           if (cancelled) throw new Error("Vision init cancelled");
 
           async function createWithFallback<T>(
@@ -446,12 +496,10 @@ export function useVisionDetection(options?: {
           // Keep a local detector alive even when the worker starts. Module
           // workers can become unavailable after startup (CDN/CSP/context
           // loss); face detection must continue without reloading the page.
-          void faceWorkerTask;
           const faceDetector = await createWithFallback((v, d) =>
             FaceDetector.createFromOptions(v, {
               baseOptions: {
-                modelAssetPath:
-                  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+                modelAssetPath: FACE_DETECTOR_MODEL_PATH,
                 delegate: d,
               },
               runningMode: "VIDEO",
@@ -487,7 +535,7 @@ export function useVisionDetection(options?: {
         const [stream, modelBundle] = await Promise.all([streamTask, modelTask]);
         const { createWithFallback, faceDetector, gestureRecognizerTask } = modelBundle;
 
-        if (cancelled) {
+        if (cancelled || generation !== initGeneration) {
           stream.getTracks().forEach((t) => t.stop());
           faceDetector?.close();
           void gestureRecognizerTask.then((g) => g?.close?.()).catch(() => {});
@@ -496,11 +544,26 @@ export function useVisionDetection(options?: {
 
         faceDetectorRef.current = faceDetector;
         // ── Mark ready as soon as camera + face detector are available. ──
+        initAttempt = 0;
+        setError(null);
         setIsReady(true);
+
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          track.onended = () => {
+            if (cancelled || generation !== initGeneration) return;
+            initGeneration += 1;
+            console.warn("[useVisionDetection] camera stream ended; reconnecting");
+            setIsReady(false);
+            setError("Camera disconnected. Reconnecting…");
+            disposeMainResources();
+            scheduleVisionRetry();
+          };
+        }
 
         void gestureRecognizerTask.then((gestureRecognizer) => {
           if (!gestureRecognizer) return;
-          if (cancelled) {
+          if (cancelled || generation !== initGeneration) {
             gestureRecognizer.close();
             return;
           }
@@ -541,7 +604,7 @@ export function useVisionDetection(options?: {
             return null;
           }),
         ]).then(([faceLandmarker, objectDetector]) => {
-          if (cancelled) {
+          if (cancelled || generation !== initGeneration) {
             faceLandmarker?.close();
             objectDetector?.close();
             return;
@@ -550,13 +613,22 @@ export function useVisionDetection(options?: {
           objectDetectorRef.current = objectDetector;
         });
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && generation === initGeneration) {
           console.error("Vision detection init error:", err);
+          disposeMainResources();
           setIsReady(false);
-          setError(
-            err instanceof Error ? err.message : "Failed to initialize vision"
-          );
+          const message = err instanceof Error ? err.message : "Failed to initialize vision";
+          const isPermissionFailure =
+            err instanceof DOMException
+            && (err.name === "NotAllowedError" || err.name === "SecurityError");
+          setError(isPermissionFailure ? message : "Vision temporarily unavailable. Reconnecting…");
+          if (!isPermissionFailure) {
+            initAttempt += 1;
+            scheduleVisionRetry();
+          }
         }
+      } finally {
+        initInProgress = false;
       }
     }
 
@@ -564,17 +636,14 @@ export function useVisionDetection(options?: {
 
     return () => {
       cancelled = true;
+      initGeneration += 1;
+      window.clearTimeout(initRetryTimer);
+      window.clearTimeout(faceWorkerRetryTimer);
+      restartFaceWorkerRef.current = () => {};
       // Cleanup
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      faceDetectorRef.current?.close();
-      try { faceWorkerRef.current?.terminate(); } catch {}
-      faceWorkerRef.current = null;
-      faceWorkerReadyRef.current = false;
-      faceWorkerEnabledRef.current = false;
-      gestureRecognizerRef.current?.close();
-      faceLandmarkerRef.current?.close();
-      objectDetectorRef.current?.close();
+      disposeMainResources();
+      stopFaceWorker();
       console.error = origError;
     };
   }, [cameraSelector, enabled]);
@@ -618,17 +687,34 @@ export function useVisionDetection(options?: {
     // ── Face Detection ──
     let faces = 0;
     if (faceWorkerReadyRef.current && faceWorker) {
+      if (
+        faceWorkerInFlightRef.current
+        && faceWorkerRequestStartedAtRef.current > 0
+        && performance.now() - faceWorkerRequestStartedAtRef.current > FACE_WORKER_HUNG_MS
+      ) {
+        restartFaceWorkerRef.current();
+      }
       // Keep exactly one worker inference in flight to avoid queue buildup.
-      if (!faceWorkerInFlightRef.current) {
+      if (faceWorkerReadyRef.current && !faceWorkerInFlightRef.current) {
         faceWorkerInFlightRef.current = true;
+        faceWorkerRequestStartedAtRef.current = performance.now();
         createImageBitmap(video)
           .then((bitmap) => {
-            faceWorker.postMessage({ type: "detect", imageBitmap: bitmap, ts: safeNow }, [bitmap]);
+            if (faceWorkerRef.current !== faceWorker || !faceWorkerReadyRef.current) {
+              bitmap.close();
+              return;
+            }
+            try {
+              faceWorker.postMessage({ type: "detect", imageBitmap: bitmap, ts: safeNow }, [bitmap]);
+            } catch {
+              bitmap.close();
+              restartFaceWorkerRef.current();
+            }
           })
           .catch(() => {
             faceWorkerInFlightRef.current = false;
-            faceWorkerReadyRef.current = false;
-            faceWorkerEnabledRef.current = false;
+            faceWorkerRequestStartedAtRef.current = 0;
+            restartFaceWorkerRef.current();
           });
       }
       const hasFreshWorkerResult =
@@ -697,7 +783,7 @@ export function useVisionDetection(options?: {
       setFacePresenceDurationMs((previous) => (previous === 0 ? previous : 0));
     }
 
-    // ── Smile Detection + Gender Detection (FaceLandmarker blendshapes + landmarks) ──
+    // ── Smile Detection (FaceLandmarker blendshapes) ──
     const landmarkInterval = isMobileRef.current
       ? LANDMARK_INTERVAL_MOBILE_MS
       : LANDMARK_INTERVAL_MS;
@@ -718,72 +804,6 @@ export function useVisionDetection(options?: {
           ) {
             lastSmileUiUpdateAtRef.current = safeNow;
             setUserSmile(smoothedSmileRef.current);
-          }
-        }
-
-        // ── Gender estimation from face landmark geometry ──
-        // Uses jaw width/face height ratio and brow thickness heuristics.
-        // Male faces tend to have wider jaws relative to face height, more prominent brows.
-        if (!genderLockedRef.current && landmarkResult?.faceLandmarks?.[0]) {
-          const lm = landmarkResult.faceLandmarks[0];
-          // Key landmarks (MediaPipe face mesh 468 points):
-          // 10 = forehead top, 152 = chin bottom
-          // 234 = left jaw, 454 = right jaw  
-          // 21 = left inner brow, 251 = right inner brow
-          // 70 = left brow ridge, 300 = right brow ridge
-          if (lm.length > 454) {
-            const forehead = lm[10];
-            const chin = lm[152];
-            const leftJaw = lm[234];
-            const rightJaw = lm[454];
-            const leftBrow = lm[70];
-            const rightBrow = lm[300];
-            const leftInnerBrow = lm[21];
-            const rightInnerBrow = lm[251];
-
-            const faceHeight = Math.abs(chin.y - forehead.y);
-            const jawWidth = Math.abs(rightJaw.x - leftJaw.x);
-
-            if (faceHeight > 0.01) {
-              // Jaw-to-face ratio: males typically > 0.78, females < 0.75
-              const jawRatio = jawWidth / faceHeight;
-              // Brow prominence: distance of brow ridge below forehead line
-              const browDrop = ((leftBrow.y - forehead.y) + (rightBrow.y - forehead.y)) / 2;
-              const browRatio = browDrop / faceHeight;
-              // Inter-brow distance relative to jaw (males have wider-set brows)
-              const browSpan = Math.abs(rightInnerBrow.x - leftInnerBrow.x);
-              const browRelative = browSpan / jawWidth;
-
-              // Score: positive = male leaning, negative = female leaning
-              let score = 0;
-              if (jawRatio > 0.78) score += 1;
-              else if (jawRatio < 0.72) score -= 1;
-              if (browRatio > 0.12) score += 1;
-              else if (browRatio < 0.08) score -= 1;
-              if (browRelative > 0.3) score += 0.5;
-              else if (browRelative < 0.22) score -= 0.5;
-
-              const vote = score >= 0.5 ? 1 : score <= -0.5 ? -1 : 0;
-              if (vote !== 0) {
-                genderVotesRef.current.push(vote);
-                // Keep last 30 votes
-                if (genderVotesRef.current.length > 30) {
-                  genderVotesRef.current = genderVotesRef.current.slice(-30);
-                }
-                // Need at least 10 votes to decide
-                if (genderVotesRef.current.length >= 10) {
-                  const sum = genderVotesRef.current.reduce((a, b) => a + b, 0);
-                  const ratio = sum / genderVotesRef.current.length;
-                  if (ratio > 0.3) {
-                    setUserGender("male");
-                    genderLockedRef.current = true;
-                  } else if (ratio < -0.3) {
-                    setUserGender("female");
-                    genderLockedRef.current = true;
-                  }
-                }
-              }
-            }
           }
         }
       } catch {
@@ -1026,6 +1046,7 @@ export function useVisionDetection(options?: {
     faceWorkerInFlightRef.current = false;
     faceWorkerCountRef.current = 0;
     faceWorkerLastTsRef.current = 0;
+    faceWorkerRequestStartedAtRef.current = 0;
     gestureRecognizerRef.current?.close();
     gestureRecognizerRef.current = null;
     faceLandmarkerRef.current?.close();
