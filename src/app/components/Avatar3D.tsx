@@ -37,7 +37,25 @@ const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
 const SANDIPANI_IDLE_LIP_CLOSURE = 0.62;
+const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.56;
+const SANDIPANI_MIN_SPEECH_LIP_CLOSURE = 0.18;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
+const SANDIPANI_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
+  viseme_PP: 1,
+  viseme_FF: 0.55,
+  viseme_TH: 0.44,
+  viseme_DD: 0.5,
+  viseme_kk: 0.56,
+  viseme_CH: 0.58,
+  viseme_SS: 0.5,
+  viseme_nn: 0.46,
+  viseme_RR: 0.52,
+  viseme_aa: 0.62,
+  viseme_E: 0.55,
+  viseme_I: 0.5,
+  viseme_O: 0.58,
+  viseme_U: 0.52,
+};
 const CHEEK_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 0,
   viseme_FF: 0.18,
@@ -629,7 +647,8 @@ function AvatarModel({
   const usesEmbeddedAnimation = /\.gl(?:b|tf)($|\?)/i.test(avatarUrl);
   const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
   const gestureClips = readGestureClipLibrary();
-  const idleLipClosure = /\/sandipani(?:-lite)?\.glb(?:$|\?)/i.test(avatarUrl)
+  const isSandipaniAvatar = /\/sandipani(?:-lite)?\.glb(?:$|\?)/i.test(avatarUrl);
+  const idleLipClosure = isSandipaniAvatar
     ? SANDIPANI_IDLE_LIP_CLOSURE
     : 0;
 
@@ -1248,13 +1267,21 @@ function AvatarModel({
       activeViseme === "viseme_PP"
         ? LIP_SYNC_CLOSURE_GAIN
         : LIP_SYNC_OPEN_GAIN;
-    const activeIntensity = mouthOpen
+    const uncalibratedIntensity = mouthOpen
       ? syncMode === "follower"
         ? sourceIntensity
         : Math.min(MAX_LIP_SYNC_INFLUENCE, sourceIntensity * gain)
       : 0;
+    const activeIntensity = isSandipaniAvatar
+      ? Math.min(
+          SANDIPANI_MAX_LIP_SYNC_INFLUENCE,
+          uncalibratedIntensity * SANDIPANI_VISEME_GAIN[activeViseme],
+        )
+      : uncalibratedIntensity;
     const closingLips = !mouthOpen || activeViseme === "viseme_PP";
-    const mouthBlend = 1 - Math.exp(-delta * (closingLips ? 42 : 18));
+    const mouthBlend = 1 - Math.exp(
+      -delta * (closingLips ? 42 : isSandipaniAvatar ? 15 : 18),
+    );
     const cheekTarget = mouthOpen
       ? Math.min(0.38, activeIntensity * CHEEK_VISEME_GAIN[activeViseme])
       : 0;
@@ -1263,11 +1290,29 @@ function AvatarModel({
       const dictionary = mesh.morphTargetDictionary;
       const influences = mesh.morphTargetInfluences;
       if (!dictionary || !influences) continue;
+      const sandipaniSpeechClosure = mouthOpen && isSandipaniAvatar
+        ? activeViseme === "viseme_PP"
+          ? Math.max(
+              idleLipClosure,
+              Math.min(0.78, sourceIntensity * LIP_SYNC_CLOSURE_GAIN),
+            )
+          : THREE.MathUtils.lerp(
+              idleLipClosure,
+              SANDIPANI_MIN_SPEECH_LIP_CLOSURE,
+              THREE.MathUtils.clamp(
+                activeIntensity / SANDIPANI_MAX_LIP_SYNC_INFLUENCE,
+                0,
+                1,
+              ),
+            )
+        : null;
       for (const viseme of AVATAR_VISEMES) {
         const index = dictionary[viseme];
         if (index === undefined) continue;
         const targetInfluence = mouthOpen
-          ? viseme === activeViseme
+          ? isSandipaniAvatar && viseme === "viseme_PP"
+            ? sandipaniSpeechClosure ?? 0
+            : viseme === activeViseme
             ? viseme === "viseme_PP"
               ? 1
               : activeIntensity

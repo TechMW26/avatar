@@ -698,6 +698,9 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
             firstMessage: getFirstMessage(),
             language: "hi",
           },
+          tts: {
+            speed: character.slug === "sandipani" ? 1.08 : 1,
+          },
         },
       });
     } catch (err) {
@@ -714,6 +717,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   }, [
     blockAutoStart,
     character.agentId,
+    character.slug,
     getFirstMessage,
     getLivePrompt,
   ]);
