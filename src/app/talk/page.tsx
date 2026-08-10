@@ -393,7 +393,8 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     if (waved) return character.greetings.wave;
     if (thumbsUp) return character.greetings.approval;
     if (peace) return character.greetings.peace;
-    return character.greetings.default;
+    const welcomes = character.greetings.welcomes;
+    return welcomes[Math.floor(Math.random() * welcomes.length)];
   }, [character]);
 
   const conversation = useConversation({

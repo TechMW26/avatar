@@ -16,7 +16,7 @@ export interface CharacterProfile {
   modelPath: string;
   portraitPath: string;
   greetings: {
-    default: string;
+    welcomes: string[];
     namaste: string;
     wave: string;
     approval: string;
@@ -40,10 +40,13 @@ export const CHARACTERS: readonly CharacterProfile[] = [
     modelPath: "/models/sandipani.glb",
     portraitPath: "/portraits/rishi-sandipani.png",
     greetings: {
-      default:
-        "आओ, बैठो। हम्म… बताओ, आज मन में क्या चल रहा है?",
+      welcomes: [
+        "हरि ॐ। आओ, तुम्हारा स्वागत है। बताओ, आज मन में क्या चल रहा है?",
+        "ॐ शांति। आओ, सहज होकर बैठो—आज किस बात पर विचार करना है?",
+        "कल्याण हो। अच्छा हुआ तुम आए। कहो, किस बात पर मन अटका है?",
+      ],
       namaste:
-        "नमस्ते। आओ—बताओ, आज किस बात पर मन अटका है?",
+        "हरि ॐ। तुम्हारे नमस्कार का उत्तर हृदय से। आओ—बताओ, मन में क्या है?",
       wave:
         "हाँ, मैंने देख लिया। आओ, बात शुरू करें—क्या सोच रहे हो?",
       approval:
@@ -73,10 +76,13 @@ export const CHARACTERS: readonly CharacterProfile[] = [
     modelPath: "/models/rani-laxmi-bai.glb",
     portraitPath: "/portraits/rani-lakshmi-bai.png",
     greetings: {
-      default:
-        "आइए। बताइए—कौन-सी बात आपको रोक रही है?",
+      welcomes: [
+        "नमस्कार। झाँसी में आपका स्वागत है। कहिए, आज मन में क्या है?",
+        "स्वागत है। आइए—बिना संकोच बताइए, कौन-सी बात आपको रोक रही है?",
+        "नमस्कार। अच्छा हुआ आप आए। कहिए, आज किस चुनौती का सामना करना है?",
+      ],
       namaste:
-        "नमस्कार। हम्म… कहिए, मन में क्या है?",
+        "नमस्कार। आपका अभिवादन स्वीकार है। आइए—खुलकर कहिए, मन में क्या है?",
       wave:
         "हाँ, मैंने देख लिया। आइए—अपनी बात खुलकर कहिए।",
       approval:
@@ -106,10 +112,13 @@ export const CHARACTERS: readonly CharacterProfile[] = [
     modelPath: "/models/shivaji-maharaj.glb",
     portraitPath: "/portraits/chhatrapati-shivaji-maharaj.png",
     greetings: {
-      default:
-        "आइए। बताइए—किस बात पर निर्णय लेना है?",
+      welcomes: [
+        "जय भवानी! आइए, आपका स्वागत है। कहिए—आज कौन-सी परिस्थिति सामने है?",
+        "जय भवानी। आइए, सीधे बात करें—किस निर्णय पर मन अटका है?",
+        "जय भवानी! स्वागत है। बताइए—लक्ष्य क्या है और बाधा कहाँ है?",
+      ],
       namaste:
-        "नमस्कार। हाँ, कहिए—क्या परिस्थिति है?",
+        "जय भवानी। आपका नमस्कार स्वीकार है। आइए—कहिए, क्या परिस्थिति है?",
       wave:
         "हाँ, मैंने देख लिया। आइए—बात सीधे कहिए।",
       approval:
