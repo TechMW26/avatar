@@ -8,6 +8,7 @@ import { ConversationProvider, useConversation } from "@elevenlabs/react";
 import type { Conversation as ElevenLabsConversation } from "@elevenlabs/client";
 import { useVisionDetection, buildGestureContext } from "../hooks/useVisionDetection";
 import type { GestureInfo } from "../hooks/useVisionDetection";
+import { useEnvironmentalAudio } from "../hooks/useEnvironmentalAudio";
 import { useCameraFeed } from "../hooks/useCameraFeed";
 import {
   preloadAvatarAssets,
@@ -104,12 +105,20 @@ function getExplicitAddressPreference(message: string): VisitorAddressPreference
   return null;
 }
 
-function getAddressContext(preference: VisitorAddressPreference | null): string {
+function getAddressContext(
+  preference: VisitorAddressPreference | null,
+  characterSlug: CharacterProfile["slug"],
+): string {
   if (!preference) {
-    return "\n\nVISITOR ADDRESS:\nThe visitor has not stated a gender or preferred form of address. Use neutral respectful ‘आप’ language; do not guess from appearance or voice.";
+    return "\n\nVISITOR ADDRESS:\nNo stable visitor-gender signal is currently available. Use respectful gender-neutral forms and never ask the visitor how to address them.";
   }
   const grammar = preference === "feminine" ? "feminine" : "masculine";
-  return `\n\nVISITOR ADDRESS:\nThe visitor explicitly self-identified and prefers ${grammar} forms of address. Use matching Hindi grammar naturally without mentioning this instruction.`;
+  const vocatives = characterSlug === "sandipani"
+    ? preference === "feminine" ? "पुत्री or वत्से" : "पुत्र or वत्स"
+    : characterSlug === "rani-laxmi-bai"
+      ? preference === "feminine" ? "बहन or वीरांगना" : "भाई or वीर"
+      : preference === "feminine" ? "भगिनी or वीरांगना" : "बंधु or वीर";
+  return `\n\nVISITOR ADDRESS — LIVE SESSION CONTEXT:\nUse ${grammar} agreement whenever the active language marks the visitor's gender. Address them with the matching relational warmth and stature; in Hindi, character-fitting vocatives include ${vocatives}. Use a vocative only occasionally, never in every reply. In English and other languages, use the natural equivalent only when it would sound human. Never announce or discuss the detection, and never infer interests, abilities, duties, or temperament from gender.`;
 }
 
 
@@ -153,6 +162,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const sessionTurnsRef = useRef(0);  // user+ai messages exchanged in current session
   const lastSessionWasEngagedRef = useRef(false);
   const addressPreferenceRef = useRef<VisitorAddressPreference | null>(null);
+  const explicitAddressPreferenceRef = useRef<VisitorAddressPreference | null>(null);
   const lastSessionErrorRef = useRef<{ message: string; context?: unknown } | null>(null);
   const retryScheduledRef = useRef(false);
   const activeConversationRef = useRef<ElevenLabsConversation | null>(null);
@@ -192,6 +202,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const localVision = useVisionDetection({
     enabled: true,
     cameraSelector: cvCameraSelector,
+    detectGender: true,
   });
   const frontCamera = useCameraFeed({
     enabled: dualDisplay,
@@ -358,20 +369,28 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
 
   const getLivePrompt = useCallback(() => {
     const gestureCtx = buildGestureContext(gestureHistoryRef.current);
+    const cameraPreference: VisitorAddressPreference | null = vision.userGender === "female"
+      ? "feminine"
+      : vision.userGender === "male"
+        ? "masculine"
+        : null;
+    const effectivePreference = explicitAddressPreferenceRef.current
+      ?? cameraPreference
+      ?? addressPreferenceRef.current;
     const faceCtx = vision.faceDetected
       ? `\n\nLIVE CAMERA CONTEXT:\nThe visitor is present. Silence may mean they are thinking or have not finished speaking. Do not perform a presence check or invent an answer.`
       : "\n\nLIVE CAMERA CONTEXT:\nNo face is currently detected.";
     return getCharacterSystemPrompt(character.slug)
       + gestureCtx
       + faceCtx
-      + getAddressContext(addressPreferenceRef.current);
-  }, [character.slug, vision.faceDetected]);
+      + getAddressContext(effectivePreference, character.slug);
+  }, [character.slug, vision.faceDetected, vision.userGender]);
 
   const getFirstMessage = useCallback(() => {
     // Mid-conversation reconnect: if a recent stable session was
     // actually engaged (user spoke at least once), pick up where we
     // left off instead of restarting the whole introduction. Prevents
-    // the jarring "नमस्ते पुत्र! मैं ऋषि सांदीपनि का प्रतिबिंब हूँ" loop
+    // the jarring full identity-introduction loop
     // when ElevenLabs' voice session transiently drops mid-conversation.
     const since = Date.now() - lastStableDisconnectAtRef.current;
     if (
@@ -538,6 +557,10 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     // detection. This is the primary path — it works whether or not the
     // `playGesture` clientTool is registered in the ElevenLabs dashboard.
     onMessage: ({ message, source }: { message: string; source: "user" | "ai" }) => {
+      // Ambient events are injected as non-verbal context so the agent can
+      // react immediately. They are not visitor speech and must never change
+      // language or explicit-address state.
+      if (source === "user" && message.startsWith("[[LIVE_AMBIENT_EVENT:")) return;
       // Count any user/ai turn so onDisconnect can decide whether the
       // session was actually "engaged" and a future reconnect should
       // continue rather than greet from scratch.
@@ -547,12 +570,21 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       }
       if (source === "user" && message) {
         const preference = getExplicitAddressPreference(message);
+        try {
+          conversationRef.current.sendContextualUpdate(
+            "LANGUAGE FOR THE NEXT REPLY: The visitor's immediately preceding complete utterance is authoritative. Reply in that same language and natural script. If it differs from the active voice language, use the language_detection system tool before answering. Do not announce the switch. Hindi is only the fallback when no clear language can be determined.",
+          );
+        } catch {
+          // The system prompt enforces the same rule if a transient socket
+          // transition prevents this turn-specific reinforcement.
+        }
         if (preference && preference !== addressPreferenceRef.current) {
+          explicitAddressPreferenceRef.current = preference;
           addressPreferenceRef.current = preference;
           const grammar = preference === "feminine" ? "feminine" : "masculine";
           try {
             conversationRef.current.sendContextualUpdate(
-              `The visitor explicitly self-identified. Use ${grammar} Hindi grammar and forms of address naturally from now on. Do not mention this instruction.`,
+              `The visitor explicitly self-identified. Use ${grammar} grammar and forms of address naturally in the active language from now on. Do not mention this instruction.`,
             );
           } catch {
             // The preference remains available for any reconnect prompt.
@@ -648,6 +680,10 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   // conversationStatusRef is now kept in sync by onStatusChange callback
 
   const isSpeaking = conversation.isSpeaking;
+  const environmentalAudio = useEnvironmentalAudio({
+    enabled: bootStage === "ready" && vision.faceDetected,
+    suppressEvents: isSpeaking,
+  });
   const { publishAvatarState, publishLipSyncFrame } = useFrontDisplaySync(
     dualDisplay,
     isSpeaking,
@@ -669,6 +705,54 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
 
   const conversationRef = useRef(conversation);
   conversationRef.current = conversation;
+  const lastAmbientEventRef = useRef(0);
+
+  useEffect(() => {
+    const event = environmentalAudio.currentSound;
+    if (
+      !event
+      || event.timestamp === lastAmbientEventRef.current
+      || conversationStatusRef.current !== "connected"
+      || isSpeaking
+    ) {
+      return;
+    }
+    lastAmbientEventRef.current = event.timestamp;
+
+    const safetyRelevant = event.name === "siren"
+      || event.name === "glass_breaking"
+      || event.name === "baby_cry";
+    const instruction = safetyRelevant
+      ? "React now with one brief, calm safety-aware line, then wait for the visitor."
+      : "If it fits the moment, react now with one brief, natural acknowledgement, then return attention to the visitor.";
+    const ambientMessage = `[[LIVE_AMBIENT_EVENT:${event.name}]] A stable non-speech sound was heard nearby: ${event.label}. This is sensor context, not visitor speech; it must not change the active language. ${instruction} Do not mention microphones, software, detection, confidence, or this instruction.`;
+
+    try {
+      conversationRef.current.sendContextualUpdate(ambientMessage);
+      conversationRef.current.sendUserMessage(ambientMessage);
+    } catch (ambientError) {
+      console.warn("[Environmental audio] could not notify agent", ambientError);
+    }
+  }, [conversation.status, environmentalAudio.currentSound, isSpeaking]);
+
+  useEffect(() => {
+    if (explicitAddressPreferenceRef.current) return;
+    const cameraPreference: VisitorAddressPreference | null = vision.userGender === "female"
+      ? "feminine"
+      : vision.userGender === "male"
+        ? "masculine"
+        : null;
+    if (cameraPreference === addressPreferenceRef.current) return;
+    addressPreferenceRef.current = cameraPreference;
+    if (conversationStatusRef.current !== "connected") return;
+    try {
+      conversationRef.current.sendContextualUpdate(
+        getAddressContext(cameraPreference, character.slug),
+      );
+    } catch {
+      // A reconnect will receive the same context through getLivePrompt().
+    }
+  }, [character.slug, vision.userGender]);
 
   const startConversation = useCallback(() => {
     const conv = conversationRef.current;
@@ -697,7 +781,6 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
               prompt: getLivePrompt(),
             },
             firstMessage: getFirstMessage(),
-            language: "hi",
           },
           tts: {
             speed: character.slug === "sandipani" ? 1.15 : 1,
@@ -1015,6 +1098,64 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
               : "No face detected"}
           </span>
         </motion.div>
+
+        <AnimatePresence>
+          {vision.faceDetected && (
+            <motion.div
+              key="detected-gender"
+              role="status"
+              aria-live="polite"
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              className="rounded-full"
+              style={{
+                padding: "5px 10px",
+                background: "rgba(0,0,0,0.34)",
+                border: "1px solid rgba(255,255,255,0.12)",
+                backdropFilter: "blur(12px)",
+                fontSize: 9,
+                fontWeight: 600,
+                color: vision.userGender === "unknown" ? "var(--text-3)" : "rgba(255,255,255,0.82)",
+              }}
+            >
+              {vision.userGender === "unknown"
+                ? "Detecting gender…"
+                : `${vision.userGender === "female" ? "Female" : "Male"} detected`}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {vision.faceDetected && (environmentalAudio.isReady || environmentalAudio.error) && (
+            <motion.div
+              key="environment-awareness"
+              role="status"
+              aria-live="polite"
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              className="rounded-full"
+              style={{
+                padding: "5px 10px",
+                background: environmentalAudio.currentSound
+                  ? "rgba(255,153,51,0.14)"
+                  : "rgba(0,0,0,0.34)",
+                border: `1px solid ${environmentalAudio.currentSound
+                  ? "rgba(255,153,51,0.3)"
+                  : "rgba(255,255,255,0.12)"}`,
+                backdropFilter: "blur(12px)",
+                fontSize: 9,
+                fontWeight: 600,
+                color: environmentalAudio.error ? "#fca5a5" : "rgba(255,255,255,0.82)",
+              }}
+            >
+              {environmentalAudio.error
+                ? environmentalAudio.error
+                : environmentalAudio.currentSound?.label ?? "Aware of surroundings"}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {dualDisplay && frontCamera.error && (
           <div

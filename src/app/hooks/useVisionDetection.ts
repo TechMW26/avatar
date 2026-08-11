@@ -47,7 +47,7 @@ export interface VisionState {
   userSmile: number;
   /** Whether a phone/cell phone is detected in the frame */
   phoneDetected: boolean;
-  /** Kept for display-sync compatibility; appearance is never used to infer gender. */
+  /** Stabilized presentation estimate from the visible face. */
   userGender: "male" | "female" | "unknown";
   /** Ref to attach to a <video> element */
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -63,6 +63,7 @@ export interface VisionState {
 
 const VISION_WASM_ROOT = "/mediapipe/wasm";
 const FACE_DETECTOR_MODEL_PATH = "/mediapipe/models/blaze_face_short_range.tflite";
+const FACE_DETECTION_CONFIDENCE = 0.42;
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const GESTURE_MIN_CONFIDENCE = 0.65;
@@ -77,7 +78,7 @@ const OBJECT_DETECT_INTERVAL_MS = 333;
 const OBJECT_DETECT_INTERVAL_MOBILE_MS = 900;
 const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
 const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
-const FACE_LOSS_GRACE_MS = 700; // short grace window smooths mobile jitter
+const FACE_LOSS_GRACE_MS = 1_400; // covers one complete worker tile scan
 const FACE_WORKER_STALE_MS = 1200;
 const FACE_WORKER_HUNG_MS = 3_000;
 const FACE_WORKER_INIT_TIMEOUT_MS = 12_000;
@@ -91,6 +92,43 @@ const NAMASTE_RETRIGGER_MS = 6500;
 const FACE_WORKER_MODE_KEY = "rishi:vision:face-worker-mode";
 const FACE_WORKER_FAIL_COUNT_KEY = "rishi:vision:face-worker-fail-count";
 const FACE_WORKER_DISABLE_UNTIL_KEY = "rishi:vision:face-worker-disable-until";
+const GENDER_MODEL_ROOT = "/face-api-models";
+const GENDER_INFERENCE_INTERVAL_MS = 2_400;
+const GENDER_MIN_CONFIDENCE = 0.76;
+const GENDER_ACQUIRE_SAMPLES = 3;
+const GENDER_SWITCH_SAMPLES = 4;
+
+type UserGender = VisionState["userGender"];
+type FaceApiModule = typeof import("@vladmandic/face-api");
+
+let genderClassifierPromise: Promise<FaceApiModule | null> | null = null;
+
+function loadGenderClassifier(): Promise<FaceApiModule | null> {
+  if (genderClassifierPromise) return genderClassifierPromise;
+  genderClassifierPromise = import("@vladmandic/face-api")
+    .then(async (faceApi) => {
+      // Gender classification runs only every few seconds. CPU avoids adding
+      // another WebGL context beside MediaPipe and the Three.js avatar.
+      const tfRuntime = faceApi.tf as unknown as {
+        setBackend: (backend: string) => Promise<boolean>;
+        ready: () => Promise<void>;
+      };
+      await tfRuntime.setBackend("cpu");
+      await tfRuntime.ready();
+      await Promise.all([
+        faceApi.nets.tinyFaceDetector.loadFromUri(GENDER_MODEL_ROOT),
+        faceApi.nets.faceLandmark68TinyNet.loadFromUri(GENDER_MODEL_ROOT),
+        faceApi.nets.ageGenderNet.loadFromUri(GENDER_MODEL_ROOT),
+      ]);
+      return faceApi;
+    })
+    .catch((error) => {
+      console.warn("Gender classifier unavailable:", error);
+      genderClassifierPromise = null;
+      return null;
+    });
+  return genderClassifierPromise;
+}
 
 function isMacOrWindowsDesktop(): boolean {
   if (typeof navigator === "undefined") return false;
@@ -110,6 +148,18 @@ function isMacOrWindowsDesktop(): boolean {
   return (isWindows || isMac) && !isAndroid && !isIOSMobile;
 }
 
+async function createNativeCameraFrame(video: HTMLVideoElement): Promise<ImageBitmap> {
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+
+  // Supplying the source rectangle explicitly prevents a hidden/CSS-cropped
+  // detector video from ever influencing the pixels sent to the worker.
+  if (width > 0 && height > 0) {
+    return createImageBitmap(video, 0, 0, width, height);
+  }
+  return createImageBitmap(video);
+}
+
 function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
   const byName = new Map<string, GestureInfo>();
   gestures.forEach((gesture) => {
@@ -124,9 +174,11 @@ function dedupeFrameGestures(gestures: GestureInfo[]): GestureInfo[] {
 export function useVisionDetection(options?: {
   enabled?: boolean;
   cameraSelector?: string | null;
+  detectGender?: boolean;
 }): VisionState {
   const enabled = options?.enabled ?? true;
   const cameraSelector = options?.cameraSelector ?? null;
+  const detectGender = options?.detectGender ?? false;
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
   const faceWorkerRef = useRef<Worker | null>(null);
@@ -170,10 +222,15 @@ export function useVisionDetection(options?: {
   // Phone detection
   const [phoneDetected, setPhoneDetected] = useState(false);
 
-  // A face cannot reliably determine gender identity. Keep the legacy field
-  // neutral for display-sync compatibility and use explicit conversational
-  // self-identification for forms of address instead.
-  const userGender = "unknown" as const;
+  // Gender-presentation estimate. Multiple high-confidence samples are
+  // required before acquisition, and even more before switching, so a single
+  // blurred/profile frame cannot flip the conversation grammar.
+  const [userGender, setUserGender] = useState<UserGender>("unknown");
+  const userGenderRef = useRef<UserGender>("unknown");
+  const genderClassifierRef = useRef<FaceApiModule | null>(null);
+  const genderInferenceInFlightRef = useRef(false);
+  const lastGenderInferenceAtRef = useRef(0);
+  const genderCandidateRef = useRef<{ gender: Exclude<UserGender, "unknown">; samples: number } | null>(null);
 
   // Gesture tracking
   const [currentGestures, setCurrentGestures] = useState<GestureInfo[]>([]);
@@ -267,7 +324,10 @@ export function useVisionDetection(options?: {
       let worker: Worker | null = null;
 
       try {
-        const activeWorker = new Worker("/face-detector-worker.js", { type: "module" });
+        // MediaPipe's WASM bootstrap uses importScripts inside workers. A
+        // classic worker supports that path; a module worker throws and then
+        // hits the library's non-standard `self.import` fallback.
+        const activeWorker = new Worker("/face-detector-worker.js");
         worker = activeWorker;
         faceWorkerRef.current = activeWorker;
         await new Promise<void>((resolve, reject) => {
@@ -327,7 +387,7 @@ export function useVisionDetection(options?: {
             type: "init",
             wasmRoot: VISION_WASM_ROOT,
             modelAssetPath: FACE_DETECTOR_MODEL_PATH,
-            minDetectionConfidence: 0.5,
+            minDetectionConfidence: FACE_DETECTION_CONFIDENCE,
           });
         });
         console.log("[useVisionDetection] face worker ready (offloaded mode)");
@@ -475,6 +535,13 @@ export function useVisionDetection(options?: {
                 console.warn("Video play() failed — detection may not start until user interaction.");
               });
             }
+            const settings = track?.getSettings();
+            const nativeWidth = video.videoWidth || settings?.width || 0;
+            const nativeHeight = video.videoHeight || settings?.height || 0;
+            if (nativeWidth > 0 && nativeHeight > 0) {
+              video.width = nativeWidth;
+              video.height = nativeHeight;
+            }
           }
           return stream;
         })();
@@ -503,7 +570,7 @@ export function useVisionDetection(options?: {
                 delegate: d,
               },
               runningMode: "VIDEO",
-              minDetectionConfidence: 0.5,
+              minDetectionConfidence: FACE_DETECTION_CONFIDENCE,
             }),
           );
 
@@ -547,6 +614,14 @@ export function useVisionDetection(options?: {
         initAttempt = 0;
         setError(null);
         setIsReady(true);
+
+        if (detectGender) {
+          void loadGenderClassifier().then((classifier) => {
+            if (!cancelled && generation === initGeneration) {
+              genderClassifierRef.current = classifier;
+            }
+          });
+        }
 
         const track = stream.getVideoTracks()[0];
         if (track) {
@@ -646,7 +721,7 @@ export function useVisionDetection(options?: {
       stopFaceWorker();
       console.error = origError;
     };
-  }, [cameraSelector, enabled]);
+  }, [cameraSelector, detectGender, enabled]);
 
   // Detection loop — runs at DETECTION_INTERVAL_MS via rAF
   const detect = useCallback(() => {
@@ -698,7 +773,7 @@ export function useVisionDetection(options?: {
       if (faceWorkerReadyRef.current && !faceWorkerInFlightRef.current) {
         faceWorkerInFlightRef.current = true;
         faceWorkerRequestStartedAtRef.current = performance.now();
-        createImageBitmap(video)
+        createNativeCameraFrame(video)
           .then((bitmap) => {
             if (faceWorkerRef.current !== faceWorker || !faceWorkerReadyRef.current) {
               bitmap.close();
@@ -781,6 +856,71 @@ export function useVisionDetection(options?: {
     } else {
       faceStartRef.current = null;
       setFacePresenceDurationMs((previous) => (previous === 0 ? previous : 0));
+    }
+
+    // ── Stabilized gender-presentation estimation ──
+    const genderNow = performance.now();
+    const genderClassifier = genderClassifierRef.current;
+    if (
+      detectGender
+      && hasFace
+      && genderClassifier
+      && !genderInferenceInFlightRef.current
+      && genderNow - lastGenderInferenceAtRef.current >= GENDER_INFERENCE_INTERVAL_MS
+    ) {
+      lastGenderInferenceAtRef.current = genderNow;
+      genderInferenceInFlightRef.current = true;
+      const options = new genderClassifier.TinyFaceDetectorOptions({
+        inputSize: 224,
+        scoreThreshold: 0.55,
+      });
+      void genderClassifier
+        .detectAllFaces(video, options)
+        .withFaceLandmarks(true)
+        .withAgeAndGender()
+        .then((results) => {
+          // When several people are visible, address the foreground visitor:
+          // the largest aligned face, not whichever face happened to receive
+          // the detector's highest confidence score.
+          const result = results.reduce<(typeof results)[number] | null>((largest, item) => {
+            if (!largest) return item;
+            const itemArea = item.detection.box.width * item.detection.box.height;
+            const largestArea = largest.detection.box.width * largest.detection.box.height;
+            return itemArea > largestArea ? item : largest;
+          }, null);
+          if (!result || !stableFaceDetectedRef.current) return results;
+          const confidence = result.genderProbability ?? 0;
+          if (confidence < GENDER_MIN_CONFIDENCE) {
+            genderCandidateRef.current = null;
+            return results;
+          }
+          const candidate = result.gender === "female" ? "female" : "male";
+          const previousCandidate = genderCandidateRef.current;
+          const samples = previousCandidate?.gender === candidate
+            ? previousCandidate.samples + 1
+            : 1;
+          genderCandidateRef.current = { gender: candidate, samples };
+          const requiredSamples = userGenderRef.current === "unknown"
+            ? GENDER_ACQUIRE_SAMPLES
+            : userGenderRef.current === candidate
+              ? 1
+              : GENDER_SWITCH_SAMPLES;
+          if (samples >= requiredSamples && userGenderRef.current !== candidate) {
+            userGenderRef.current = candidate;
+            setUserGender(candidate);
+          }
+          return results;
+        })
+        .catch(() => {
+          // A transient inference failure should not affect face detection.
+        })
+        .finally(() => {
+          genderInferenceInFlightRef.current = false;
+        });
+    } else if (!hasFace && userGenderRef.current !== "unknown") {
+      userGenderRef.current = "unknown";
+      genderCandidateRef.current = null;
+      setUserGender("unknown");
     }
 
     // ── Smile Detection (FaceLandmarker blendshapes) ──
@@ -1019,7 +1159,7 @@ export function useVisionDetection(options?: {
     }
 
     rafRef.current = requestAnimationFrame(() => detectRef.current());
-  }, []);
+  }, [detectGender]);
 
   // Start detection loop once ready
   useEffect(() => {
@@ -1078,6 +1218,11 @@ export function useVisionDetection(options?: {
     setCurrentGestures([]);
     setUserSmile(0);
     setPhoneDetected(false);
+    userGenderRef.current = "unknown";
+    genderCandidateRef.current = null;
+    genderInferenceInFlightRef.current = false;
+    lastGenderInferenceAtRef.current = 0;
+    setUserGender("unknown");
   }, []);
 
   return {

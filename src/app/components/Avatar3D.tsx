@@ -36,9 +36,7 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
-const SANDIPANI_IDLE_LIP_CLOSURE = 0.7;
 const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.18;
-const SANDIPANI_MIN_SPEECH_LIP_CLOSURE = 0.36;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
 const SANDIPANI_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 1,
@@ -127,6 +125,8 @@ const FACE_DEBOUNCE_MS = 350;
 // Never replay the same gesture too quickly, even if a narrower trigger
 // cooldown would otherwise allow it.
 const SAME_GESTURE_COOLDOWN_MS = 4_500;
+const SPEAKING_GESTURE_DELAY_MS = 450;
+const SPEAKING_GESTURE_COOLDOWN_MS = 8_000;
 
 /* ── Stage geometry ──
    The animated foot bones are locked to the viewport floor while the grass
@@ -346,12 +346,14 @@ function remapClipToAvatarRig(
   /** Map of `strippedBoneName` → actual rig bone name (preserving the rig's
    *  prefix so the AnimationMixer can find the bone by name). */
   avatarBoneByStripped: Map<string, string>,
-  avatarRestQuaternionByStripped: Map<string, THREE.Quaternion>,
+  avatarBaseQuaternionByStripped: Map<string, THREE.Quaternion>,
+  sourceReferenceQuaternionByStripped: Map<string, THREE.Quaternion>,
   /** When true, drop all tracks targeting the lower body (UpLeg/Leg/Foot/Toe).
    *  Keep available for future upper-body-only idles. */
   lockLegs = false,
   protectGeneratedMesh = false,
   generatedLimbStrength = 0.45,
+  additive = false,
 ): THREE.AnimationClip | null {
   const tracks: THREE.KeyframeTrack[] = [];
   const skipped: string[] = [];
@@ -364,8 +366,12 @@ function remapClipToAvatarRig(
     "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
     "RightShoulder", "RightArm", "RightForeArm", "RightHand",
   ]);
-  const GENERATED_TORSO_BONES = new Set(["Spine", "Spine1", "Spine2", "Neck"]);
+  const GENERATED_TORSO_BONES = new Set(["Hips", "Spine", "Spine1", "Spine2", "Neck"]);
   const GENERATED_HEAD_BONES = new Set(["Head"]);
+  const isFingerBone = (boneName: string) =>
+    /^(?:Left|Right)Hand(?:Thumb|Index|Middle|Ring|Pinky|Little)\d+$/.test(
+      boneName,
+    );
 
   for (const track of clip.tracks) {
     const dot = track.name.indexOf(".");
@@ -394,6 +400,13 @@ function remapClipToAvatarRig(
       continue;
     }
 
+    // In-place gestures are layered over the authored idle. Any Hips
+    // rotation would propagate through the planted legs and make the foot
+    // clamp move the entire avatar up/down, so keep the idle root unchanged.
+    if (lockLegs && lookup === "Hips" && property === "quaternion") {
+      continue;
+    }
+
     const cloned = track.clone();
     cloned.name = `${actualBoneName}.${property}`;
     if (
@@ -404,26 +417,43 @@ function remapClipToAvatarRig(
         GENERATED_LIMB_BONES.has(lookup)
         || GENERATED_TORSO_BONES.has(lookup)
         || GENERATED_HEAD_BONES.has(lookup)
+        || isFingerBone(lookup)
       )
     ) {
-      // Meshy characters are single-shell scans without production edge
-      // loops around shoulders and wrists. Preserve the authored gesture
-      // while limiting rotation away from its clean first-frame pose, which
-      // prevents sleeves, palms, and torso cloth from opening at their seams.
-      const strength = GENERATED_LIMB_BONES.has(lookup)
-        ? generatedLimbStrength
-        : GENERATED_HEAD_BONES.has(lookup)
-          ? 0
-          : 0.65;
+      // Gesture clips contain absolute local rotations authored against the
+      // source Mixamo bind pose. Applying those values directly to another
+      // character can rotate the whole torso onto its face. Convert every
+      // sample into a delta from the clip's first frame, then layer that
+      // delta over this avatar's own idle/rest rotation. The first gesture
+      // frame therefore exactly matches the idle pose and crossfades without
+      // changing the character's plane or orientation.
+      const strength = isFingerBone(lookup)
+        ? 1
+        : GENERATED_LIMB_BONES.has(lookup)
+          ? generatedLimbStrength
+          : GENERATED_HEAD_BONES.has(lookup)
+            ? 0
+            : 0.65;
       const base = (
-        avatarRestQuaternionByStripped.get(lookup)
+        avatarBaseQuaternionByStripped.get(lookup)
         ?? new THREE.Quaternion()
       ).clone().normalize();
+      const sourceBase = (
+        sourceReferenceQuaternionByStripped.get(lookup)
+        ?? new THREE.Quaternion().fromArray(cloned.values, 0)
+      ).clone().normalize();
       const sample = new THREE.Quaternion();
+      const delta = new THREE.Quaternion();
+      const retargeted = new THREE.Quaternion();
       const limited = new THREE.Quaternion();
       for (let offset = 0; offset < cloned.values.length; offset += 4) {
         sample.fromArray(cloned.values, offset).normalize();
-        limited.copy(base).slerp(sample, strength).normalize();
+        delta.copy(sourceBase).invert().multiply(sample).normalize();
+        retargeted.copy(base).multiply(delta).normalize();
+        limited
+          .copy(additive ? new THREE.Quaternion() : base)
+          .slerp(additive ? delta : retargeted, strength)
+          .normalize();
         limited.toArray(cloned.values, offset);
       }
     }
@@ -443,7 +473,9 @@ function remapClipToAvatarRig(
       `[Avatar] clip ${clip.name}: ${tracks.length} tracks mapped, ${skipped.length} skipped (e.g. ${skipped.slice(0, 4).join(", ")})`,
     );
   }
-  return new THREE.AnimationClip(clip.name, clip.duration, tracks);
+  const mapped = new THREE.AnimationClip(clip.name, clip.duration, tracks);
+  if (additive) mapped.blendMode = THREE.AdditiveAnimationBlendMode;
+  return mapped;
 }
 
 /* ── Avatar cache (Suspense-friendly) ──
@@ -648,9 +680,6 @@ function AvatarModel({
   const embeddedClips = readEmbeddedAvatarClips(avatarUrl);
   const gestureClips = readGestureClipLibrary();
   const isSandipaniAvatar = /\/sandipani(?:-lite)?\.glb(?:$|\?)/i.test(avatarUrl);
-  const idleLipClosure = isSandipaniAvatar
-    ? SANDIPANI_IDLE_LIP_CLOSURE
-    : 0;
 
   const scene = useMemo(() => SkeletonUtils.clone(baseFbx) as THREE.Group, [baseFbx]);
 
@@ -733,6 +762,8 @@ function AvatarModel({
   const lastSwordAtRef = useRef<number>(0);
   const lastAiNonceRef = useRef<number>(-1);
   const lastSyncedSequenceRef = useRef<number>(-1);
+  const speakingStartedAtRef = useRef(0);
+  const lastSpeakingGestureAtRef = useRef(0);
 
   /* ── Attract mode ──
      If the sage sits with no visitor for a long random interval, he
@@ -814,9 +845,10 @@ function AvatarModel({
           for (const name of AVATAR_VISEMES) {
             const index = mesh.morphTargetDictionary[name];
             if (index !== undefined) {
-              mesh.morphTargetInfluences[index] = name === "viseme_PP"
-                ? idleLipClosure
-                : 0;
+              // Match Rani's stable neutral calibration: no speech target is
+              // held while idle. Sandipani's PP target lifts an inner-mouth
+              // strip, so using it as a rest pose creates the drooped lip.
+              mesh.morphTargetInfluences[index] = 0;
             }
           }
           const cheekIndex = mesh.morphTargetDictionary[SPEECH_CHEEK_MORPH];
@@ -1027,9 +1059,60 @@ function AvatarModel({
       falling: undefined,
     };
 
+    // Gesture deltas must start from the character's authored idle pose, not
+    // from its FBX/GLB bind pose (which is commonly a T-pose). Seed the map
+    // with bind rotations for safety, then replace every bone represented in
+    // the embedded idle clip with that clip's first-frame local rotation.
+    const avatarGestureBaseQuaternionByStripped = new Map(
+      avatarRestQuaternionByStripped,
+    );
+    idleClip?.tracks.forEach((track) => {
+      const dot = track.name.indexOf(".");
+      if (
+        dot <= 0
+        || track.name.slice(dot + 1) !== "quaternion"
+        || !(track instanceof THREE.QuaternionKeyframeTrack)
+        || track.values.length < 4
+      ) {
+        return;
+      }
+      const stripped = stripMixamoPrefix(track.name.slice(0, dot));
+      if (!avatarBoneByStripped.has(stripped)) return;
+      avatarGestureBaseQuaternionByStripped.set(
+        stripped,
+        new THREE.Quaternion().fromArray(track.values, 0).normalize(),
+      );
+    });
+
+    // All exported gesture clips share the same Mixamo source rig. The first
+    // frame of `explaining` is its neutral stance, so use it as the common
+    // reference instead of subtracting each clip's own first frame. This
+    // preserves static poses such as Namaste and the raised starting hand of
+    // a wave while still removing the foreign bind-pose orientation.
+    const sourceReferenceQuaternionByStripped = new Map<string, THREE.Quaternion>();
+    const sourceReferenceClip = sourceClips.explaining ?? sourceClips.waving;
+    sourceReferenceClip?.tracks.forEach((track) => {
+      const dot = track.name.indexOf(".");
+      if (
+        dot <= 0
+        || track.name.slice(dot + 1) !== "quaternion"
+        || !(track instanceof THREE.QuaternionKeyframeTrack)
+        || track.values.length < 4
+      ) {
+        return;
+      }
+      sourceReferenceQuaternionByStripped.set(
+        stripMixamoPrefix(track.name.slice(0, dot)),
+        new THREE.Quaternion().fromArray(track.values, 0).normalize(),
+      );
+    });
+
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
       const clip = sourceClips[key];
       if (!clip) return;
+      const isInPlaceGesture = key !== "idle_standing"
+        && key !== "climbing"
+        && key !== "falling";
       // Preserve the supplied idle exactly. Gesture clips contain only
       // Mixamo skeleton tracks and are remapped onto the current character.
       const mapped = usesEmbeddedAnimation && key === "idle_standing"
@@ -1037,7 +1120,12 @@ function AvatarModel({
         : remapClipToAvatarRig(
             clip,
             avatarBoneByStripped,
-            avatarRestQuaternionByStripped,
+            avatarGestureBaseQuaternionByStripped,
+            sourceReferenceQuaternionByStripped,
+            key !== "climbing" && key !== "falling",
+            true,
+            0.9,
+            isInPlaceGesture,
           );
       if (!mapped) return;
       const action = mixer.clipAction(mapped, scene);
@@ -1290,36 +1378,16 @@ function AvatarModel({
       const dictionary = mesh.morphTargetDictionary;
       const influences = mesh.morphTargetInfluences;
       if (!dictionary || !influences) continue;
-      const sandipaniSpeechClosure = mouthOpen && isSandipaniAvatar
-        ? activeViseme === "viseme_PP"
-          ? Math.max(
-              idleLipClosure,
-              Math.min(0.76, sourceIntensity * LIP_SYNC_CLOSURE_GAIN),
-            )
-          : THREE.MathUtils.lerp(
-              idleLipClosure,
-              SANDIPANI_MIN_SPEECH_LIP_CLOSURE,
-              THREE.MathUtils.clamp(
-                activeIntensity / SANDIPANI_MAX_LIP_SYNC_INFLUENCE,
-                0,
-                1,
-              ),
-            )
-        : null;
       for (const viseme of AVATAR_VISEMES) {
         const index = dictionary[viseme];
         if (index === undefined) continue;
-        const targetInfluence = mouthOpen
-          ? isSandipaniAvatar && viseme === "viseme_PP"
-            ? sandipaniSpeechClosure ?? 0
-            : viseme === activeViseme
-            ? viseme === "viseme_PP"
+        const targetInfluence = mouthOpen && viseme === activeViseme
+          ? isSandipaniAvatar
+            ? activeIntensity
+            : viseme === "viseme_PP"
               ? 1
               : activeIntensity
-            : 0
-          : viseme === "viseme_PP"
-            ? idleLipClosure
-            : 0;
+          : 0;
         influences[index] += (targetInfluence - influences[index]) * mouthBlend;
       }
       const cheekIndex = dictionary[SPEECH_CHEEK_MORPH];
@@ -1540,16 +1608,50 @@ function AvatarModel({
       const next = actions[clipKey];
       if (!next) return false;
 
+      const prev = currentActionRef.current;
+      const idle = actions.idle_standing;
+      const isAdditiveGesture = next.getClip().blendMode
+        === THREE.AdditiveAnimationBlendMode;
+
+      if (clipKey === "idle_standing") {
+        // Idle is the permanent base layer. Returning from a gesture only
+        // fades out that overlay; it must never restart or lose its authored
+        // body/foot pose.
+        if (prev && prev !== next) prev.fadeOut(fade);
+        next.enabled = true;
+        next.setEffectiveWeight(1);
+        if (!next.isRunning()) {
+          next.reset().setLoop(THREE.LoopRepeat, Infinity).play();
+        }
+        currentActionRef.current = next;
+        return true;
+      }
+
       next.reset().setLoop(loop, once ? 1 : Infinity);
       next.clampWhenFinished = once;
       next.enabled = true;
-      next.setEffectiveWeight(1);
 
-      const prev = currentActionRef.current;
-      if (prev && prev !== next) {
-        prev.crossFadeTo(next, fade, false);
-      } else {
+      if (isAdditiveGesture) {
+        // Keep the embedded idle running at full weight and layer only the
+        // gesture's rotational deltas over it. This preserves scale, planted
+        // feet, vertical position and the model's original body animation.
+        if (idle) {
+          idle.enabled = true;
+          idle.setEffectiveWeight(1);
+          if (!idle.isRunning()) {
+            idle.reset().setLoop(THREE.LoopRepeat, Infinity).play();
+          }
+        }
+        if (prev && prev !== idle && prev !== next) prev.fadeOut(fade);
+        next.setEffectiveWeight(1);
         next.fadeIn(fade);
+      } else {
+        next.setEffectiveWeight(1);
+        if (prev && prev !== next) {
+          prev.crossFadeTo(next, fade, false);
+        } else {
+          next.fadeIn(fade);
+        }
       }
 
       next.play();
@@ -1608,11 +1710,6 @@ function AvatarModel({
     /* ── Debounce face presence/absence ── */
     const now = performance.now();
 
-    // Supplied character GLBs currently contain only their authored idle.
-    // Keep that clip running and ignore body-state/gesture requests until a
-    // matching pre-animated GLB clip is provided for the requested action.
-    if (usesEmbeddedAnimation) return;
-
     if (syncMode === "follower") {
       const command = syncedAnimationRef.current;
       if (command && command.sequence !== lastSyncedSequenceRef.current) {
@@ -1659,6 +1756,11 @@ function AvatarModel({
       stableFaceRef.current = rawFace;
     }
     const faceNow = stableFaceRef.current;
+    if (isSpeakingRef.current) {
+      if (speakingStartedAtRef.current === 0) speakingStartedAtRef.current = now;
+    } else {
+      speakingStartedAtRef.current = 0;
+    }
 
     /* ── State machine ──
        sitting ─face→ standing_up ─done→ walking_in ─arrived→ idle_standing
@@ -1787,6 +1889,20 @@ function AvatarModel({
             // Consume the nonce even if we couldn't play (cooldown / unknown
             // gesture name) so we don't fire it later when the cooldown ends.
             lastAiNonceRef.current = ai.nonce;
+          } else if (
+            isSpeakingRef.current
+            && speakingStartedAtRef.current > 0
+            && now - speakingStartedAtRef.current >= SPEAKING_GESTURE_DELAY_MS
+            && now - lastSpeakingGestureAtRef.current >= SPEAKING_GESTURE_COOLDOWN_MS
+            && actions.explaining
+          ) {
+            // Short or streaming replies may not provide enough completed
+            // transcript for semantic gesture selection. Use one restrained
+            // conversational gesture so the avatar never speaks in a rigid
+            // idle pose; explicit semantic gestures still take precedence.
+            lastSpeakingGestureAtRef.current = now;
+            lastExplainAtRef.current = now;
+            goTo("explaining", THREE.LoopOnce, true, 0.35);
           }
         }
       } else {
