@@ -36,25 +36,25 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
-const SANDIPANI_IDLE_LIP_CLOSURE = 0.62;
-const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.56;
-const SANDIPANI_MIN_SPEECH_LIP_CLOSURE = 0.18;
+const SANDIPANI_IDLE_LIP_CLOSURE = 0.7;
+const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.18;
+const SANDIPANI_MIN_SPEECH_LIP_CLOSURE = 0.36;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
 const SANDIPANI_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 1,
-  viseme_FF: 0.55,
-  viseme_TH: 0.44,
-  viseme_DD: 0.5,
-  viseme_kk: 0.56,
-  viseme_CH: 0.58,
-  viseme_SS: 0.5,
-  viseme_nn: 0.46,
-  viseme_RR: 0.52,
-  viseme_aa: 0.62,
-  viseme_E: 0.55,
-  viseme_I: 0.5,
-  viseme_O: 0.58,
-  viseme_U: 0.52,
+  viseme_FF: 0.12,
+  viseme_TH: 0.07,
+  viseme_DD: 0.09,
+  viseme_kk: 0.1,
+  viseme_CH: 0.11,
+  viseme_SS: 0.09,
+  viseme_nn: 0.08,
+  viseme_RR: 0.1,
+  viseme_aa: 0.19,
+  viseme_E: 0.14,
+  viseme_I: 0.12,
+  viseme_O: 0.17,
+  viseme_U: 0.14,
 };
 const CHEEK_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 0,
@@ -1248,7 +1248,7 @@ function AvatarModel({
       && (
         classified.viseme === activeVisemeRef.current
         || classified.viseme === "viseme_PP"
-        || lipNow - activeVisemeSinceRef.current >= 55
+        || lipNow - activeVisemeSinceRef.current >= (isSandipaniAvatar ? 80 : 55)
       )
     ) {
       if (classified.viseme !== activeVisemeRef.current) {
@@ -1280,7 +1280,7 @@ function AvatarModel({
       : uncalibratedIntensity;
     const closingLips = !mouthOpen || activeViseme === "viseme_PP";
     const mouthBlend = 1 - Math.exp(
-      -delta * (closingLips ? 42 : isSandipaniAvatar ? 15 : 18),
+      -delta * (closingLips ? 42 : isSandipaniAvatar ? 12 : 18),
     );
     const cheekTarget = mouthOpen
       ? Math.min(0.38, activeIntensity * CHEEK_VISEME_GAIN[activeViseme])
@@ -1294,7 +1294,7 @@ function AvatarModel({
         ? activeViseme === "viseme_PP"
           ? Math.max(
               idleLipClosure,
-              Math.min(0.78, sourceIntensity * LIP_SYNC_CLOSURE_GAIN),
+              Math.min(0.76, sourceIntensity * LIP_SYNC_CLOSURE_GAIN),
             )
           : THREE.MathUtils.lerp(
               idleLipClosure,

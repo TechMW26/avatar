@@ -700,7 +700,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
             language: "hi",
           },
           tts: {
-            speed: character.slug === "sandipani" ? 1.08 : 1,
+            speed: character.slug === "sandipani" ? 1.15 : 1,
           },
         },
       });
