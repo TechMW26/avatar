@@ -21,7 +21,7 @@ const RAW_ASSET_BASE_URL =
   (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ASSET_BASE_URL) || "";
 
 export const ASSET_BASE_URL = RAW_ASSET_BASE_URL.replace(/\/$/, "");
-export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v58";
+export const ASSET_CACHE_NAME = "rishi-avatar-fbx-v59";
 const ASSET_CACHE_PREFIX = "rishi-avatar-fbx-v";
 
 let cachedRuntimeAssetCacheName: string | null = null;
@@ -244,11 +244,14 @@ export function getDeviceProfile(): DeviceProfile {
     antialias: tier === "high",
     shadows: false,
     anisotropy: tier === "low" ? 1 : tier === "mid" ? 2 : 4,
-    powerPreference: tier === "low" ? "low-power" : "high-performance",
+    // Prefer the discrete/high-performance adapter on every tier. The DPR,
+    // material and frame caps below still protect weak GPUs, while this hint
+    // avoids an integrated/software adapter becoming the bottleneck.
+    powerPreference: "high-performance",
     toneMappingExposure: tier === "high" ? 1.02 : 1.06,
     doubleSide: tier === "high",
     enableNormalMap: tier !== "low",
-    maxLights: tier === "low" ? 1 : tier === "mid" ? 2 : 3,
+    maxLights: tier === "low" ? 1 : tier === "mid" ? 2 : 4,
     targetFps: tier === "low" ? 24 : tier === "mid" ? 30 : 60,
     enableEnvReflections: tier === "high",
     maxTextureSize: tier === "low" ? 512 : tier === "mid" ? 1024 : 2048,

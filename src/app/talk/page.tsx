@@ -570,14 +570,6 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       }
       if (source === "user" && message) {
         const preference = getExplicitAddressPreference(message);
-        try {
-          conversationRef.current.sendContextualUpdate(
-            "LANGUAGE FOR THE NEXT REPLY: The visitor's immediately preceding complete utterance is authoritative. Reply in that same language and natural script. If it differs from the active voice language, use the language_detection system tool before answering. Do not announce the switch. Hindi is only the fallback when no clear language can be determined.",
-          );
-        } catch {
-          // The system prompt enforces the same rule if a transient socket
-          // transition prevents this turn-specific reinforcement.
-        }
         if (preference && preference !== addressPreferenceRef.current) {
           explicitAddressPreferenceRef.current = preference;
           addressPreferenceRef.current = preference;
@@ -765,12 +757,24 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     retryScheduledRef.current = false;
     setConversationError(null);
     try {
-      // WebSocket avoids the WebRTC DataChannel failures observed on the
-      // installation network while retaining full duplex voice support.
       conv.startSession({
         agentId: character.agentId,
+        // WebSocket reads the agent's negotiated formats from initiation
+        // metadata, so the dashboard's μ-law 8 kHz microphone input and
+        // PCM 8 kHz TTS output are used end-to-end. WebRTC would instead use
+        // its own Opus media path and bypass those selected wire formats.
         connectionType: "websocket",
+        serverLocation: "global",
+        // At 8 kHz, 50 ms is only 400 μ-law samples while halving WebSocket
+        // frame/base64 overhead versus 25 ms packets on constrained links.
+        inputChunkDurationMs: 50,
         useWakeLock: true,
+        // Bound spoken turns so the LLM reaches its first complete phrase
+        // quickly and cannot generate a long response before yielding.
+        customLlmExtraBody: {
+          max_tokens: 160,
+          temperature: 0.65,
+        },
         onConversationCreated: (activeConversation) => {
           activeConversationRef.current = activeConversation;
           sessionTeardownStartedRef.current = false;

@@ -71,7 +71,7 @@ PROFILES = {
         # mouth to the moustache and beard. Keep those authored surfaces
         # fixed during speech and articulate only the lower lip band.
         "lower_lip_visemes": True,
-        "lower_lip_open": 0.0120,
+        "lower_lip_open": 0.0250,
         "lower_lip_center_offset_z": 0.0050,
         "lower_lip_inner_x": 0.0060,
         "lower_lip_outer_x": 0.0110,

@@ -70,17 +70,18 @@ const GESTURE_MIN_CONFIDENCE = 0.65;
 const GESTURE_STABLE_FRAMES = 2;
 const DETECTION_INTERVAL_MS = 130; // ~7.7fps face/gesture loop
 const DETECTION_INTERVAL_MOBILE_MS = 170; // lighter cadence on phones
-const FACE_UI_UPDATE_INTERVAL_MS = 120; // throttle React updates for counters
-const SMILE_UI_UPDATE_INTERVAL_MS = 160;
-const LANDMARK_INTERVAL_MS = 200;
-const LANDMARK_INTERVAL_MOBILE_MS = 320;
-const OBJECT_DETECT_INTERVAL_MS = 333;
-const OBJECT_DETECT_INTERVAL_MOBILE_MS = 900;
+const FACE_UI_UPDATE_INTERVAL_MS = 250; // enough precision for the 1.5s greeting gate
+const SMILE_UI_UPDATE_INTERVAL_MS = 333;
+const LANDMARK_INTERVAL_MS = 350;
+const LANDMARK_INTERVAL_MOBILE_MS = 600;
+const GESTURE_INTERVAL_MS = 240;
+const OBJECT_DETECT_INTERVAL_MS = 1_200;
+const OBJECT_DETECT_INTERVAL_MOBILE_MS = 2_000;
 const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
 const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
 const FACE_LOSS_GRACE_MS = 1_400; // covers one complete worker tile scan
 const FACE_WORKER_STALE_MS = 1200;
-const FACE_WORKER_HUNG_MS = 3_000;
+const FACE_WORKER_HUNG_MS = 6_000;
 const FACE_WORKER_INIT_TIMEOUT_MS = 12_000;
 const FACE_WORKER_RETRY_BASE_MS = 5_000;
 const FACE_WORKER_RETRY_MAX_MS = 30_000;
@@ -93,10 +94,11 @@ const FACE_WORKER_MODE_KEY = "rishi:vision:face-worker-mode";
 const FACE_WORKER_FAIL_COUNT_KEY = "rishi:vision:face-worker-fail-count";
 const FACE_WORKER_DISABLE_UNTIL_KEY = "rishi:vision:face-worker-disable-until";
 const GENDER_MODEL_ROOT = "/face-api-models";
-const GENDER_INFERENCE_INTERVAL_MS = 2_400;
-const GENDER_MIN_CONFIDENCE = 0.76;
-const GENDER_ACQUIRE_SAMPLES = 3;
-const GENDER_SWITCH_SAMPLES = 4;
+const GENDER_ACQUIRE_INTERVAL_MS = 550;
+const GENDER_VERIFY_INTERVAL_MS = 4_000;
+const GENDER_MIN_CONFIDENCE = 0.72;
+const GENDER_ACQUIRE_SAMPLES = 2;
+const GENDER_SWITCH_SAMPLES = 3;
 
 type UserGender = VisionState["userGender"];
 type FaceApiModule = typeof import("@vladmandic/face-api");
@@ -107,17 +109,22 @@ function loadGenderClassifier(): Promise<FaceApiModule | null> {
   if (genderClassifierPromise) return genderClassifierPromise;
   genderClassifierPromise = import("@vladmandic/face-api")
     .then(async (faceApi) => {
-      // Gender classification runs only every few seconds. CPU avoids adding
-      // another WebGL context beside MediaPipe and the Three.js avatar.
       const tfRuntime = faceApi.tf as unknown as {
         setBackend: (backend: string) => Promise<boolean>;
         ready: () => Promise<void>;
       };
-      await tfRuntime.setBackend("cpu");
+      // WebGL is substantially faster for the age/gender CNN. Inference is
+      // bursty and independently throttled, so it does not monopolise the
+      // adapter used by the continuously rendered Three.js scene.
+      try {
+        const accelerated = await tfRuntime.setBackend("webgl");
+        if (!accelerated) await tfRuntime.setBackend("cpu");
+      } catch {
+        await tfRuntime.setBackend("cpu");
+      }
       await tfRuntime.ready();
       await Promise.all([
         faceApi.nets.tinyFaceDetector.loadFromUri(GENDER_MODEL_ROOT),
-        faceApi.nets.faceLandmark68TinyNet.loadFromUri(GENDER_MODEL_ROOT),
         faceApi.nets.ageGenderNet.loadFromUri(GENDER_MODEL_ROOT),
       ]);
       return faceApi;
@@ -155,7 +162,13 @@ async function createNativeCameraFrame(video: HTMLVideoElement): Promise<ImageBi
   // Supplying the source rectangle explicitly prevents a hidden/CSS-cropped
   // detector video from ever influencing the pixels sent to the worker.
   if (width > 0 && height > 0) {
-    return createImageBitmap(video, 0, 0, width, height);
+    const outputWidth = Math.min(640, width);
+    const outputHeight = Math.max(1, Math.round(height * (outputWidth / width)));
+    return createImageBitmap(video, 0, 0, width, height, {
+      resizeWidth: outputWidth,
+      resizeHeight: outputHeight,
+      resizeQuality: "low",
+    });
   }
   return createImageBitmap(video);
 }
@@ -212,6 +225,7 @@ export function useVisionDetection(options?: {
   const lastFaceUiUpdateAtRef = useRef(0);
   const lastSmileUiUpdateAtRef = useRef(0);
   const lastLandmarkDetectionRef = useRef(0);
+  const lastGestureDetectionRef = useRef(0);
   const isMobileRef = useRef(false);
   const lastGestureStateKeyRef = useRef("");
 
@@ -447,6 +461,11 @@ export function useVisionDetection(options?: {
         const isDesktopGesturePlatform = isMacOrWindowsDesktop();
         const isMobileDevice = !isDesktopGesturePlatform;
         isMobileRef.current = isMobileDevice;
+        // Start the lazily imported classifier alongside camera/MediaPipe
+        // startup instead of waiting for both to finish first.
+        const genderClassifierTask = detectGender
+          ? loadGenderClassifier()
+          : Promise.resolve(null);
 
         // 1) Warm camera and 2) load MediaPipe models concurrently so
         // startup doesn't pay both latencies serially on mobile.
@@ -462,9 +481,9 @@ export function useVisionDetection(options?: {
             constraints.push({
               video: {
                 deviceId: { exact: preferredDeviceId },
-                width: { ideal: isMobileDevice ? 640 : 960 },
-                height: { ideal: isMobileDevice ? 480 : 540 },
-                frameRate: { ideal: 24, max: 30 },
+                width: { ideal: 640 },
+                height: { ideal: isMobileDevice ? 480 : 360 },
+                frameRate: { ideal: 24, max: 24 },
               },
               audio: false,
             });
@@ -481,9 +500,9 @@ export function useVisionDetection(options?: {
           // 3. Any camera — last resort
           constraints.push({
             video: {
-              width: { ideal: isMobileDevice ? 640 : 960 },
-              height: { ideal: isMobileDevice ? 480 : 540 },
-              frameRate: { ideal: 24, max: 30 },
+              width: { ideal: 640 },
+              height: { ideal: isMobileDevice ? 480 : 360 },
+              frameRate: { ideal: 24, max: 24 },
             },
             audio: false,
           });
@@ -616,7 +635,7 @@ export function useVisionDetection(options?: {
         setIsReady(true);
 
         if (detectGender) {
-          void loadGenderClassifier().then((classifier) => {
+          void genderClassifierTask.then((classifier) => {
             if (!cancelled && generation === initGeneration) {
               genderClassifierRef.current = classifier;
             }
@@ -866,33 +885,27 @@ export function useVisionDetection(options?: {
       && hasFace
       && genderClassifier
       && !genderInferenceInFlightRef.current
-      && genderNow - lastGenderInferenceAtRef.current >= GENDER_INFERENCE_INTERVAL_MS
+      && genderNow - lastGenderInferenceAtRef.current >= (
+        userGenderRef.current === "unknown"
+          ? GENDER_ACQUIRE_INTERVAL_MS
+          : GENDER_VERIFY_INTERVAL_MS
+      )
     ) {
       lastGenderInferenceAtRef.current = genderNow;
       genderInferenceInFlightRef.current = true;
       const options = new genderClassifier.TinyFaceDetectorOptions({
-        inputSize: 224,
-        scoreThreshold: 0.55,
+        inputSize: 160,
+        scoreThreshold: 0.5,
       });
       void genderClassifier
-        .detectAllFaces(video, options)
-        .withFaceLandmarks(true)
+        .detectSingleFace(video, options)
         .withAgeAndGender()
-        .then((results) => {
-          // When several people are visible, address the foreground visitor:
-          // the largest aligned face, not whichever face happened to receive
-          // the detector's highest confidence score.
-          const result = results.reduce<(typeof results)[number] | null>((largest, item) => {
-            if (!largest) return item;
-            const itemArea = item.detection.box.width * item.detection.box.height;
-            const largestArea = largest.detection.box.width * largest.detection.box.height;
-            return itemArea > largestArea ? item : largest;
-          }, null);
-          if (!result || !stableFaceDetectedRef.current) return results;
+        .then((result) => {
+          if (!result || !stableFaceDetectedRef.current) return result;
           const confidence = result.genderProbability ?? 0;
           if (confidence < GENDER_MIN_CONFIDENCE) {
             genderCandidateRef.current = null;
-            return results;
+            return result;
           }
           const candidate = result.gender === "female" ? "female" : "male";
           const previousCandidate = genderCandidateRef.current;
@@ -901,7 +914,7 @@ export function useVisionDetection(options?: {
             : 1;
           genderCandidateRef.current = { gender: candidate, samples };
           const requiredSamples = userGenderRef.current === "unknown"
-            ? GENDER_ACQUIRE_SAMPLES
+            ? confidence >= 0.9 ? 1 : GENDER_ACQUIRE_SAMPLES
             : userGenderRef.current === candidate
               ? 1
               : GENDER_SWITCH_SAMPLES;
@@ -909,7 +922,7 @@ export function useVisionDetection(options?: {
             userGenderRef.current = candidate;
             setUserGender(candidate);
           }
-          return results;
+          return result;
         })
         .catch(() => {
           // A transient inference failure should not affect face detection.
@@ -959,7 +972,13 @@ export function useVisionDetection(options?: {
 
     // ── Gesture Recognition ──
     let gestureResult: GestureRecognizerResult | null = null;
-    if (gestureRecognizer) {
+    let gestureEvaluated = false;
+    if (
+      gestureRecognizer
+      && safeNow - lastGestureDetectionRef.current >= GESTURE_INTERVAL_MS
+    ) {
+      lastGestureDetectionRef.current = safeNow;
+      gestureEvaluated = true;
       try {
         gestureResult = gestureRecognizer.recognizeForVideo(video, safeNow);
       } catch {
@@ -1149,13 +1168,17 @@ export function useVisionDetection(options?: {
       }
     }
 
-    const nextGestures = dedupeFrameGestures(frameGestures);
-    const nextGestureKey = nextGestures
-      .map((g) => `${g.name}:${Math.round(g.confidence * 100)}`)
-      .join("|");
-    if (nextGestureKey !== lastGestureStateKeyRef.current) {
-      lastGestureStateKeyRef.current = nextGestureKey;
-      setCurrentGestures(nextGestures);
+    // Do not clear a gesture on the light face-only frames between expensive
+    // hand-inference polls. Update React state only when hands were evaluated.
+    if (gestureEvaluated) {
+      const nextGestures = dedupeFrameGestures(frameGestures);
+      const nextGestureKey = nextGestures
+        .map((g) => `${g.name}:${Math.round(g.confidence * 100)}`)
+        .join("|");
+      if (nextGestureKey !== lastGestureStateKeyRef.current) {
+        lastGestureStateKeyRef.current = nextGestureKey;
+        setCurrentGestures(nextGestures);
+      }
     }
 
     rafRef.current = requestAnimationFrame(() => detectRef.current());

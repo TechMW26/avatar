@@ -36,26 +36,28 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
-// A quarter-strength bilabial target closes the authored resting seam
-// without recreating the oversized lower-lip deformation seen at 70%+.
-const SANDIPANI_IDLE_LIP_CLOSURE = 0.25;
-const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.24;
+// Sandipani's generated PP delta is deliberately very small and face-local.
+// A literal 0.25 influence was visually indistinguishable from Basis and did
+// not reach the upper lip. This calibrated value seals the authored seam
+// without an overlay or any beard/jaw/body deformation.
+const SANDIPANI_IDLE_LIP_CLOSURE = 1;
+const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.68;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
 const SANDIPANI_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 1,
-  viseme_FF: 0.28,
-  viseme_TH: 0.22,
-  viseme_DD: 0.25,
-  viseme_kk: 0.28,
-  viseme_CH: 0.3,
-  viseme_SS: 0.25,
-  viseme_nn: 0.22,
-  viseme_RR: 0.28,
-  viseme_aa: 0.42,
-  viseme_E: 0.34,
-  viseme_I: 0.32,
-  viseme_O: 0.38,
-  viseme_U: 0.34,
+  viseme_FF: 0.72,
+  viseme_TH: 0.66,
+  viseme_DD: 0.7,
+  viseme_kk: 0.76,
+  viseme_CH: 0.8,
+  viseme_SS: 0.7,
+  viseme_nn: 0.64,
+  viseme_RR: 0.76,
+  viseme_aa: 1,
+  viseme_E: 0.88,
+  viseme_I: 0.84,
+  viseme_O: 0.98,
+  viseme_U: 0.9,
 };
 const CHEEK_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 0,
@@ -349,32 +351,10 @@ function remapClipToAvatarRig(
   /** Map of `strippedBoneName` → actual rig bone name (preserving the rig's
    *  prefix so the AnimationMixer can find the bone by name). */
   avatarBoneByStripped: Map<string, string>,
-  avatarBaseQuaternionByStripped: Map<string, THREE.Quaternion>,
-  sourceReferenceQuaternionByStripped: Map<string, THREE.Quaternion>,
-  /** When true, drop all tracks targeting the lower body (UpLeg/Leg/Foot/Toe).
-   *  Keep available for future upper-body-only idles. */
-  lockLegs = false,
-  protectGeneratedMesh = false,
-  generatedLimbStrength = 0.45,
-  additive = false,
+  avatarIdleRootPosition: THREE.Vector3,
 ): THREE.AnimationClip | null {
   const tracks: THREE.KeyframeTrack[] = [];
   const skipped: string[] = [];
-
-  const LEG_BONES = new Set([
-    "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase", "LeftToe_End",
-    "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase", "RightToe_End",
-  ]);
-  const GENERATED_LIMB_BONES = new Set([
-    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-  ]);
-  const GENERATED_TORSO_BONES = new Set(["Hips", "Spine", "Spine1", "Spine2", "Neck"]);
-  const GENERATED_HEAD_BONES = new Set(["Head"]);
-  const isFingerBone = (boneName: string) =>
-    /^(?:Left|Right)Hand(?:Thumb|Index|Middle|Ring|Pinky|Little)\d+$/.test(
-      boneName,
-    );
 
   for (const track of clip.tracks) {
     const dot = track.name.indexOf(".");
@@ -390,74 +370,47 @@ function remapClipToAvatarRig(
       continue;
     }
 
-    // Mixamo Hips position tracks ship in centimeters; applying them to a
-    // meter-scale rig flings the avatar off-screen. Keep it in place.
-    if (
-      lookup === "Hips" &&
-      (property === "position" || property.startsWith("position["))
-    ) {
-      continue;
-    }
-
-    if (lockLegs && LEG_BONES.has(lookup)) {
-      continue;
-    }
-
-    // In-place gestures are layered over the authored idle. Any Hips
-    // rotation would propagate through the planted legs and make the foot
-    // clamp move the entire avatar up/down, so keep the idle root unchanged.
-    if (lockLegs && lookup === "Hips" && property === "quaternion") {
-      continue;
-    }
-
+    // The avatar and every gesture use the same Mixamo hierarchy. Preserve
+    // every authored keyframe exactly; only rewrite the track target to the
+    // concrete bone name used by this particular export.
     const cloned = track.clone();
     cloned.name = `${actualBoneName}.${property}`;
     if (
-      protectGeneratedMesh
+      lookup === "Hips"
+      && property === "position"
+      && cloned instanceof THREE.VectorKeyframeTrack
+    ) {
+      // FBXLoader exposes Mixamo root translation in centimetres and Z-up;
+      // GLTFLoader exposes the same rig in metres and Y-up. This is only a
+      // coordinate/unit conversion—not retargeting or motion suppression.
+      const sourceOrigin = new THREE.Vector3(
+        cloned.values[0] * 0.01,
+        cloned.values[2] * 0.01,
+        -cloned.values[1] * 0.01,
+      );
+      for (let offset = 0; offset < cloned.values.length; offset += 3) {
+        const x = cloned.values[offset] * 0.01;
+        const y = cloned.values[offset + 2] * 0.01;
+        const z = -cloned.values[offset + 1] * 0.01;
+        cloned.values[offset] = avatarIdleRootPosition.x + x - sourceOrigin.x;
+        cloned.values[offset + 1] = avatarIdleRootPosition.y + y - sourceOrigin.y;
+        cloned.values[offset + 2] = avatarIdleRootPosition.z + z - sourceOrigin.z;
+      }
+    } else if (
+      lookup === "Hips"
       && property === "quaternion"
       && cloned instanceof THREE.QuaternionKeyframeTrack
-      && (
-        GENERATED_LIMB_BONES.has(lookup)
-        || GENERATED_TORSO_BONES.has(lookup)
-        || GENERATED_HEAD_BONES.has(lookup)
-        || isFingerBone(lookup)
-      )
     ) {
-      // Gesture clips contain absolute local rotations authored against the
-      // source Mixamo bind pose. Applying those values directly to another
-      // character can rotate the whole torso onto its face. Convert every
-      // sample into a delta from the clip's first frame, then layer that
-      // delta over this avatar's own idle/rest rotation. The first gesture
-      // frame therefore exactly matches the idle pose and crossfades without
-      // changing the character's plane or orientation.
-      const strength = isFingerBone(lookup)
-        ? 1
-        : GENERATED_LIMB_BONES.has(lookup)
-          ? generatedLimbStrength
-          : GENERATED_HEAD_BONES.has(lookup)
-            ? 0
-            : 0.65;
-      const base = (
-        avatarBaseQuaternionByStripped.get(lookup)
-        ?? new THREE.Quaternion()
-      ).clone().normalize();
-      const sourceBase = (
-        sourceReferenceQuaternionByStripped.get(lookup)
-        ?? new THREE.Quaternion().fromArray(cloned.values, 0)
-      ).clone().normalize();
+      // GLB bakes the FBX root's -90° X axis conversion into the Hips track.
+      // Apply that fixed basis change while retaining every authored sample.
+      const fbxToGlb = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(1, 0, 0),
+        -Math.PI / 2,
+      );
       const sample = new THREE.Quaternion();
-      const delta = new THREE.Quaternion();
-      const retargeted = new THREE.Quaternion();
-      const limited = new THREE.Quaternion();
       for (let offset = 0; offset < cloned.values.length; offset += 4) {
         sample.fromArray(cloned.values, offset).normalize();
-        delta.copy(sourceBase).invert().multiply(sample).normalize();
-        retargeted.copy(base).multiply(delta).normalize();
-        limited
-          .copy(additive ? new THREE.Quaternion() : base)
-          .slerp(additive ? delta : retargeted, strength)
-          .normalize();
-        limited.toArray(cloned.values, offset);
+        fbxToGlb.clone().multiply(sample).normalize().toArray(cloned.values, offset);
       }
     }
     tracks.push(cloned);
@@ -476,9 +429,7 @@ function remapClipToAvatarRig(
       `[Avatar] clip ${clip.name}: ${tracks.length} tracks mapped, ${skipped.length} skipped (e.g. ${skipped.slice(0, 4).join(", ")})`,
     );
   }
-  const mapped = new THREE.AnimationClip(clip.name, clip.duration, tracks);
-  if (additive) mapped.blendMode = THREE.AdditiveAnimationBlendMode;
-  return mapped;
+  return new THREE.AnimationClip(clip.name, clip.duration, tracks);
 }
 
 /* ── Avatar cache (Suspense-friendly) ──
@@ -824,7 +775,6 @@ function AvatarModel({
     // settings picked by `<DeviceTunedCanvas>`.
     const matProfile = getDeviceProfile();
     const avatarBoneByStripped = new Map<string, string>();
-    const avatarRestQuaternionByStripped = new Map<string, THREE.Quaternion>();
     const lipSyncMeshes: THREE.Mesh[] = [];
 
     scene.traverse((obj) => {
@@ -997,10 +947,6 @@ function AvatarModel({
       if ((obj as THREE.Bone).isBone) {
         const stripped = stripMixamoPrefix(obj.name);
         avatarBoneByStripped.set(stripped, obj.name);
-        avatarRestQuaternionByStripped.set(
-          stripped,
-          (obj as THREE.Bone).quaternion.clone(),
-        );
         if (stripped === "LeftToeBase" || stripped === "LeftFoot") {
           // Prefer the toe (lowest), but fall back to foot if the rig has no toe.
           if (!footBonesRef.current.left || stripped === "LeftToeBase") {
@@ -1063,73 +1009,29 @@ function AvatarModel({
       falling: undefined,
     };
 
-    // Gesture deltas must start from the character's authored idle pose, not
-    // from its FBX/GLB bind pose (which is commonly a T-pose). Seed the map
-    // with bind rotations for safety, then replace every bone represented in
-    // the embedded idle clip with that clip's first-frame local rotation.
-    const avatarGestureBaseQuaternionByStripped = new Map(
-      avatarRestQuaternionByStripped,
-    );
-    idleClip?.tracks.forEach((track) => {
+    const avatarIdleRootPosition = new THREE.Vector3();
+    const idleRootTrack = idleClip?.tracks.find((track) => {
       const dot = track.name.indexOf(".");
-      if (
-        dot <= 0
-        || track.name.slice(dot + 1) !== "quaternion"
-        || !(track instanceof THREE.QuaternionKeyframeTrack)
-        || track.values.length < 4
-      ) {
-        return;
-      }
-      const stripped = stripMixamoPrefix(track.name.slice(0, dot));
-      if (!avatarBoneByStripped.has(stripped)) return;
-      avatarGestureBaseQuaternionByStripped.set(
-        stripped,
-        new THREE.Quaternion().fromArray(track.values, 0).normalize(),
-      );
-    });
-
-    // All exported gesture clips share the same Mixamo source rig. The first
-    // frame of `explaining` is its neutral stance, so use it as the common
-    // reference instead of subtracting each clip's own first frame. This
-    // preserves static poses such as Namaste and the raised starting hand of
-    // a wave while still removing the foreign bind-pose orientation.
-    const sourceReferenceQuaternionByStripped = new Map<string, THREE.Quaternion>();
-    const sourceReferenceClip = sourceClips.explaining ?? sourceClips.waving;
-    sourceReferenceClip?.tracks.forEach((track) => {
-      const dot = track.name.indexOf(".");
-      if (
-        dot <= 0
-        || track.name.slice(dot + 1) !== "quaternion"
-        || !(track instanceof THREE.QuaternionKeyframeTrack)
-        || track.values.length < 4
-      ) {
-        return;
-      }
-      sourceReferenceQuaternionByStripped.set(
-        stripMixamoPrefix(track.name.slice(0, dot)),
-        new THREE.Quaternion().fromArray(track.values, 0).normalize(),
-      );
-    });
+      return dot > 0
+        && stripMixamoPrefix(track.name.slice(0, dot)) === "Hips"
+        && track.name.slice(dot + 1) === "position"
+        && track instanceof THREE.VectorKeyframeTrack;
+    }) as THREE.VectorKeyframeTrack | undefined;
+    if (idleRootTrack && idleRootTrack.values.length >= 3) {
+      avatarIdleRootPosition.fromArray(idleRootTrack.values, 0);
+    }
 
     (Object.keys(sourceClips) as ClipKey[]).forEach((key) => {
       const clip = sourceClips[key];
       if (!clip) return;
-      const isInPlaceGesture = key !== "idle_standing"
-        && key !== "climbing"
-        && key !== "falling";
       // Preserve the supplied idle exactly. Gesture clips contain only
-      // Mixamo skeleton tracks and are remapped onto the current character.
+      // Mixamo skeleton tracks and are mapped one-to-one onto the same rig.
       const mapped = usesEmbeddedAnimation && key === "idle_standing"
         ? clip.clone()
         : remapClipToAvatarRig(
             clip,
             avatarBoneByStripped,
-            avatarGestureBaseQuaternionByStripped,
-            sourceReferenceQuaternionByStripped,
-            key !== "climbing" && key !== "falling",
-            true,
-            0.9,
-            isInPlaceGesture,
+            avatarIdleRootPosition,
           );
       if (!mapped) return;
       const action = mixer.clipAction(mapped, scene);
@@ -1340,7 +1242,7 @@ function AvatarModel({
       && (
         classified.viseme === activeVisemeRef.current
         || classified.viseme === "viseme_PP"
-        || lipNow - activeVisemeSinceRef.current >= (isSandipaniAvatar ? 65 : 55)
+        || lipNow - activeVisemeSinceRef.current >= (isSandipaniAvatar ? 42 : 55)
       )
     ) {
       if (classified.viseme !== activeVisemeRef.current) {
@@ -1374,7 +1276,7 @@ function AvatarModel({
       : uncalibratedIntensity;
     const closingLips = !mouthOpen || activeViseme === "viseme_PP";
     const mouthBlend = 1 - Math.exp(
-      -delta * (closingLips ? 42 : isSandipaniAvatar ? 16 : 18),
+      -delta * (closingLips ? 42 : isSandipaniAvatar ? 22 : 18),
     );
     const cheekTarget = mouthOpen
       ? Math.min(0.38, activeIntensity * CHEEK_VISEME_GAIN[activeViseme])
@@ -1526,9 +1428,11 @@ function AvatarModel({
             // Make sure transforms are up to date for the new mixer pose.
             // Update from the moving/scaling outer group so foot world
             // positions include the transform applied earlier this frame.
-            grp.updateMatrixWorld(true);
             let minFootY = Infinity;
             const v = new THREE.Vector3();
+            // getWorldPosition updates only this bone's ancestor chain. This
+            // avoids the previous full-avatar matrix traversal on every
+            // grounding sample.
             if (lf) { lf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
             if (rf) { rf.getWorldPosition(v); minFootY = Math.min(minFootY, v.y); }
             if (Number.isFinite(minFootY)) {
@@ -2528,10 +2432,21 @@ function CameraAnimator({ targetZRef }: { targetZRef: MutableRefObject<number> }
   const { camera, size } = useThree();
   useFrame((_, delta) => {
     const aspect = size.width > 0 && size.height > 0 ? size.width / size.height : 1;
-    // Portrait screens need extra camera distance to keep the full body in-frame.
-    const portraitBoost = aspect < 0.62 ? Math.min(1.2, ((0.62 - aspect) / 0.62) * 1.2) : 0;
+    // A longer portrait lens reduces wide-angle distortion while preserving
+    // full-body framing. Very narrow screens still get a small distance boost.
+    const portraitBoost = aspect < 0.62 ? Math.min(0.8, ((0.62 - aspect) / 0.62) * 0.8) : 0;
     const target = targetZRef.current + portraitBoost;
-    camera.position.z += (target - camera.position.z) * Math.min(1, delta * 1.5);
+    const blend = Math.min(1, delta * 2.2);
+    camera.position.z += (target - camera.position.z) * blend;
+    camera.position.y += (0.1 - camera.position.y) * blend;
+    if (camera instanceof THREE.PerspectiveCamera) {
+      const targetFov = aspect < 0.75 ? 34 : 32;
+      const previousFov = camera.fov;
+      camera.fov += (targetFov - camera.fov) * blend;
+      if (Math.abs(camera.fov - previousFov) > 0.005) {
+        camera.updateProjectionMatrix();
+      }
+    }
   });
   return null;
 }
@@ -2551,7 +2466,7 @@ function SceneLights({
 }) {
   const profile = useMemo(() => getDeviceProfile(), []);
   const max = profile.maxLights;
-  const baseAmbient = max >= 3 ? 0.52 : max >= 2 ? 0.68 : 0.86;
+  const baseAmbient = max >= 3 ? 0.62 : max >= 2 ? 0.76 : 0.92;
   const ambientRef = useRef<THREE.AmbientLight>(null);
   const keyRef = useRef<THREE.DirectionalLight>(null);
   const fillRef = useRef<THREE.DirectionalLight>(null);
@@ -2561,10 +2476,10 @@ function SceneLights({
   const nextSampleAtRef = useRef(0);
   const targetRef = useRef({
     ambient: baseAmbient,
-    key: 1.1,
-    fill: 0.3,
-    rim: 0.22,
-    point: 0.3,
+    key: 1.28,
+    fill: 0.38,
+    rim: 0.3,
+    point: 0.24,
     keyX: 2,
     color: new THREE.Color(1, 0.94, 0.87),
   });
@@ -2630,10 +2545,10 @@ function SceneLights({
         const average = (red + green + blue) / Math.max(1, samples * 3);
         const target = targetRef.current;
         target.ambient = baseAmbient * (0.62 + exposure * 0.55);
-        target.key = 0.72 + exposure * 1.05;
-        target.fill = 0.18 + exposure * 0.28;
-        target.rim = 0.14 + exposure * 0.2;
-        target.point = 0.14 + exposure * 0.3;
+        target.key = 0.9 + exposure * 1.08;
+        target.fill = 0.24 + exposure * 0.34;
+        target.rim = 0.2 + exposure * 0.25;
+        target.point = 0.16 + exposure * 0.28;
 
         // Camera feeds use true direction, so the sampled bright side maps
         // directly to the matching side of the avatar.
@@ -2686,12 +2601,12 @@ function SceneLights({
     <>
       <ambientLight ref={ambientRef} intensity={baseAmbient} />
       {/* Key light — always on. */}
-      <directionalLight ref={keyRef} position={[2.8, 3.4, 3.6]} intensity={1.1} />
+      <directionalLight ref={keyRef} position={[2.8, 3.4, 3.6]} intensity={1.28} />
       {max >= 2 && (
         <directionalLight
           ref={fillRef}
           position={[-2.2, 1.7, 2.4]}
-          intensity={0.3}
+          intensity={0.38}
           color="#ffeedd"
         />
       )}
@@ -2699,15 +2614,15 @@ function SceneLights({
         <directionalLight
           ref={rimRef}
           position={[-2.4, 2.2, -2.2]}
-          intensity={0.22}
+          intensity={0.3}
           color="#FFB469"
         />
       )}
       {max >= 4 && (
           <pointLight
             ref={pointRef}
-            position={[0, 0.3, 0.9]}
-            intensity={0.3}
+            position={[0, 1.55, 2.1]}
+            intensity={0.24}
             color="#ffe4c9"
           />
       )}
@@ -2768,6 +2683,27 @@ function DynamicDprController({ minDpr, maxDpr }: { minDpr: number; maxDpr: numb
       setDpr(restored);
     }
   });
+
+  return null;
+}
+
+function FrameRateScheduler({ targetFps }: { targetFps: number }) {
+  const invalidate = useThree((state) => state.invalidate);
+
+  useEffect(() => {
+    let frameId = 0;
+    let lastFrameAt = 0;
+    const interval = 1000 / Math.max(1, targetFps);
+    const tick = (now: number) => {
+      if (now - lastFrameAt >= interval - 1) {
+        lastFrameAt = now;
+        invalidate();
+      }
+      frameId = requestAnimationFrame(tick);
+    };
+    frameId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frameId);
+  }, [invalidate, targetFps]);
 
   return null;
 }
@@ -2969,7 +2905,7 @@ function DeviceTunedCanvas({
   const profile = useMemo(() => getDeviceProfile(), []);
   return (
     <Canvas
-      camera={{ position: [0, 0.05, CAMERA_Z_NEAR], fov: 36, near: 0.1, far: 50 }}
+      camera={{ position: [0, 0.1, CAMERA_Z_NEAR], fov: 32, near: 0.1, far: 50 }}
       gl={{
         alpha: true,
         antialias: profile.antialias,
@@ -2994,6 +2930,7 @@ function DeviceTunedCanvas({
         precision: profile.shaderPrecision,
       }}
       dpr={[profile.minDpr, profile.maxDpr]}
+      frameloop="demand"
       shadows={profile.shadows}
       // Skip object sorting — the scene has only the avatar;
       // the GPU's depth test handles correct occlusion. Sorting costs
@@ -3021,6 +2958,7 @@ function DeviceTunedCanvas({
         zIndex: 1,
       }}
     >
+      <FrameRateScheduler targetFps={profile.targetFps} />
       <DynamicDprController minDpr={profile.minDpr} maxDpr={profile.maxDpr} />
       {children}
     </Canvas>
