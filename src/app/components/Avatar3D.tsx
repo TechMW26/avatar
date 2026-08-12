@@ -36,23 +36,26 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
-const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.18;
+// A quarter-strength bilabial target closes the authored resting seam
+// without recreating the oversized lower-lip deformation seen at 70%+.
+const SANDIPANI_IDLE_LIP_CLOSURE = 0.25;
+const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.24;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
 const SANDIPANI_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 1,
-  viseme_FF: 0.12,
-  viseme_TH: 0.07,
-  viseme_DD: 0.09,
-  viseme_kk: 0.1,
-  viseme_CH: 0.11,
-  viseme_SS: 0.09,
-  viseme_nn: 0.08,
-  viseme_RR: 0.1,
-  viseme_aa: 0.19,
-  viseme_E: 0.14,
-  viseme_I: 0.12,
-  viseme_O: 0.17,
-  viseme_U: 0.14,
+  viseme_FF: 0.28,
+  viseme_TH: 0.22,
+  viseme_DD: 0.25,
+  viseme_kk: 0.28,
+  viseme_CH: 0.3,
+  viseme_SS: 0.25,
+  viseme_nn: 0.22,
+  viseme_RR: 0.28,
+  viseme_aa: 0.42,
+  viseme_E: 0.34,
+  viseme_I: 0.32,
+  viseme_O: 0.38,
+  viseme_U: 0.34,
 };
 const CHEEK_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
   viseme_PP: 0,
@@ -845,10 +848,11 @@ function AvatarModel({
           for (const name of AVATAR_VISEMES) {
             const index = mesh.morphTargetDictionary[name];
             if (index !== undefined) {
-              // Match Rani's stable neutral calibration: no speech target is
-              // held while idle. Sandipani's PP target lifts an inner-mouth
-              // strip, so using it as a rest pose creates the drooped lip.
-              mesh.morphTargetInfluences[index] = 0;
+              mesh.morphTargetInfluences[index] = (
+                isSandipaniAvatar && name === "viseme_PP"
+              )
+                ? SANDIPANI_IDLE_LIP_CLOSURE
+                : 0;
             }
           }
           const cheekIndex = mesh.morphTargetDictionary[SPEECH_CHEEK_MORPH];
@@ -1336,7 +1340,7 @@ function AvatarModel({
       && (
         classified.viseme === activeVisemeRef.current
         || classified.viseme === "viseme_PP"
-        || lipNow - activeVisemeSinceRef.current >= (isSandipaniAvatar ? 80 : 55)
+        || lipNow - activeVisemeSinceRef.current >= (isSandipaniAvatar ? 65 : 55)
       )
     ) {
       if (classified.viseme !== activeVisemeRef.current) {
@@ -1361,14 +1365,16 @@ function AvatarModel({
         : Math.min(MAX_LIP_SYNC_INFLUENCE, sourceIntensity * gain)
       : 0;
     const activeIntensity = isSandipaniAvatar
-      ? Math.min(
-          SANDIPANI_MAX_LIP_SYNC_INFLUENCE,
-          uncalibratedIntensity * SANDIPANI_VISEME_GAIN[activeViseme],
-        )
+      ? syncMode === "follower"
+        ? Math.min(SANDIPANI_MAX_LIP_SYNC_INFLUENCE, uncalibratedIntensity)
+        : Math.min(
+            SANDIPANI_MAX_LIP_SYNC_INFLUENCE,
+            uncalibratedIntensity * SANDIPANI_VISEME_GAIN[activeViseme],
+          )
       : uncalibratedIntensity;
     const closingLips = !mouthOpen || activeViseme === "viseme_PP";
     const mouthBlend = 1 - Math.exp(
-      -delta * (closingLips ? 42 : isSandipaniAvatar ? 12 : 18),
+      -delta * (closingLips ? 42 : isSandipaniAvatar ? 16 : 18),
     );
     const cheekTarget = mouthOpen
       ? Math.min(0.38, activeIntensity * CHEEK_VISEME_GAIN[activeViseme])
@@ -1381,13 +1387,19 @@ function AvatarModel({
       for (const viseme of AVATAR_VISEMES) {
         const index = dictionary[viseme];
         if (index === undefined) continue;
-        const targetInfluence = mouthOpen && viseme === activeViseme
-          ? isSandipaniAvatar
-            ? activeIntensity
-            : viseme === "viseme_PP"
-              ? 1
-              : activeIntensity
-          : 0;
+        const targetInfluence = mouthOpen
+          ? viseme === activeViseme
+            ? isSandipaniAvatar
+              ? activeViseme === "viseme_PP"
+                ? Math.max(SANDIPANI_IDLE_LIP_CLOSURE, activeIntensity)
+                : activeIntensity
+              : viseme === "viseme_PP"
+                ? 1
+                : activeIntensity
+            : 0
+          : isSandipaniAvatar && viseme === "viseme_PP"
+            ? SANDIPANI_IDLE_LIP_CLOSURE
+            : 0;
         influences[index] += (targetInfluence - influences[index]) * mouthBlend;
       }
       const cheekIndex = dictionary[SPEECH_CHEEK_MORPH];
