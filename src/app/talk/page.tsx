@@ -51,6 +51,7 @@ const NO_FACE_AUTO_END_MS = 10_000;
 const CONVERSATION_ACTIVITY_HOLD_MS = 5_000;
 const PENDING_AGENT_REPLY_HOLD_MS = 30_000;
 const USER_AUDIO_ACTIVITY_THRESHOLD = 0.015;
+const MICROPHONE_SAMPLE_RATE = 8_000;
 const SHOW_CONVERSATION_CONTROLS = false;
 
 type VisitorAddressPreference = "masculine" | "feminine";
@@ -173,6 +174,28 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const activeConversationRef = useRef<ElevenLabsConversation | null>(null);
   const sessionTeardownStartedRef = useRef(false);
   const [conversationRetryBlocked, setConversationRetryBlocked] = useState(false);
+
+  const ensureMicrophoneReady = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("This browser does not provide microphone access.");
+    }
+    const permissionStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+    const track = permissionStream.getAudioTracks()[0];
+    if (!track || track.readyState !== "live") {
+      permissionStream.getTracks().forEach((mediaTrack) => mediaTrack.stop());
+      throw new Error("No active microphone was found.");
+    }
+    track.enabled = true;
+    permissionStream.getTracks().forEach((mediaTrack) => mediaTrack.stop());
+  }, []);
 
   useEffect(() => {
     document.title = `${character.name} · Living History`;
@@ -422,9 +445,16 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   }, [character]);
 
   const conversation = useConversation({
+    micMuted: false,
     onConnect: () => {
       console.log("[ElevenLabs] connected");
       sessionTeardownStartedRef.current = false;
+      try {
+        conversationRef.current.setMuted(false);
+      } catch {
+        // The controlled `micMuted: false` state will also enforce this on
+        // the next React update.
+      }
       pronunciationLipSyncRef.current.clear();
       setConversationError(null);
       startInFlightRef.current = false;
@@ -767,7 +797,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     }
   }, [character.slug, vision.userGender]);
 
-  const startConversation = useCallback(() => {
+  const startConversation = useCallback(async () => {
     const conv = conversationRef.current;
     if (startInFlightRef.current || conv.status !== "disconnected") {
       return;
@@ -778,6 +808,11 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     retryScheduledRef.current = false;
     setConversationError(null);
     try {
+      await ensureMicrophoneReady();
+      if (conversationRef.current.status !== "disconnected") {
+        startInFlightRef.current = false;
+        return;
+      }
       conv.startSession({
         agentId: character.agentId,
         // WebSocket reads the agent's negotiated formats from initiation
@@ -818,7 +853,13 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
         return;
       }
 
-      const message = err instanceof Error ? err.message : "Unable to start conversation";
+      const permissionDenied = err instanceof DOMException
+        && (err.name === "NotAllowedError" || err.name === "SecurityError");
+      const message = permissionDenied
+        ? "Microphone access is blocked. Allow microphone access in the browser, then reload."
+        : err instanceof Error
+          ? err.message
+          : "Unable to start conversation";
       setConversationError(message);
       blockAutoStart(AUTO_START_RETRY_DELAY_MS);
       startInFlightRef.current = false;
@@ -827,9 +868,56 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     blockAutoStart,
     character.agentId,
     character.slug,
+    ensureMicrophoneReady,
     getFirstMessage,
     getLivePrompt,
   ]);
+
+  // Keep the SDK input explicitly unmuted and reacquire the default input
+  // when the page resumes or the OS audio-device list changes. This covers
+  // sleep/wake, Bluetooth hand-off, USB mic reconnects and tab restoration.
+  useEffect(() => {
+    if (conversation.status !== "connected") return;
+
+    const forceMicrophoneOn = () => {
+      try {
+        if (conversationRef.current.isMuted) {
+          conversationRef.current.setMuted(false);
+        }
+      } catch (micError) {
+        console.warn("[Microphone] could not unmute input", micError);
+      }
+    };
+    const reacquireMicrophone = async () => {
+      forceMicrophoneOn();
+      try {
+        await conversationRef.current.changeInputDevice({
+          format: "ulaw",
+          sampleRate: MICROPHONE_SAMPLE_RATE,
+        });
+        forceMicrophoneOn();
+      } catch (micError) {
+        console.warn("[Microphone] input reacquisition failed", micError);
+      }
+    };
+    const handleResume = () => {
+      if (document.visibilityState === "visible") forceMicrophoneOn();
+    };
+
+    forceMicrophoneOn();
+    const guard = window.setInterval(forceMicrophoneOn, 2_000);
+    window.addEventListener("focus", forceMicrophoneOn);
+    window.addEventListener("pageshow", forceMicrophoneOn);
+    document.addEventListener("visibilitychange", handleResume);
+    navigator.mediaDevices?.addEventListener("devicechange", reacquireMicrophone);
+    return () => {
+      window.clearInterval(guard);
+      window.removeEventListener("focus", forceMicrophoneOn);
+      window.removeEventListener("pageshow", forceMicrophoneOn);
+      document.removeEventListener("visibilitychange", handleResume);
+      navigator.mediaDevices?.removeEventListener("devicechange", reacquireMicrophone);
+    };
+  }, [conversation.status]);
 
   const endConversation = useCallback(() => {
     try {
@@ -875,15 +963,14 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   useEffect(() => {
     if (vision.faceDetected) {
       faceGoneSinceRef.current = null;
-    } else {
-      if (faceGoneSinceRef.current === null) {
-        faceGoneSinceRef.current = Date.now();
-      }
-      const gone = Date.now() - faceGoneSinceRef.current;
-      if (gone >= 2000) {
-        autoStartArmedRef.current = true;
-      }
+      return;
     }
+
+    if (faceGoneSinceRef.current === null) faceGoneSinceRef.current = Date.now();
+    const timer = window.setTimeout(() => {
+      if (!vision.faceDetected) autoStartArmedRef.current = true;
+    }, 2_000);
+    return () => window.clearTimeout(timer);
   }, [vision.faceDetected]);
 
   useEffect(() => {
@@ -949,23 +1036,21 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     }
   }, [blockAutoStart, conversation.status]);
 
-  // Auto-end only when BOTH conditions hold: the face has been absent for
-  // ten seconds and the conversation is idle. Agent speech, visitor audio,
-  // and a pending agent reply all keep the stream alive.
+  // Auto-end only when BOTH conditions hold: no detector-confirmed face frame
+  // has arrived for ten seconds and the conversation is idle. This uses raw
+  // MediaPipe confirmations, not a UI/placeholder presence flag.
   useEffect(() => {
-    if (vision.faceDetected) {
-      faceAbsentSinceRef.current = null;
-      return;
-    }
-    if (faceAbsentSinceRef.current === null) {
-      faceAbsentSinceRef.current = Date.now();
-    }
+    const lastConfirmedFaceAt = vision.lastFaceSeenAt;
+    if (lastConfirmedFaceAt !== null) faceAbsentSinceRef.current = null;
     if (conversation.status !== "connected") return;
 
     const checkForIdleDeparture = () => {
-      if (vision.faceDetected || faceAbsentSinceRef.current === null) return;
       const now = Date.now();
-      if (now - faceAbsentSinceRef.current < NO_FACE_AUTO_END_MS) return;
+      const noFaceSince = lastConfirmedFaceAt
+        ?? faceAbsentSinceRef.current
+        ?? connectedAtRef.current
+        ?? now;
+      if (now - noFaceSince < NO_FACE_AUTO_END_MS) return;
 
       let visitorIsSpeaking = false;
       try {
@@ -995,7 +1080,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     checkForIdleDeparture();
     const timer = window.setInterval(checkForIdleDeparture, 500);
     return () => window.clearInterval(timer);
-  }, [vision.faceDetected, conversation.status, endConversation]);
+  }, [vision.lastFaceSeenAt, conversation.status, endConversation]);
 
   // Cleanup on unmount
   useEffect(() => {

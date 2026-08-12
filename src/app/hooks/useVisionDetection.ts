@@ -35,6 +35,8 @@ export interface GestureInfo {
 export interface VisionState {
   /** Whether at least one face is currently detected */
   faceDetected: boolean;
+  /** Wall-clock time of the latest detector-confirmed face frame. */
+  lastFaceSeenAt: number | null;
   /** How long a face has been continuously present (ms) */
   facePresenceDurationMs: number;
   /** Number of faces currently visible */
@@ -63,7 +65,7 @@ export interface VisionState {
 
 const VISION_WASM_ROOT = "/mediapipe/wasm";
 const FACE_DETECTOR_MODEL_PATH = "/mediapipe/models/blaze_face_short_range.tflite";
-const FACE_DETECTION_CONFIDENCE = 0.42;
+const FACE_DETECTION_CONFIDENCE = 0.32;
 const GESTURE_HISTORY_TTL = 30_000; // keep gestures for 30s
 const GESTURE_DEDUP_MS = 2_000; // don't re-add same gesture within 2s
 const GESTURE_MIN_CONFIDENCE = 0.65;
@@ -79,7 +81,7 @@ const OBJECT_DETECT_INTERVAL_MS = 1_200;
 const OBJECT_DETECT_INTERVAL_MOBILE_MS = 2_000;
 const FACE_ACQUIRE_FRAMES = 2; // require 2 consecutive hits before face=true
 const FACE_LOSS_FRAMES = 4; // require multiple misses before face=false
-const FACE_LOSS_GRACE_MS = 1_400; // covers one complete worker tile scan
+const FACE_LOSS_GRACE_MS = 2_500; // tolerate brief blur/profile-frame misses
 const FACE_WORKER_STALE_MS = 1200;
 const FACE_WORKER_HUNG_MS = 6_000;
 const FACE_WORKER_INIT_TIMEOUT_MS = 12_000;
@@ -215,12 +217,14 @@ export function useVisionDetection(options?: {
   // Face tracking
   const faceStartRef = useRef<number | null>(null);
   const [faceDetected, setFaceDetected] = useState(false);
+  const [lastFaceSeenAt, setLastFaceSeenAt] = useState<number | null>(null);
   const [facePresenceDurationMs, setFacePresenceDurationMs] = useState(0);
   const [faceCount, setFaceCount] = useState(0);
   const stableFaceDetectedRef = useRef(false);
   const faceSeenStreakRef = useRef(0);
   const faceMissStreakRef = useRef(0);
   const lastFaceSeenAtRef = useRef(0);
+  const lastPublishedFaceSeenAtRef = useRef(0);
   const lastVideoTimestampRef = useRef(0);
   const lastFaceUiUpdateAtRef = useRef(0);
   const lastSmileUiUpdateAtRef = useRef(0);
@@ -760,11 +764,10 @@ export function useVisionDetection(options?: {
       return;
     }
 
-    // MediaPipe VIDEO mode is happiest with media timestamps. On mobile,
-    // `performance.now()` + camera buffering can cause occasional
-    // non-monotonic frame timing and transient misses.
-    const mediaTs = video.currentTime * 1000;
-    const now = Number.isFinite(mediaTs) && mediaTs > 0 ? mediaTs : performance.now();
+    // Use a monotonic wall clock rather than video.currentTime. Camera media
+    // timestamps can pause while a tab or USB feed recovers, which used to
+    // stall detection even though fresh frames were already available.
+    const now = performance.now();
     const safeNow = Math.max(now, lastVideoTimestampRef.current + 1);
     lastVideoTimestampRef.current = safeNow;
 
@@ -838,6 +841,11 @@ export function useVisionDetection(options?: {
       faceSeenStreakRef.current += 1;
       faceMissStreakRef.current = 0;
       lastFaceSeenAtRef.current = safeNow;
+      const confirmedAt = Date.now();
+      if (confirmedAt - lastPublishedFaceSeenAtRef.current >= FACE_UI_UPDATE_INTERVAL_MS) {
+        lastPublishedFaceSeenAtRef.current = confirmedAt;
+        setLastFaceSeenAt(confirmedAt);
+      }
     } else {
       faceSeenStreakRef.current = 0;
       faceMissStreakRef.current += 1;
@@ -1221,10 +1229,12 @@ export function useVisionDetection(options?: {
     }
     setIsReady(false);
     setFaceDetected(false);
+    setLastFaceSeenAt(null);
     stableFaceDetectedRef.current = false;
     faceSeenStreakRef.current = 0;
     faceMissStreakRef.current = 0;
     lastFaceSeenAtRef.current = 0;
+    lastPublishedFaceSeenAtRef.current = 0;
     lastVideoTimestampRef.current = 0;
     lastFaceUiUpdateAtRef.current = 0;
     lastSmileUiUpdateAtRef.current = 0;
@@ -1250,6 +1260,7 @@ export function useVisionDetection(options?: {
 
   return {
     faceDetected,
+    lastFaceSeenAt,
     facePresenceDurationMs,
     faceCount,
     currentGestures,
