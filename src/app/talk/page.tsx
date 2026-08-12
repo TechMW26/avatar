@@ -45,11 +45,12 @@ const MAX_BACKOFF_MS = 30000;
 // rishi sandipani hu" from re-firing when the voice session
 // transiently drops mid-conversation.
 const RECONNECT_CONTINUATION_WINDOW_MS = 90_000;
-// Mid-conversation no-face grace period. Previously 3s — too short
-// for users who lean back, look down at notes, or step half a foot to
-// the side. Long sessions were getting torn down and restarted with
-// the full greeting.
-const NO_FACE_AUTO_END_MS = 12_000;
+// A visitor must remain outside the camera for this full window before an
+// idle voice stream may close. Active speech/turn processing extends it.
+const NO_FACE_AUTO_END_MS = 10_000;
+const CONVERSATION_ACTIVITY_HOLD_MS = 5_000;
+const PENDING_AGENT_REPLY_HOLD_MS = 30_000;
+const USER_AUDIO_ACTIVITY_THRESHOLD = 0.015;
 const SHOW_CONVERSATION_CONTROLS = false;
 
 type VisitorAddressPreference = "masculine" | "feminine";
@@ -147,6 +148,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [retryWakeAt, setRetryWakeAt] = useState(0);
   const startInFlightRef = useRef(false);
+  const initialSessionConnectedRef = useRef(false);
   const autoStartArmedRef = useRef(true);
   const autoStartBlockedUntilRef = useRef(0);
   const hadSuccessfulConnectionRef = useRef(false);
@@ -154,6 +156,9 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   const connectedAtRef = useRef<number>(0);  // timestamp when connection was established
   const consecutiveFailuresRef = useRef(0);  // for exponential backoff
   const faceAbsentSinceRef = useRef<number | null>(null);
+  const lastConversationActivityAtRef = useRef(0);
+  const pendingAgentReplySinceRef = useRef<number | null>(null);
+  const agentSpeakingRef = useRef(false);
   // Continuation tracking: when the user has actually exchanged turns
   // with the agent, we mark the session as "engaged". On a reconnect
   // soon after, we issue a brief resume line instead of the full
@@ -424,7 +429,11 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       setConversationError(null);
       startInFlightRef.current = false;
       hadSuccessfulConnectionRef.current = true;
+      initialSessionConnectedRef.current = true;
       connectedAtRef.current = Date.now();
+      lastConversationActivityAtRef.current = Date.now();
+      pendingAgentReplySinceRef.current = null;
+      agentSpeakingRef.current = false;
       faceAbsentSinceRef.current = vision.faceDetected ? null : Date.now();
       retryScheduledRef.current = false;
       lastSessionErrorRef.current = null;
@@ -435,6 +444,8 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     },
     onDisconnect: (details) => {
       activeConversationRef.current = null;
+      pendingAgentReplySinceRef.current = null;
+      agentSpeakingRef.current = false;
       pronunciationLipSyncRef.current.clear();
       clearPendingAutoGestureTimers();
       const sessionDuration = connectedAtRef.current > 0 ? Date.now() - connectedAtRef.current : 0;
@@ -546,6 +557,8 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       pronunciationLipSyncRef.current.clear();
     },
     onModeChange: ({ mode }) => {
+      agentSpeakingRef.current = mode === "speaking";
+      lastConversationActivityAtRef.current = Date.now();
       if (mode === "listening") pronunciationLipSyncRef.current.clear();
     },
     // NOTE: onDebug fires on every audio/event packet. Logging it to the
@@ -565,6 +578,10 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       // session was actually "engaged" and a future reconnect should
       // continue rather than greet from scratch.
       if (message) {
+        lastConversationActivityAtRef.current = Date.now();
+        pendingAgentReplySinceRef.current = source === "user"
+          ? Date.now()
+          : null;
         sessionTurnsRef.current += 1;
         if (sessionTurnsRef.current >= 2) consecutiveFailuresRef.current = 0;
       }
@@ -672,6 +689,10 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   // conversationStatusRef is now kept in sync by onStatusChange callback
 
   const isSpeaking = conversation.isSpeaking;
+  useEffect(() => {
+    agentSpeakingRef.current = isSpeaking;
+    if (isSpeaking) lastConversationActivityAtRef.current = Date.now();
+  }, [isSpeaking]);
   const environmentalAudio = useEnvironmentalAudio({
     enabled: bootStage === "ready" && vision.faceDetected,
     suppressEvents: isSpeaking,
@@ -870,20 +891,25 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
       return;
     }
 
-    // Never auto-start speech before both boot prerequisites are ready:
-    //   1) avatar assets preloaded
-    //   2) vision detectors initialized
-    if (bootStage !== "ready" || !vision.isReady) {
+    // The first voice stream connects as soon as avatar boot completes. If
+    // that initial attempt fails, retries continue without requiring a face.
+    // Once a session has connected successfully, subsequent starts remain
+    // face-triggered so an empty installation does not reconnect forever.
+    if (bootStage !== "ready") {
       return;
     }
+
+    const shouldStartInitialSession = !initialSessionConnectedRef.current;
+    if (!shouldStartInitialSession && !vision.isReady) return;
 
     if (Date.now() < autoStartBlockedUntilRef.current) {
       return;
     }
 
     if (
-      vision.faceDetected &&
-      vision.facePresenceDurationMs >= 1500 &&
+      (shouldStartInitialSession || (
+        vision.faceDetected && vision.facePresenceDurationMs >= 1500
+      )) &&
       conversation.status === "disconnected"
     ) {
       autoStartArmedRef.current = false;
@@ -923,10 +949,9 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     }
   }, [blockAutoStart, conversation.status]);
 
-  // Auto-end: if no face for NO_FACE_AUTO_END_MS and agent is on. The
-  // window is intentionally generous (12s) — short pauses where the
-  // user looks away or leans back used to tear down the session and
-  // trigger a full re-greeting on reconnect.
+  // Auto-end only when BOTH conditions hold: the face has been absent for
+  // ten seconds and the conversation is idle. Agent speech, visitor audio,
+  // and a pending agent reply all keep the stream alive.
   useEffect(() => {
     if (vision.faceDetected) {
       faceAbsentSinceRef.current = null;
@@ -937,20 +962,39 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     }
     if (conversation.status !== "connected") return;
 
-    const timer = setTimeout(() => {
-      if (!vision.faceDetected && faceAbsentSinceRef.current !== null) {
-        const elapsed = Date.now() - faceAbsentSinceRef.current;
-        if (elapsed >= NO_FACE_AUTO_END_MS) {
-          // User has truly left — clear the engagement flag so the next
-          // visitor gets a fresh greeting, not a confusing continuation.
-          lastSessionWasEngagedRef.current = false;
-          lastStableDisconnectAtRef.current = 0;
-          endConversation();
-        }
-      }
-    }, Math.max(0, NO_FACE_AUTO_END_MS - (Date.now() - (faceAbsentSinceRef.current ?? Date.now()))));
+    const checkForIdleDeparture = () => {
+      if (vision.faceDetected || faceAbsentSinceRef.current === null) return;
+      const now = Date.now();
+      if (now - faceAbsentSinceRef.current < NO_FACE_AUTO_END_MS) return;
 
-    return () => clearTimeout(timer);
+      let visitorIsSpeaking = false;
+      try {
+        visitorIsSpeaking = conversationRef.current.getInputVolume()
+          >= USER_AUDIO_ACTIVITY_THRESHOLD;
+      } catch {
+        // Audio analyser can be temporarily unavailable during transport
+        // changes; the remaining activity guards still protect the session.
+      }
+      if (visitorIsSpeaking) {
+        lastConversationActivityAtRef.current = now;
+        return;
+      }
+
+      const pendingSince = pendingAgentReplySinceRef.current;
+      const replyPending = pendingSince !== null
+        && now - pendingSince < PENDING_AGENT_REPLY_HOLD_MS;
+      const recentlyActive = now - lastConversationActivityAtRef.current
+        < CONVERSATION_ACTIVITY_HOLD_MS;
+      if (agentSpeakingRef.current || replyPending || recentlyActive) return;
+
+      lastSessionWasEngagedRef.current = false;
+      lastStableDisconnectAtRef.current = 0;
+      endConversation();
+    };
+
+    checkForIdleDeparture();
+    const timer = window.setInterval(checkForIdleDeparture, 500);
+    return () => window.clearInterval(timer);
   }, [vision.faceDetected, conversation.status, endConversation]);
 
   // Cleanup on unmount
