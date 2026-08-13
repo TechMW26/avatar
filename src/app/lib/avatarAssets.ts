@@ -300,6 +300,8 @@ export function getAssetQueueForProfile(
  * runtime code; never mutate this set directly.
  */
 const MISSING_ASSETS = new Set<string>();
+const ASSET_DOWNLOAD_ATTEMPTS = 4;
+const ASSET_RETRY_BASE_DELAY_MS = 750;
 
 export function isAssetMissing(path: string): boolean {
   return MISSING_ASSETS.has(path);
@@ -320,10 +322,28 @@ export interface PreloadProgress {
   totalBytes: number;
 }
 
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException("Preload aborted", "AbortError"));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = globalThis.setTimeout(resolve, delayMs);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        globalThis.clearTimeout(timer);
+        reject(new DOMException("Preload aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
 async function streamIntoCache(
   spec: AvatarAssetSpec,
   cache: Cache | null,
   onChunk: (deltaBytes: number, totalForThisAsset: number) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const url = assetUrl(spec.path);
 
@@ -338,20 +358,24 @@ async function streamIntoCache(
     }
   }
 
-  const resp = await fetch(url, { credentials: "omit" });
+  const resp = await fetch(url, { credentials: "omit", signal });
   if (!resp.ok) {
     // 4xx → asset is genuinely absent (typo in path, blob bucket out
     // of sync with the deployed code, etc). Mark it missing so the
     // runtime loader can short-circuit, advance the byte counter by
     // the estimated size so the progress bar still completes, and
     // continue with the next asset instead of blocking boot.
-    if (resp.status >= 400 && resp.status < 500) {
+    if (
+      resp.status >= 400
+      && resp.status < 500
+      && ![408, 425, 429].includes(resp.status)
+    ) {
       console.warn(`[avatarAssets] skipping missing asset ${spec.path}: ${resp.status}`);
       MISSING_ASSETS.add(spec.path);
       onChunk(spec.estBytes, spec.estBytes);
       return;
     }
-    // 5xx / network → genuine failure, surface it so the user sees Retry.
+    // Transient HTTP failures are retried by the sequential preloader.
     throw new Error(`Failed to load ${spec.path}: ${resp.status} ${resp.statusText}`);
   }
 
@@ -461,28 +485,60 @@ async function preloadAvatarAssetsUnlocked(
       totalBytes,
     });
 
-    let assetLoadedSoFar = 0;
-    await streamIntoCache(spec, cache, (delta, totalForThisAsset) => {
-      assetLoadedSoFar += delta;
-      loadedBytes += delta;
+    let completed = false;
+    for (let attempt = 1; attempt <= ASSET_DOWNLOAD_ATTEMPTS; attempt++) {
+      const loadedBeforeAttempt = loadedBytes;
+      const totalBeforeAttempt = totalBytes;
+      let assetLoadedSoFar = 0;
+      try {
+        await streamIntoCache(spec, cache, (delta, totalForThisAsset) => {
+          assetLoadedSoFar += delta;
+          loadedBytes += delta;
 
-      // If the real Content-Length differs from our estimate, adjust
-      // the running total so the bar stays monotonic.
-      const drift = totalForThisAsset - spec.estBytes;
-      if (drift !== 0 && assetLoadedSoFar === delta) {
-        // First chunk for this asset — apply the drift exactly once.
-        totalBytes += drift;
+          // If the real Content-Length differs from our estimate, adjust
+          // the running total so the bar stays accurate.
+          const drift = totalForThisAsset - spec.estBytes;
+          if (drift !== 0 && assetLoadedSoFar === delta) totalBytes += drift;
+
+          onProgress({
+            ratio: totalBytes > 0 ? Math.min(1, loadedBytes / totalBytes) : 0,
+            currentIndex: i,
+            totalAssets: queue.length,
+            currentPath: spec.path,
+            loadedBytes,
+            totalBytes,
+          });
+        }, signal);
+        completed = true;
+        break;
+      } catch (error) {
+        loadedBytes = loadedBeforeAttempt;
+        totalBytes = totalBeforeAttempt;
+        if (
+          signal?.aborted
+          || (error instanceof DOMException && error.name === "AbortError")
+          || attempt === ASSET_DOWNLOAD_ATTEMPTS
+        ) {
+          throw error;
+        }
+        const delayMs = ASSET_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+        console.warn(
+          `[avatarAssets] download failed for ${spec.path}; retrying `
+          + `(${attempt + 1}/${ASSET_DOWNLOAD_ATTEMPTS}) in ${delayMs}ms`,
+          error,
+        );
+        onProgress({
+          ratio: totalBytes > 0 ? Math.min(1, loadedBytes / totalBytes) : 0,
+          currentIndex: i,
+          totalAssets: queue.length,
+          currentPath: spec.path,
+          loadedBytes,
+          totalBytes,
+        });
+        await waitForRetry(delayMs, signal);
       }
-
-      onProgress({
-        ratio: totalBytes > 0 ? Math.min(1, loadedBytes / totalBytes) : 0,
-        currentIndex: i,
-        totalAssets: queue.length,
-        currentPath: spec.path,
-        loadedBytes,
-        totalBytes,
-      });
-    });
+    }
+    if (!completed) throw new Error(`Failed to download ${spec.path}`);
 
     // Yield to the event loop between heavy assets so the UI can
     // repaint and Safari has a chance to release transient buffers.
