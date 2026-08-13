@@ -11,6 +11,7 @@ tsconfig.tsbuildinfo
 # misc
 .DS_Store
 *.pem
+.codex-tmp/
 
 # debug
 npm-debug.log*
@@ -39,4 +40,3 @@ public/avatar-old.fbx
 
 # Internal documents (not for repo)
 Proposal_Letter_Hindi.md
-

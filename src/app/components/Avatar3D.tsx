@@ -36,11 +36,7 @@ const DEFAULT_AVATAR_URL = "/models/sandipani.glb";
 const LIP_SYNC_OPEN_GAIN = 1.28;
 const LIP_SYNC_CLOSURE_GAIN = 1.16;
 const MAX_LIP_SYNC_INFLUENCE = 0.84;
-// Sandipani's generated PP delta is deliberately very small and face-local.
-// A literal 0.25 influence was visually indistinguishable from Basis and did
-// not reach the upper lip. This calibrated value seals the authored seam
-// without an overlay or any beard/jaw/body deformation.
-const SANDIPANI_IDLE_LIP_CLOSURE = 1;
+const SANDIPANI_IDLE_LIP_CLOSURE = 0.62;
 const SANDIPANI_MAX_LIP_SYNC_INFLUENCE = 0.68;
 const SPEECH_CHEEK_MORPH = "speech_CheekRaise";
 const SANDIPANI_VISEME_GAIN: Record<(typeof AVATAR_VISEMES)[number], number> = {
@@ -132,6 +128,9 @@ const FACE_DEBOUNCE_MS = 350;
 const SAME_GESTURE_COOLDOWN_MS = 4_500;
 const SPEAKING_GESTURE_DELAY_MS = 450;
 const SPEAKING_GESTURE_COOLDOWN_MS = 8_000;
+// Camera-recognized gestures remain active; conversation/tool/speaking
+// driven body animations are temporarily disabled.
+const AI_TRIGGERED_BODY_ANIMATIONS_ENABLED = false;
 
 /* ── Stage geometry ──
    The animated foot bones are locked to the viewport floor while the grass
@@ -781,9 +780,6 @@ function AvatarModel({
       const mesh = obj as THREE.Mesh;
       if (mesh.isMesh) {
         if (/Sandipani(?:IdleLipSeal|MouthCavity)/i.test(mesh.name)) {
-          // Legacy synthetic mouth layers are intentionally disabled. The
-          // current model's authored face is closed at Basis and its native
-          // viseme targets provide the complete speech deformation.
           mesh.visible = false;
           return;
         }
@@ -1702,7 +1698,9 @@ function AvatarModel({
           // Explicit AI-driven gestures (e.g. ElevenLabs clientTool fires
           // an `aiGesture` with a fresh nonce on a high-weight phrase).
           // No random firing — the agent decides when it matters.
-          const ai = aiGestureRef.current;
+          const ai = AI_TRIGGERED_BODY_ANIMATIONS_ENABLED
+            ? aiGestureRef.current
+            : null;
           if (
             ai &&
             ai.nonce !== lastAiNonceRef.current &&
@@ -1806,7 +1804,8 @@ function AvatarModel({
             // gesture name) so we don't fire it later when the cooldown ends.
             lastAiNonceRef.current = ai.nonce;
           } else if (
-            isSpeakingRef.current
+            AI_TRIGGERED_BODY_ANIMATIONS_ENABLED
+            && isSpeakingRef.current
             && speakingStartedAtRef.current > 0
             && now - speakingStartedAtRef.current >= SPEAKING_GESTURE_DELAY_MS
             && now - lastSpeakingGestureAtRef.current >= SPEAKING_GESTURE_COOLDOWN_MS

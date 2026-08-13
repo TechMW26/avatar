@@ -34,6 +34,10 @@ import {
 import { PronunciationLipSync } from "../lib/lipSync";
 
 const Avatar3D = dynamic(() => import("../components/Avatar3D"), { ssr: false });
+// Body animation is driven only by live camera gestures for now. Keep the
+// AI plumbing inert so dashboard tools or transcript cues cannot move the
+// avatar while preserving camera-triggered wave/namaste behavior.
+const AI_TRIGGERED_GESTURES_ENABLED = false;
 const AUTO_START_RETRY_DELAY_MS = 4000;
 const AUTO_START_STORAGE_KEY = "rishi:auto-start-blocked-until";
 const CONNECTION_TIMEOUT_MS = 10000;
@@ -249,6 +253,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
   // Avatar3D plays the gesture exactly once.
   const [aiGesture, setAiGesture] = useState<{ name: string; nonce: number } | null>(null);
   const triggerAiGesture = useCallback((name: string) => {
+    if (!AI_TRIGGERED_GESTURES_ENABLED) return;
     setAiGesture({ name, nonce: Date.now() + Math.floor(Math.random() * 1000) });
   }, []);
   const lastAutoGestureNameRef = useRef<string | null>(null);
@@ -648,6 +653,8 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
         }
       }
 
+      if (!AI_TRIGGERED_GESTURES_ENABLED) return;
+
       const candidates = detectGestureCandidatesFromText(safeMessage);
       if (!candidates.length) return;
 
@@ -681,6 +688,7 @@ function TalkPageContent({ character }: { character: CharacterProfile }) {
     // aiGesture nonce — Avatar3D handles cooldowns + state transitions.
     clientTools: {
       playGesture: ({ name }: { name: string }) => {
+        if (!AI_TRIGGERED_GESTURES_ENABLED) return "disabled";
         // NOTE: `climbing` is deliberately excluded — it is reserved
         // exclusively for attract-mode (when no one is in front of the
         // camera) and must never fire mid-conversation.
